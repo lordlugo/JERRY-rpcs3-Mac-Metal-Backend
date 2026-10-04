@@ -18,6 +18,12 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-04 — cellAudio: mix one block behind the read position (game keeps real-time rate)
+
+- GTA IV log after the faded-gap change: 240 gaps (7.6 s of filler) in 30 s, queue 37 ms. Not a slow cellAudio thread and not the output: the game delivered ~70% of real-time audio. With buffering, this thread waits for the block at the read position before sending the next MIX event, so the event rate equals the game's response time; GTA IV's SPURS mixer answers in ~6.7 ms (> one 5.3 ms period): ~148 events/s instead of 187.5.
+- The block mixed at the end of a period is now the one behind the read position the game is told (tag check, mix and clear all use mix_offset() = -1 with buffering). The game gets a full extra period and its pipeline keeps up; +5.3 ms latency. All games.
+- The 30 s audio line now says how much audio the game delivered (% of real time, and % while not idle).
+
 ## 2026-10-04 — cellAudio: no more crackling from a late game; faded gaps
 
 - GTA IV log (AirPods): 1017 silent and 135 skipped periods in 30 s, 29 output underruns (843 ms), queue 20 ms on average (desired 100 ms), cellAudio thread never late. The wait-for-a-late-game rule needed more than 50 ms queued, more than a real-time-paced game ever keeps, so each period the game was slightly late became 5.3 ms of hard-cut silence (crackling, stutter); skipped periods queued nothing and ran the output dry.

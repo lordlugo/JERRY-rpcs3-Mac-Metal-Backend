@@ -885,7 +885,7 @@ std::tuple<u32, u32, u32, u32> cell_audio_thread::count_port_buffer_tags()
 
 		if (!port.num_channels) continue;
 
-		auto port_buf = get_buffer(port);
+		auto port_buf = get_buffer(port, mix_offset());
 
 		// Find the last tag that has been touched
 		const u32 tag_first_pos = port.num_channels == 2 ? PORT_BUFFER_TAG_FIRST_2CH : PORT_BUFFER_TAG_FIRST_8CH;
@@ -1025,8 +1025,8 @@ void cell_audio_thread::advance(u64 timestamp)
 
 	std::unique_lock lock(mutex);
 
-	// update ports
-	reset_ports(0);
+	// update ports: the block just mixed is cleared and tagged for its next turn
+	reset_ports(mix_offset());
 
 	be_t<u64>* indices = nullptr;
 
@@ -1227,9 +1227,11 @@ void cell_audio_thread::report_stats(u64 timestamp)
 		const f64 frames_per_ms = cfg.audio_sampling_rate / 1000.0;
 		const std::string queue = cfg.buffering_enabled ? fmt::format(", average queue %.1f ms (desired %u ms)", m_average_playtime / 1000.0, cfg.desired_buffer_duration / 1000) : std::string{};
 
-		cellAudio.notice("Audio in the last %u s: game late for %u period(s) covered by the queue, %u skipped, %u gap(s) inserted for a late game (%.1f ms), %u silent while the game was idle; "
+		const f64 real_time_periods = static_cast<f64>(elapsed) / cfg.audio_block_period;
+		cellAudio.notice("Audio in the last %u s: game delivered %u period(s) (%.0f%% of real time, %.0f%% while not idle); game late for %u period(s) covered by the queue, %u skipped, %u gap(s) inserted for a late game (%.1f ms), %u silent while the game was idle; "
 			"cellAudio thread late %u time(s) (longest gap %.1f ms); output underrun %u time(s) (%.1f ms of silence), %.1f ms dropped (queue full)%s, output pulls up to %.1f ms",
-			elapsed / 1'000'000, s.late_waited, s.skipped, s.gaps, s.gap_us / 1000.0, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
+			elapsed / 1'000'000, s.mixed, 100.0 * s.mixed / real_time_periods, 100.0 * s.mixed / std::max(1.0, real_time_periods - s.silent),
+			s.late_waited, s.skipped, s.gaps, s.gap_us / 1000.0, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
 			s.output.padded_frames / frames_per_ms, s.output.dropped_frames / frames_per_ms, queue, ringbuffer->get_output_burst_duration() / 1000.0);
 	}
 
@@ -1586,6 +1588,7 @@ void cell_audio_thread::operator()()
 			// Store number of untouched buffers for future reference
 			untouched_expected = untouched;
 			m_silent_run = 0;
+			m_stats.mixed++;
 
 			// Log if we enqueued untouched/incomplete buffers
 			if (untouched > 0 || incomplete > 0)
@@ -1794,7 +1797,7 @@ void cell_audio_thread::mix(float* out_buffer, s32 offset)
 	{
 		if (port.state != audio_port_state::started) continue;
 
-		auto buf = get_buffer(port, offset);
+		auto buf = get_buffer(port, offset + mix_offset());
 
 		static constexpr float minus_3db = 0.707f; // value taken from https://www.dolby.com/us/en/technologies/a-guide-to-dolby-metadata.pdf
 		float m = master_volume;

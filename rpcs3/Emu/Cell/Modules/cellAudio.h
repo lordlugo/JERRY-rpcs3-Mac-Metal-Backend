@@ -445,6 +445,15 @@ private:
 	be_t<f32>* get_buffer(const audio_port& port, s32 offset = 0) const;
 
 	void reset_ports(s32 offset = 0);
+
+	// RPCS3 Metal fork: the block mixed at the end of a period, relative to the read position the game is told (see
+	// advance()). Upstream mixes the block at the read position itself, so the game has less than one 5.3 ms period
+	// from the MIX event to finish it, and with buffering this thread waits for it before sending the next event: the
+	// game's response time then sets the audio rate. GTA IV answers in ~6.7 ms through its SPURS mixer: 148 events
+	// per second instead of 187.5, ~79% of real-time audio, the rest filled with gaps (heavy stutter). One block
+	// behind gives the game a full extra period while the events keep their real-time rate; the game still writes
+	// where it always did. Costs 5.3 ms of latency.
+	s32 mix_offset() const { return cfg.buffering_enabled ? -1 : 0; }
 	void advance(u64 timestamp);
 	std::tuple<u32, u32, u32, u32> count_port_buffer_tags();
 	template <AudioChannelCnt channels, AudioChannelCnt downmix>
@@ -463,6 +472,7 @@ private:
 		u64 skipped = 0;        // The game was too late: time advanced without its audio
 		u64 silent = 0;         // Ports started but untouched as expected (the game is idle): silence enqueued
 		u64 gaps = 0;           // The game was late and the queue ran low: one faded gap of silence inserted
+		u64 mixed = 0;          // Periods mixed from the game's audio
 		u64 gap_us = 0;         // Total length of those gaps
 		u64 thread_late = 0;    // This thread ran more than two periods after its previous loop iteration
 		u64 max_thread_gap = 0; // usecs
