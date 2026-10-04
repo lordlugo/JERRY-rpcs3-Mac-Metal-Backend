@@ -993,6 +993,41 @@ std::tuple<u32, u32, u32, u32> cell_audio_thread::count_port_buffer_tags()
 	return std::make_tuple(active, in_progress, untouched, incomplete);
 }
 
+void cell_audio_thread::probe_write_ahead()
+{
+	// Caller holds the audio mutex. A block still carries the -0.0 end tag that reset_ports() put there when it was
+	// last mixed until the game writes it; the first lap after a port starts has no tags yet, so it is skipped.
+	if (!cfg.buffering_enabled)
+	{
+		return;
+	}
+
+	for (const audio_port& port : ports)
+	{
+		if (port.state != audio_port_state::started || !port.num_channels || port.active_counter <= u64{port.num_blocks} * 2)
+		{
+			continue;
+		}
+
+		const u32 last_tag = (port.num_channels == 2 ? PORT_BUFFER_TAG_FIRST_2CH : PORT_BUFFER_TAG_FIRST_8CH) +
+			(PORT_BUFFER_TAG_COUNT - 1) * (port.num_channels == 2 ? PORT_BUFFER_TAG_DELTA_2CH : PORT_BUFFER_TAG_DELTA_8CH);
+
+		u32 lead = 0;
+		for (; lead < port.num_blocks; lead++)
+		{
+			const f32 val = get_buffer(port, static_cast<s32>(lead))[last_tag];
+
+			if (val == 0.0f && std::signbit(val))
+			{
+				break;
+			}
+		}
+
+		m_stats.lead[std::min<usz>(lead, m_stats.lead.size() - 1)]++;
+		break; // first port only
+	}
+}
+
 void cell_audio_thread::reset_ports(s32 offset)
 {
 	// Memset buffer to 0 and tag
@@ -1053,6 +1088,8 @@ void cell_audio_thread::advance(u64 timestamp)
 		// Calculate rolling average of enqueued playtime
 		m_average_playtime = cfg.period_average_alpha * ringbuffer->get_enqueued_playtime() + (1.0f - cfg.period_average_alpha) * m_average_playtime;
 	}
+
+	probe_write_ahead();
 
 	m_counter++;
 	m_last_period_end = timestamp;
@@ -1205,7 +1242,8 @@ void cell_audio_thread::report_stats(u64 timestamp)
 		return;
 	}
 
-	if (timestamp - m_stats_time < 30'000'000)
+	// 10 s windows: short play sessions still get reports from gameplay, not only from the menus
+	if (timestamp - m_stats_time < 10'000'000)
 	{
 		return;
 	}
@@ -1220,7 +1258,7 @@ void cell_audio_thread::report_stats(u64 timestamp)
 
 	const period_stats& s = m_stats;
 
-	if (s.late_waited || s.skipped || s.silent || s.gaps || s.thread_late || s.output.underruns || s.output.padded_frames || s.output.dropped_frames)
+	if (s.mixed || s.late_waited || s.skipped || s.silent || s.gaps || s.thread_late || s.output.underruns || s.output.padded_frames || s.output.dropped_frames)
 	{
 		// Late game: late periods covered by the queue, skipped (and silent) periods. Late cellAudio thread: its own
 		// gaps. Output: underruns of the device's queue, audio lost to a full queue.
@@ -1233,6 +1271,24 @@ void cell_audio_thread::report_stats(u64 timestamp)
 			elapsed / 1'000'000, s.mixed, 100.0 * s.mixed / real_time_periods, 100.0 * s.mixed / std::max(1.0, real_time_periods - s.silent),
 			s.late_waited, s.skipped, s.gaps, s.gap_us / 1000.0, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
 			s.output.padded_frames / frames_per_ms, s.output.dropped_frames / frames_per_ms, queue, ringbuffer->get_output_burst_duration() / 1000.0);
+
+		u64 lead_total = 0;
+		for (u32 n : s.lead) lead_total += n;
+
+		if (lead_total)
+		{
+			std::string hist;
+			for (usz i = 0; i < s.lead.size(); i++)
+			{
+				if (s.lead[i])
+				{
+					fmt::append(hist, "%s%u%s: %.0f%%", hist.empty() ? "" : ", ", i, i == s.lead.size() - 1 ? "+" : "", 100.0 * s.lead[i] / lead_total);
+				}
+			}
+
+			cellAudio.notice("Audio write-ahead: blocks the game had already written past the read position at MIX events: %s; mixed block complete %.2f ms after the event on average (longest %.2f ms, period %.2f ms)",
+				hist, s.mixed ? s.ready_us_sum / 1000.0 / s.mixed : 0.0, s.ready_us_max / 1000.0, cfg.audio_block_period / 1000.0);
+		}
 	}
 
 	m_stats = {};
@@ -1589,6 +1645,8 @@ void cell_audio_thread::operator()()
 			untouched_expected = untouched;
 			m_silent_run = 0;
 			m_stats.mixed++;
+			m_stats.ready_us_sum += time_since_last_period;
+			m_stats.ready_us_max = std::max(m_stats.ready_us_max, time_since_last_period);
 
 			// Log if we enqueued untouched/incomplete buffers
 			if (untouched > 0 || incomplete > 0)

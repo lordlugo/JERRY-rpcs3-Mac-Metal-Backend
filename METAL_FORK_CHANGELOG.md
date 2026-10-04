@@ -18,6 +18,12 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-04 — cellAudio: one-block lag reverted; write-ahead probe; 10 s audio reports
+
+- The one-block lag gave 98% delivery in GTA IV's menus but sounded much worse in play (no gameplay report: the session ended 25 s into gameplay). Reverted to upstream's mix position.
+- New per-10 s line "Audio write-ahead": how many blocks the game had already written past the read position at each MIX event, and how long after the event the mixed block was complete (average/longest vs. the 5.33 ms period). Decides whether a lag is safe for a game.
+- Audio report every 10 s (was 30 s), printed whenever the game delivered audio.
+
 ## 2026-10-04 — cellAudio: mix one block behind the read position (game keeps real-time rate)
 
 - GTA IV log after the faded-gap change: 240 gaps (7.6 s of filler) in 30 s, queue 37 ms. Not a slow cellAudio thread and not the output: the game delivered ~70% of real-time audio. With buffering, this thread waits for the block at the read position before sending the next MIX event, so the event rate equals the game's response time; GTA IV's SPURS mixer answers in ~6.7 ms (> one 5.3 ms period): ~148 events/s instead of 187.5.
