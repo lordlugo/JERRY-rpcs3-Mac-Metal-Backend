@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/RSX/Common/zcull_read_reason.hpp"
 #include "../Overlays/overlay_compile_notification.h"
 #include "../Overlays/Shaders/shader_loading_dialog.h"
 
@@ -2914,7 +2915,7 @@ bool MTLGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_inf
 
 void MTLGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* query)
 {
-	mtl::wait_site_scope wait_site("zcull report read");
+	mtl::wait_site_scope wait_site(rsx::reports::g_read_reason ? rsx::reports::g_read_reason : "zcull report read: other");
 	auto &data = m_occlusion_map[query->driver_handle];
 	if (data.indices.empty())
 		return;

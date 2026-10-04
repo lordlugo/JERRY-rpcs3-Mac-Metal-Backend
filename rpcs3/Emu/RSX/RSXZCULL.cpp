@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Common/zcull_read_reason.hpp"
 #include "Core/RSXEngLock.hpp"
 #include "Core/RSXReservationLock.hpp"
 #include "Host/MM.h"
@@ -473,6 +474,7 @@ namespace rsx
 
 		void ZCULL_control::flush_deferred_labels(::rsx::thread* ptimer)
 		{
+			read_reason_scope reason(g_read_reason ? g_read_reason : "zcull report read: labels held back for reports forced out");
 			if (m_deferred_labels.empty())
 			{
 				return;

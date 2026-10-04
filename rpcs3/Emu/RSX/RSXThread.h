@@ -377,6 +377,11 @@ namespace rsx
 		void check_stall_tripwire();
 
 	public:
+		// RPCS3 Metal fork: called when the user closes the game. If the display stopped flipping a while ago (the user
+		// gave up on a frozen game before the tripwire fired), write the stall report now, while the threads are still
+		// parked where they hang.
+		void report_stall_on_exit();
+
 		thread(const thread&) = delete;
 		thread& operator=(const thread&) = delete;
 		void save(utils::serial& ar);
@@ -429,6 +434,7 @@ namespace rsx
 
 		// A deferred label write to this address is pending
 		bool has_deferred_label_at(u32 address) const;
+		bool deferred_label_will_write(u32 address, u32 value) const; // See reports::ZCULL_control
 
 		// Any deferred label write is pending
 		bool has_deferred_labels() const;

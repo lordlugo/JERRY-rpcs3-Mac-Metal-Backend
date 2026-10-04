@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Common/zcull_read_reason.hpp"
 #include "RSXThread.h"
 
 #include "Capture/rsx_capture.h"
@@ -954,6 +955,7 @@ namespace rsx
 			else
 			{
 				// NOTE: eval_sources list is reversed with newest query first
+				reports::read_reason_scope reason("zcull report read: conditional rendering evaluated on the CPU");
 				zcull_ctrl->read_barrier(this, cond_render_ctrl.eval_address, cond_render_ctrl.eval_sources.front());
 				ensure(!cond_render_ctrl.eval_pending());
 			}
@@ -2820,7 +2822,8 @@ namespace rsx
 		const u64 now = get_system_time();
 		const u32 put = static_cast<u32>(ctrl->put);
 
-		if (now - last_host_flip_timestamp <= 15'000'000)
+		// 8 s: users close a frozen game after 10-15 s (Assassin's Creed II: 13 s, no report at the old 15 s)
+		if (now - last_host_flip_timestamp <= 8'000'000)
 		{
 			// Display progress (or early session): re-arm for the next episode
 			stall_tripwire_fired = false;
@@ -2869,6 +2872,33 @@ namespace rsx
 		}
 
 		stall_tripwire_last_put = put;
+	}
+
+	void thread::report_stall_on_exit()
+	{
+		if (!rsx_thread_running || !ctrl || stall_tripwire_fired || !last_host_flip_timestamp || Emu.IsPausedOrReady())
+		{
+			return;
+		}
+
+		const u64 since_flip = get_system_time() - last_host_flip_timestamp;
+		if (since_flip < 4'000'000)
+		{
+			return;
+		}
+
+		stall_tripwire_fired = true;
+
+		// Read from another thread: plain snapshots, diagnostic only
+		const std::string msg = fmt::format("RSX stall on exit: the game was closed %llu s after its last display flip (GET=0x%x PUT=0x%x, FIFO state=%u, last method=0x%x). The threads below are where it hung.",
+			since_flip / 1'000'000, static_cast<u32>(ctrl->get), static_cast<u32>(ctrl->put), static_cast<u32>(performance_counters.state),
+			fifo_ctrl ? fifo_ctrl->last_cmd() : 0u);
+
+		rsx_log.error("%s", msg);
+
+		const std::string thread_states = dump_stall_thread_states();
+		append_stall_sidecar(stall_sidecar_path(), msg + "\n" + thread_states);
+		logs::listener::sync_all();
 	}
 
 	void thread::check_zcull_status(bool framebuffer_swap)
@@ -2984,6 +3014,7 @@ namespace rsx
 
 	void thread::sync()
 	{
+		reports::read_reason_scope reason("zcull report read: full sync (semaphore/notify/reference/user command)");
 		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);
 
 		mm_flush();
@@ -3058,6 +3089,11 @@ namespace rsx
 		{
 			zcull_ctrl->flush_deferred_labels(this);
 		}
+	}
+
+	bool thread::deferred_label_will_write(u32 address, u32 value) const
+	{
+		return zcull_ctrl && zcull_ctrl->deferred_label_will_write(address, value);
 	}
 
 	bool thread::has_deferred_label_at(u32 address) const
@@ -3741,6 +3777,7 @@ namespace rsx
 	flags32_t thread::read_barrier(u32 memory_address, u32 memory_range, bool unconditional)
 	{
 		flags32_t zcull_flags = (unconditional)? reports::sync_none : reports::sync_defer_copy;
+		reports::read_reason_scope reason("zcull report read: RSX copy/blit reads report memory (NV0039/NV3089)");
 		return zcull_ctrl->read_barrier(this, memory_address, memory_range, zcull_flags);
 	}
 

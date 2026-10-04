@@ -15,6 +15,37 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+
+
+
+## 2026-10-04 — cellAudio: no more crackling from a late game; faded gaps
+
+- GTA IV log (AirPods): 1017 silent and 135 skipped periods in 30 s, 29 output underruns (843 ms), queue 20 ms on average (desired 100 ms), cellAudio thread never late. The wait-for-a-late-game rule needed more than 50 ms queued, more than a real-time-paced game ever keeps, so each period the game was slightly late became 5.3 ms of hard-cut silence (crackling, stutter); skipped periods queued nothing and ran the output dry.
+- Wait floor = the output's largest measured pull (callbacks within 2 ms count as one burst, so Bluetooth bursts are covered) + one period + 1 ms, capped at half the desired buffer; wait for at most the desired buffer duration.
+- When the queue does run low: one faded gap that rebuilds a reserve (floor + max(4 periods, desired/4)), for skips too, instead of a gap every period.
+- A game that wrote audio a moment ago is late, not idle: wait for it. After 8 untouched periods in a row it is idle and gets silence at the normal rate (upstream behaviour).
+- Every edge between game audio and inserted silence fades (2.7 ms decay from the last frame, 2.7 ms fade-in).
+- Log line now separates gaps for a late game from silence while idle, and prints the output's largest pull. Applies to all games.
+
+## 2026-10-04 — Accurate RSX reservation access for every game; stall report on close
+
+- Assassin's Creed II (BLES00669) hung on a loading screen ~6 s after its SPUs began reading the RSX report area in main memory; one SPURS kernel never stopped on exit (37 s). Same signature as the God of War: Ascension freeze cured by Accurate RSX reservation access: without it RSX writes to main memory do not take the 128-byte reservations, and an SPU atomic on the same line (SPURS state) can be lost. Now forced on at boot for every game instead of a per-title list.
+- RSX stall tripwire fires after 8 s without a flip (was 15 s; the AC2 session was closed after 13 s with no report), and closing a game that stopped flipping 4+ s ago writes the stall report (thread wait sites) to RPCS3.log and RSXStallReports.log.
+
+## 2026-10-04 — NV406E semaphore acquire on the RSX's own held-back release
+
+- GTA IV log: with all labels deferred in order, the wait moved to "zcull report read: semaphore acquire flushes held-back labels" (5.8-9.8 ms per frame), and the acquire's own wait was then 0 ms: the game makes the RSX acquire a semaphore the RSX released itself just before (held back only for the CPU's view of the zcull reports).
+- semaphore_acquire: when the newest held-back label for the address carries the awaited value, the acquire is satisfied without forcing the labels out (later commands reach the GPU after the work the release followed, by queue order). The memory still gets the value when the reports land. Otherwise unchanged (flush, then wait). Applies to all games.
+
+## 2026-10-04 — Labels join held-back labels instead of forcing them out
+
+- GTA IV log (approximate ZCULL now on): the RSX thread waited 7.4-10.1 ms per frame at "zcull report read: labels held back for reports forced out". write_gcm_label deferred only pipeline-flushing labels and flip semaphores; any other label (e.g. texture read semaphores, written without a pipeline flush) flushed the held-back labels first, i.e. waited for the GPU to write their reports. Now every label is deferred behind held-back ones, in order (nv47_sync.hpp). Semaphore acquires still flush them before waiting (tagged separately in the log).
+
+## 2026-10-04 — GTA IV: zcull report reads named by cause, approximate ZCULL
+
+- GTA IV log: the named wait site was "zcull report read", 5.3-6.9 ms per frame (GPU 66-80% busy, CPU 70-87% on every core). The reason for a report read is now recorded (rsx::reports::read_reason_scope, Common/zcull_read_reason.hpp): conditional rendering evaluated on the CPU, RSX copy/blit reading report memory (NV0039/NV3089), full sync (semaphore/notify/reference/user command), labels forced out; the Metal wait site carries it.
+- GTA IV built-in settings: Accurate ZCULL stats off (approximate ZCULL), so most report reads stop at the first visible sample instead of waiting for every query.
+
 ## 2026-10-04 — Performance overlay: CPU and GPU utilization measured like Redline
 
 - CPU (utils::cpu_stats::get_usage, macOS): whole-system load from host_statistics(HOST_CPU_LOAD_INFO) tick deltas, (user + system + nice) / (those + idle), wrapping 32-bit deltas, time-scaled EMA (gain 0.4 per second). Replaces the process-time estimate (times(), 10 ms resolution, divided by the logical CPU count). Same method as mac-resource-monitor (Redline) Sources/Metrics.swift readCPU.

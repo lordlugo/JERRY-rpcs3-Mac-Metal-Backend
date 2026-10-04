@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/RSX/Common/zcull_read_reason.hpp"
 #include "nv406e.h"
 #include "nv47_sync.hpp"
 
@@ -61,12 +62,24 @@ namespace rsx
 
 				return;
 			}
+			else if (RSX(ctx)->deferred_label_will_write(addr, arg))
+			{
+				// RPCS3 Metal fork: the awaited value is the RSX's own earlier release, held back only so that the CPU
+				// does not see it before the zcull reports queued before it. The RSX itself is past that release: every
+				// later command reaches the GPU after the work the release followed (queue order), so the acquire is
+				// satisfied now instead of forcing the held-back labels out, which waited for all queued GPU work
+				// (GTA IV: 6-10 ms per frame, "semaphore acquire flushes held-back labels"). The memory gets the value
+				// when the reports land, as for the CPU.
+				RSX(ctx)->flush_fifo();
+				return;
+			}
 			else
 			{
 				RSX(ctx)->flush_fifo();
 
 				// The awaited value may depend on a texture read label that is still waiting for zcull reports (directly,
 				// or through a CPU thread that waits for it). Never wait with labels held back.
+				reports::read_reason_scope reason("zcull report read: semaphore acquire flushes held-back labels");
 				RSX(ctx)->flush_deferred_labels();
 			}
 

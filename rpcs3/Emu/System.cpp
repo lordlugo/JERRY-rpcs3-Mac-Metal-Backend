@@ -300,6 +300,9 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 	// stretch threshold (75 ms of 100), so playback kept slowing down ("slow audio"); the buffer absorbs the lateness.
 	// MSAA stays on Auto (the official entry turns it off, leaving every edge aliased): single-sample surfaces get the
 	// fork's forced host MSAA, which anti-aliases geometry edges (the GPU is 26-41% busy at the game's 30 fps cap).
+	// Approximate ZCULL (Accurate ZCULL stats off): the game reads occlusion results while the GPU is still busy (the RSX
+	// thread waited 5-7 ms per frame in "zcull report read"); approximate stats stop at the first visible sample, so most
+	// reads need no wait.
 	// Its 30 fps cap is in the game code (timed with the timebase; a 120 Hz vblank left it at 30). The resolution
 	// scale is the user's own.
 	static constexpr std::string_view gta4_serials[] = { "BLES00229", "BLUS30127", "NPEB00882", "BLES01128", "BLUS30682" };
@@ -314,6 +317,7 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 			"  MSAA: Auto\n"
 			"  Multithreaded RSX: true\n"
 			"  Write Color Buffers: true\n"
+			"  Accurate ZCULL stats: false\n"
 			"Audio:\n"
 			"  Desired Audio Buffer Duration: 100\n"
 			"  Enable Time Stretching: false\n";
@@ -2080,11 +2084,18 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				}
 			}
 
-			// RPCS3 Metal fork: freezes without it (see get_builtin_title_config), so a custom config cannot turn it off
-			if (!g_cfg.core.rsx_accurate_res_access && title_needs_accurate_rsx_reservations(m_title_id, m_title))
+			// RPCS3 Metal fork: on for every game. Without it the RSX's writes to main memory (zcull reports, labels,
+			// Write Color Buffers flushes, NV0039/NV3089 copies) do not take the 128-byte reservations, so an SPU atomic
+			// update of the same cache line can be lost. SPURS keeps its scheduling state in such lines: a lost update
+			// leaves an SPU waiting forever, the game hangs (God of War: Ascension in the menus, Far Cry 3, Assassin's
+			// Creed II on a loading screen right after its SPUs began reading the report area) and the SPU thread
+			// never stops on exit. A per-title list only ever catches a game after it froze; the cost is small (SPU
+			// atomics on lines the RSX writes take its range lock).
+			if (!g_cfg.core.rsx_accurate_res_access)
 			{
 				g_cfg.core.rsx_accurate_res_access.set(true);
-				sys_log.notice("Accurate RSX reservation access: on (%s freezes without it)", m_title_id);
+				sys_log.notice("Accurate RSX reservation access: on (SPU atomics must not race RSX writes to main memory: games freeze without it%s)",
+					title_needs_accurate_rsx_reservations(m_title_id, m_title) ? ", this one is known to" : "");
 			}
 
 			// RPCS3 Metal fork: per-game configs made while Atomic was the default still say Atomic (see metal-fork-defaults-v10)
@@ -3575,6 +3586,15 @@ void Emulator::GracefulShutdown(bool allow_autoexit, bool async_op, bool savesta
 	const u64 read_counter = get_sysutil_cb_manager_read_count();
 
 	const bool force_termination = old_state == system_state::frozen || savestate;
+
+	if (!force_termination && old_state != system_state::paused)
+	{
+		// RPCS3 Metal fork: a game closed because it froze leaves a report of where it hung
+		if (auto rsx = rsx::get_current_renderer())
+		{
+			rsx->report_stall_on_exit();
+		}
+	}
 
 	if (!force_termination)
 	{

@@ -351,6 +351,20 @@ private:
 	f32 cb_pad_level = 0.0f;                   // Level of cb_last_frame in the last padded frame
 	std::array<u8, sizeof(f32) * AUDIO_MAX_CHANNELS> cb_last_frame{};
 
+	// RPCS3 Metal fork: the most audio the output took in one go while playing (one callback, or callbacks back to back
+	// within 2 ms: Bluetooth outputs pull in bursts). The cellAudio thread keeps this much queued while it waits for a
+	// late game, so waiting never runs the output dry. Written by the backend's callback, read by the cellAudio thread.
+	std::atomic<u32> cb_max_burst_frames{0};
+	u32 cb_burst_frames = 0;
+	u64 cb_last_pull_us = 0;
+
+	// RPCS3 Metal fork: silence that the cellAudio thread inserts between game audio fades instead of cutting it hard
+	// (a hard cut is a click; many of them in a row are heard as crackling). cellAudio thread only.
+	static constexpr u32 prod_fade_frames = 128; // 2.7 ms at 48 kHz
+	bool m_prod_silent = true;
+	std::array<f32, AUDIO_MAX_CHANNELS> m_prod_last_frame{};
+	std::unique_ptr<float[]> m_prod_scratch{};
+
 	// Diagnostics, see take_xrun_stats(). Written by the backend's real-time callback: relaxed atomics only.
 	std::atomic<u64> cb_underruns{0};
 	std::atomic<u64> cb_padded_frames{0};
@@ -393,6 +407,9 @@ public:
 
 	u64 get_enqueued_samples() const;
 	u64 get_enqueued_playtime() const;
+
+	// Largest pull of the output seen so far (usecs), at least one device buffer
+	u64 get_output_burst_duration() const;
 
 	bool is_playing() const
 	{
@@ -444,7 +461,9 @@ private:
 	{
 		u64 late_waited = 0;    // The game was later than the skip timeouts and the queued audio covered the wait
 		u64 skipped = 0;        // The game was too late: time advanced without its audio
-		u64 silent = 0;         // Ports started but untouched as expected: silence enqueued
+		u64 silent = 0;         // Ports started but untouched as expected (the game is idle): silence enqueued
+		u64 gaps = 0;           // The game was late and the queue ran low: one faded gap of silence inserted
+		u64 gap_us = 0;         // Total length of those gaps
 		u64 thread_late = 0;    // This thread ran more than two periods after its previous loop iteration
 		u64 max_thread_gap = 0; // usecs
 		audio_ringbuffer::xrun_stats output{};
@@ -454,6 +473,12 @@ private:
 	u64 m_stats_time = 0;       // Start of the current report window
 	u64 m_last_loop_time = 0;   // Previous loop iteration, 0 when the next gap must not be measured
 	bool m_period_late = false; // The game is later than the skip timeouts for the current period
+
+	// RPCS3 Metal fork: periods in a row the game left all its ports untouched. A game that produced audio a moment ago
+	// is late, and the thread waits for it while the queue covers the wait; after idle_after_periods it is idle (menus,
+	// loading) and gets silence at the normal rate, like upstream.
+	static constexpr u32 idle_after_periods = 8;
+	u32 m_silent_run = idle_after_periods;
 
 public:
 	shared_mutex emu_cfg_upd_m{};

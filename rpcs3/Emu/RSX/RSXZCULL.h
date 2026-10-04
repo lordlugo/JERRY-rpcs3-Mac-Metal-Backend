@@ -233,6 +233,18 @@ namespace rsx
 			// Deferred labels are waiting for reports
 			bool has_deferred_labels() const { return !m_deferred_labels.empty(); }
 
+			// The newest held-back label for this address carries this value (what the memory will hold once written)
+			bool deferred_label_will_write(u32 address, u32 value) const
+			{
+				for (auto it = m_deferred_labels.rbegin(); it != m_deferred_labels.rend(); ++it)
+				{
+					if (it->address == address)
+						return it->value == value;
+				}
+
+				return false;
+			}
+
 			// A deferred label targets this address
 			bool has_deferred_label_at(u32 address) const
 			{

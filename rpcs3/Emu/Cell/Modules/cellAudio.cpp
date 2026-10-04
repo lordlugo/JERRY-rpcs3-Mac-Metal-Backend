@@ -362,6 +362,7 @@ audio_ringbuffer::audio_ringbuffer(cell_audio_config& _cfg)
 
 	cb_ringbuf.set_buf_size(static_cast<u32>(cfg.backend_ch_cnt * cfg.audio_sampling_rate * cfg.audio_sample_size * buffer_dur_mult));
 	cb_capacity = cb_ringbuf.get_total_size();
+	m_prod_scratch = std::make_unique<float[]>(usz{AUDIO_MAX_CHANNELS} * AUDIO_BUFFER_SAMPLES);
 	backend->SetWriteCallback(std::bind(&audio_ringbuffer::backend_write_callback, this, std::placeholders::_1, std::placeholders::_2));
 	backend->SetStateCallback(std::bind(&audio_ringbuffer::backend_state_callback, this, std::placeholders::_1));
 }
@@ -412,6 +413,20 @@ u32 audio_ringbuffer::backend_write_callback(u32 size, void *buf)
 
 	const u32 frames_req = size / frame_bytes;
 	const u64 bytes_req = u64{frames_req} * frame_bytes;
+
+	// Pull size, for how much the cellAudio thread keeps queued (get_output_burst_duration). Callbacks within 2 ms of
+	// each other are one burst. Only while playing: the first callbacks after a start or a refill catch up at once.
+	if (cb_counting && !cb_refilling)
+	{
+		const u64 now = get_system_time();
+		cb_burst_frames = (now - cb_last_pull_us < 2000) ? cb_burst_frames + frames_req : frames_req;
+		cb_last_pull_us = now;
+
+		if (cb_burst_frames > cb_max_burst_frames.load(std::memory_order_relaxed))
+		{
+			cb_max_burst_frames.store(cb_burst_frames, std::memory_order_relaxed);
+		}
+	}
 	const f32 fade_step = 1.0f / cb_fade_frames;
 	u32 frames = 0;
 
@@ -527,6 +542,12 @@ u64 audio_ringbuffer::get_enqueued_samples() const
 	return ringbuf_samples;
 }
 
+u64 audio_ringbuffer::get_output_burst_duration() const
+{
+	const u64 burst = u64{cb_max_burst_frames.load(std::memory_order_relaxed)} * 1'000'000 / cfg.audio_sampling_rate;
+	return std::max(burst, cfg.backend_buffer_duration);
+}
+
 u64 audio_ringbuffer::get_enqueued_playtime() const
 {
 	AUDIT(cfg.buffering_enabled);
@@ -552,6 +573,33 @@ void audio_ringbuffer::enqueue(bool enqueue_silence, bool force)
 	{
 		// backend is not ready yet
 		return;
+	}
+
+	// RPCS3 Metal fork: no hard cuts between game audio and inserted silence. Silence after audio continues from the
+	// last frame down to zero within prod_fade_frames, and audio after silence fades in. (commit_data converts the
+	// buffer in place, so the faded silence goes through a scratch buffer, never the shared silence buffer.)
+	const u32 ch = cfg.audio_channels;
+	const f32 fade_step = 1.0f / prod_fade_frames;
+
+	if (enqueue_silence)
+	{
+		if (!m_prod_silent && m_prod_scratch && ch <= AUDIO_MAX_CHANNELS)
+		{
+			AudioBackend::fill_decay(m_prod_scratch.get(), AUDIO_BUFFER_SAMPLES, m_prod_last_frame.data(), ch, sizeof(f32), 1.0f, fade_step);
+			buf = m_prod_scratch.get();
+		}
+
+		m_prod_silent = true;
+	}
+	else if (ch <= AUDIO_MAX_CHANNELS)
+	{
+		if (m_prod_silent)
+		{
+			AudioBackend::apply_gain_ramp(buf, prod_fade_frames, ch, sizeof(f32), 0.0f, fade_step);
+		}
+
+		m_prod_silent = false;
+		std::memcpy(m_prod_last_frame.data(), buf + usz{AUDIO_BUFFER_SAMPLES - 1} * ch, sizeof(f32) * ch);
 	}
 
 	// Enqueue audio
@@ -638,6 +686,7 @@ void audio_ringbuffer::flush()
 	cb_counting = false;
 	cb_fade_in_level = 0.0f;
 	cb_pad_level = 0.0f;
+	m_prod_silent = true;
 
 	if (frequency_ratio != RESAMPLER_MAX_FREQ_VAL)
 	{
@@ -1171,17 +1220,17 @@ void cell_audio_thread::report_stats(u64 timestamp)
 
 	const period_stats& s = m_stats;
 
-	if (s.late_waited || s.skipped || s.silent || s.thread_late || s.output.underruns || s.output.padded_frames || s.output.dropped_frames)
+	if (s.late_waited || s.skipped || s.silent || s.gaps || s.thread_late || s.output.underruns || s.output.padded_frames || s.output.dropped_frames)
 	{
 		// Late game: late periods covered by the queue, skipped (and silent) periods. Late cellAudio thread: its own
 		// gaps. Output: underruns of the device's queue, audio lost to a full queue.
 		const f64 frames_per_ms = cfg.audio_sampling_rate / 1000.0;
 		const std::string queue = cfg.buffering_enabled ? fmt::format(", average queue %.1f ms (desired %u ms)", m_average_playtime / 1000.0, cfg.desired_buffer_duration / 1000) : std::string{};
 
-		cellAudio.notice("Audio in the last %u s: game late for %u period(s) covered by the queue, %u skipped, %u silent; "
-			"cellAudio thread late %u time(s) (longest gap %.1f ms); output underrun %u time(s) (%.1f ms of silence), %.1f ms dropped (queue full)%s",
-			elapsed / 1'000'000, s.late_waited, s.skipped, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
-			s.output.padded_frames / frames_per_ms, s.output.dropped_frames / frames_per_ms, queue);
+		cellAudio.notice("Audio in the last %u s: game late for %u period(s) covered by the queue, %u skipped, %u gap(s) inserted for a late game (%.1f ms), %u silent while the game was idle; "
+			"cellAudio thread late %u time(s) (longest gap %.1f ms); output underrun %u time(s) (%.1f ms of silence), %.1f ms dropped (queue full)%s, output pulls up to %.1f ms",
+			elapsed / 1'000'000, s.late_waited, s.skipped, s.gaps, s.gap_us / 1000.0, s.silent, s.thread_late, s.max_thread_gap / 1000.0, s.output.underruns,
+			s.output.padded_frames / frames_per_ms, s.output.dropped_frames / frames_per_ms, queue, ringbuffer->get_output_burst_duration() / 1000.0);
 	}
 
 	m_stats = {};
@@ -1291,6 +1340,8 @@ void cell_audio_thread::operator()()
 				m_average_playtime = static_cast<f32>(ringbuffer->get_enqueued_playtime());
 				untouched_expected = 0;
 			}
+
+			m_silent_run = idle_after_periods;
 
 			m_audio_should_restart = false;
 			continue;
@@ -1422,6 +1473,36 @@ void cell_audio_thread::operator()()
 				continue;
 			}
 
+			// RPCS3 Metal fork: waiting for a late game. The thread waits while the queue holds more than the output's
+			// largest pull plus one period (measured, see get_output_burst_duration: Bluetooth outputs pull in bursts),
+			// for at most the desired buffer duration. The previous fixed floor (half the desired buffer, 50 ms) sat above
+			// the queue a real-time-paced game keeps (GTA IV: 20 ms on average), so every period the game was a fraction
+			// of a millisecond late became 5.3 ms of hard-cut silence: 1017 of them in 30 s, heard as crackling and
+			// stutter. When the queue does run low, one faded gap long enough to rebuild a reserve is inserted instead
+			// of a gap every period.
+			const u64 wait_floor = std::min<u64>(ringbuffer->get_output_burst_duration() + cfg.audio_block_period + 1000, cfg.desired_buffer_duration / 2);
+			const bool queue_covers_wait = !g_cfg.audio.disable_sampling_skip &&
+				enqueued_playtime > wait_floor &&
+				time_since_last_period < cfg.desired_buffer_duration;
+
+			// The game is late and the queue is low: silence for this period plus a reserve, so that the next late
+			// periods are covered by the queue again (one short dropout instead of crackling)
+			const auto insert_gap = [&]()
+			{
+				const u64 target = wait_floor + std::max<u64>(4 * u64{cfg.audio_block_period}, cfg.desired_buffer_duration / 4);
+				u64 blocks = 1;
+
+				if (enqueued_playtime + cfg.audio_block_period < target)
+				{
+					blocks = (target - enqueued_playtime + cfg.audio_block_period - 1) / cfg.audio_block_period;
+				}
+
+				blocks = std::min<u64>(blocks, cfg.desired_full_buffers);
+				ringbuffer->enqueue_silence(static_cast<u32>(blocks));
+				m_stats.gaps++;
+				m_stats.gap_us += blocks * cfg.audio_block_period;
+			};
+
 			// Wait until buffers have been touched
 			//cellAudio.error("active=%u, in_progress=%u, untouched=%u, incomplete=%u", active_ports, in_progress, untouched, incomplete);
 			if (untouched > untouched_expected)
@@ -1431,23 +1512,21 @@ void cell_audio_thread::operator()()
 				const bool timed_out = (untouched == active_ports && time_since_last_period > cfg.fully_untouched_timeout) ||
 					time_since_last_period > cfg.partially_untouched_timeout;
 
-				// RPCS3 Metal fork: those timeouts (2 periods, 4 when some ports were written) are much shorter than the
-				// audio that is queued with buffering. A game that is merely slow (long frames, saturated SPUs) lost the
-				// period, and left a gap, while the queue could have covered the wait. Keep waiting while the queue holds
-				// more than the device's next pull plus one period, for at most the desired buffer duration. A game that
-				// stopped feeding its ports (menus, loading) still gets its period skipped, and silence enqueued for the
-				// periods after it, before the queue runs dry.
-				// Half the desired buffer stays queued (Bluetooth outputs pull in large bursts, see the silence path below)
-				const bool queue_covers_wait = enqueued_playtime > std::max<u64>(cfg.backend_buffer_duration + 2 * cfg.audio_block_period, cfg.desired_buffer_duration / 2) &&
-					time_since_last_period < cfg.desired_buffer_duration / 2;
-
 				if ((timed_out && !queue_covers_wait) || g_cfg.audio.disable_sampling_skip)
 				{
-					// There's no audio in the buffers, simply advance time and hope the game recovers
+					// The game's period is lost: faded silence takes its place (upstream queued nothing and let the
+					// output run dry)
 					cellAudio.trace("advancing time: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
 					const period_work work(scheduling);
 					m_stats.skipped++;
+					insert_gap();
 					untouched_expected = untouched;
+
+					if (untouched == active_ports)
+					{
+						m_silent_run++;
+					}
+
 					advance(timestamp);
 					continue;
 				}
@@ -1462,21 +1541,12 @@ void cell_audio_thread::operator()()
 			// Fast-path for when there is no audio in the buffers
 			if (untouched == active_ports)
 			{
-				// RPCS3 Metal fork: after one skipped period every port is "expected" untouched, so each later period the
-				// game has not written yet came straight here and became silence, although the queue held tens of ms of
-				// audio and the game was only a few ms late (GTA IV: 47 skips -> ~680 silent periods per 30 s, heard as
-				// heavy audio stutter). Same rule as the skip above: wait for the game while the queue covers the wait,
-				// for at most the desired buffer duration. A game that really stopped feeding its ports drains the
-				// queue first and then gets silence at the normal rate.
-				// Keep at least half of the desired buffer queued while waiting: Bluetooth outputs (AirPods) pull audio
-				// in bursts much larger than their nominal buffer, so waiting down to one device buffer plus a period
-				// (the rule above) ran the output dry: 132 underruns, 4 s of silence in 30 s.
-				const u64 wait_floor = std::max<u64>(cfg.backend_buffer_duration + 2 * cfg.audio_block_period, cfg.desired_buffer_duration / 2);
-				const bool queue_covers_wait = cfg.buffering_enabled &&
-					enqueued_playtime > wait_floor &&
-					time_since_last_period < cfg.desired_buffer_duration / 2;
+				// A game that produced audio a moment ago is late, not idle: wait for it while the queue covers the wait
+				// (after a skip every port is "expected" untouched, and upstream turned each later period straight into
+				// silence). A game idle for idle_after_periods periods gets silence at the normal rate, like upstream.
+				const bool game_idle = m_silent_run >= idle_after_periods;
 
-				if (queue_covers_wait && !g_cfg.audio.disable_sampling_skip)
+				if (!game_idle && queue_covers_wait)
 				{
 					// Counted as a late period (covered by the queue) once upstream would have given it up
 					m_period_late |= time_since_last_period > cfg.fully_untouched_timeout;
@@ -1484,11 +1554,20 @@ void cell_audio_thread::operator()()
 					continue;
 				}
 
-				// There's no audio in the buffers, simply advance time
 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
 				const period_work work(scheduling);
-				m_stats.silent++;
-				ringbuffer->enqueue_silence();
+
+				if (game_idle)
+				{
+					m_stats.silent++;
+					ringbuffer->enqueue_silence();
+				}
+				else
+				{
+					insert_gap();
+				}
+
+				m_silent_run++;
 				untouched_expected = untouched;
 				advance(timestamp);
 				continue;
@@ -1506,6 +1585,7 @@ void cell_audio_thread::operator()()
 
 			// Store number of untouched buffers for future reference
 			untouched_expected = untouched;
+			m_silent_run = 0;
 
 			// Log if we enqueued untouched/incomplete buffers
 			if (untouched > 0 || incomplete > 0)

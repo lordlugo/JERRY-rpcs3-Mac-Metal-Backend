@@ -68,9 +68,14 @@ namespace rsx
 					return;
 				}
 			}
-			else if (RSX(ctx)->has_deferred_labels() && RSX(ctx)->defer_label(address, data))
+
+			// RPCS3 Metal fork: while labels are held back for zcull reports, every later label joins them in order
+			// (flip semaphores, and labels written without a pipeline flush such as texture read semaphores). Forcing
+			// the held-back ones out instead waits for the GPU to write their reports: GTA IV releases a texture read
+			// semaphore after back-end labels every frame, and the RSX thread waited 7-10 ms per frame there
+			// ("zcull report read: labels held back for reports forced out").
+			if (RSX(ctx)->has_deferred_labels() && RSX(ctx)->defer_label(address, data))
 			{
-				// Flip semaphores stay ordered behind labels that are held back for zcull reports
 				return;
 			}
 
