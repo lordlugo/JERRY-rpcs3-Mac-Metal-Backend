@@ -1,8 +1,11 @@
 #include "stdafx.h"
 #include "device.h"
+#include "commands.h"
 
 #include "Emu/RSX/Metal/MTLDeviceQuery.h"
 #include "Emu/RSX/Metal/MTLPipelineArchive.h"
+
+#include <chrono>
 
 namespace mtl
 {
@@ -140,6 +143,10 @@ namespace mtl
 			m_compiler = nullptr;
 		}
 
+		// Every submission completed (or was abandoned): the queues' submission records go with them
+		forget_queue_submissions(m_async_queue);
+		forget_queue_submissions(m_queue);
+
 		if (m_async_queue)
 		{
 			m_async_queue->release();
@@ -168,7 +175,7 @@ namespace mtl
 
 		std::lock_guard lock(m_residency_lock);
 		m_residency->addAllocation(allocation);
-		m_residency_dirty = true;
+		m_residency_added = true;
 		m_residency_count++;
 	}
 
@@ -179,10 +186,17 @@ namespace mtl
 			return;
 		}
 
+		const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+
 		std::lock_guard lock(m_residency_lock);
 		m_residency->removeAllocation(allocation);
-		m_residency_dirty = true;
 		m_residency_count--;
+
+		if (m_pending_evictions.empty())
+		{
+			m_first_pending_eviction_us = now_us;
+		}
 
 		// The caller releases the allocation right after this. The removal is only staged until the next commit(), and
 		// committing a set that still references a deallocated resource crashes inside the Objective-C runtime.
@@ -197,14 +211,30 @@ namespace mtl
 			return;
 		}
 
+		// Additions must be committed before the GPU runs work that may use them. Removals only give memory back, and a
+		// commit processes the set: they are committed with the next addition, or once 64 are pending or the oldest
+		// one is 50 ms old (a few submissions, not every one of them).
+		constexpr usz max_pending_evictions = 64;
+		constexpr u64 max_eviction_delay_us = 50'000;
+
+		const u64 now_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count());
+
 		std::vector<MTL::Allocation*> evicted;
 		{
 			std::lock_guard lock(m_residency_lock);
-			if (m_residency_dirty)
+
+			const bool removals_due = !m_pending_evictions.empty() &&
+				(m_pending_evictions.size() >= max_pending_evictions || now_us - m_first_pending_eviction_us >= max_eviction_delay_us);
+
+			if (!m_residency_added && !removals_due)
 			{
-				m_residency->commit();
-				m_residency_dirty = false;
+				return;
 			}
+
+			m_residency->commit();
+			m_residency_added = false;
+			m_residency_commits++;
 
 			evicted.swap(m_pending_evictions);
 		}
@@ -233,6 +263,18 @@ namespace mtl
 	u64 render_device::allocated_bytes() const
 	{
 		return m_device ? m_device->currentAllocatedSize() : 0;
+	}
+
+	u64 render_device::resident_allocation_count() const
+	{
+		reader_lock lock(m_residency_lock);
+		return m_residency_count;
+	}
+
+	u64 render_device::get_residency_commits_and_reset()
+	{
+		std::lock_guard lock(m_residency_lock);
+		return std::exchange(m_residency_commits, 0);
 	}
 
 	// MTLDeviceQuery.h

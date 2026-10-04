@@ -7,9 +7,10 @@
 //    No ShaderWrite: nothing writes surfaces from compute, and it would cost lossless compression.
 //    MSAA targets are TextureType2DMultisample.
 //  - No layouts. Feedback loops (sampling a bound attachment) cannot be solved with a barrier inside a pass on Apple
-//    GPUs: texture_barrier() ends the current render pass (the next encoder waits for all prior work) when the surface
-//    was written by that pass (written_in_pass, marked by the renderer after draws and clears), and counts the split
-//    in mtl::g_feedback_loop_pass_splits. Writes of passes that already ended are in memory and need no split.
+//    GPUs: texture_barrier() ends the current render pass (the draw then samples in the next pass, which the hazard
+//    tracker orders after the ended pass's writes) when the surface was written by that pass (written_in_pass, marked
+//    by the renderer after draws and clears), and counts the split in mtl::g_feedback_loop_pass_splits. Writes of
+//    passes that already ended are ordered by the tracker and need no split.
 //    Same-pixel feedback can use framebuffer fetch instead (renderer's call).
 //  - Feedback streaks: a run of draws of the same material (same programs, textures, blending, viewport and scissor,
 //    no texture cache invalidation or wait-for-idle in between) that each sample and write the same attachment (water
@@ -173,6 +174,7 @@ namespace mtl
 		// MSAA support:
 		// Get the linear resolve target bound to this surface. Initialize if none exists
 		mtl::viewable_image* get_resolve_target_safe(mtl::command_list& cmd);
+		mtl::viewable_image* ensure_resolve_target();
 		// Resolve the planar MSAA data into a linear block
 		void resolve(mtl::command_list& cmd);
 		// Unresolve the linear data into planar MSAA data
@@ -238,8 +240,8 @@ namespace mtl
 		bool spill(mtl::command_list& cmd, std::vector<std::unique_ptr<mtl::viewable_image>>& resolve_cache);
 
 		// Synchronization
-		// Feedback loop: Metal cannot wait inside a render pass. Ends the pass (if open) so the next pass is ordered
-		// after every previous attachment write. Increments g_feedback_loop_pass_splits when a pass had to be split.
+		// Feedback loop: Metal cannot wait inside a render pass. Ends the pass (if open) so that the sampling draw runs
+		// in a pass ordered after the attachment writes. Increments g_feedback_loop_pass_splits when a pass was split.
 		void texture_barrier(mtl::command_list& cmd);
 		void post_texture_barrier(mtl::command_list& cmd);
 		void memory_barrier(mtl::command_list& cmd, rsx::surface_access access);
@@ -542,5 +544,20 @@ namespace mtl
 		bool can_collapse_surface(const std::unique_ptr<mtl::render_target>& surface, rsx::problem_severity severity) override;
 		bool handle_memory_pressure(mtl::command_list& cmd, rsx::problem_severity severity) override;
 		void trim(mtl::command_list& cmd, rsx::problem_severity memory_pressure);
+
+		// Every color surface in the cache (graphics self-check, MTLFrameInspector)
+		template <typename F>
+		void for_each_color_surface(F&& func)
+		{
+			if (!m_render_targets_memory_range.valid())
+			{
+				return;
+			}
+
+			for (auto it = m_render_targets_storage.begin_range(m_render_targets_memory_range); it != m_render_targets_storage.end(); ++it)
+			{
+				func(it->second.get());
+			}
+		}
 	};
 }

@@ -5,6 +5,7 @@
 #include "RSXThread.h"
 #include "Capture/rsx_capture.h"
 #include "Core/RSXReservationLock.hpp"
+#include "Common/sync_wait_stats.hpp"
 #include "Emu/Memory/vm_reservation.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
 #include "NV47/HW/context.h"
@@ -218,6 +219,7 @@ namespace rsx
 						const auto then = std::exchange(now, get_system_time());
 						start_time = now;
 						m_thread->performance_counters.idle_time += now - then;
+						g_sync_wait_stats.add(sync_wait::fifo_empty, now - then);
 					}
 					else
 					{
@@ -371,7 +373,13 @@ namespace rsx
 			if (m_remaining_commands)
 			{
 				// Previous block aborted to wait for PUT pointer
-				read_unsafe(data);
+				if (!read_unsafe(data))
+				{
+					// Still not published (or the fetch failed and the FIFO was recovered): data was not written, and
+					// run_FIFO must not execute whatever its uninitialized register pair holds
+					data.reg = FIFO_EMPTY;
+				}
+
 				return;
 			}
 
@@ -478,9 +486,13 @@ namespace rsx
 					}
 					else
 					{
+						// The first argument is not published yet (PUT points right after the header). Leave the header
+						// unconsumed and read it again once PUT moves. Resuming the block here instead (read_unsafe reads
+						// the word after m_internal_get, which already points at the first argument) would skip that
+						// argument and take the next command's header as the block's last one.
 						data.reg = FIFO_EMPTY;
-						m_command_reg = m_cmd & 0xfffc;
-						m_remaining_commands++;
+						m_internal_get -= 4;
+						m_remaining_commands = 0;
 					}
 
 					return;
@@ -666,6 +678,53 @@ namespace rsx
 
 			return NOTHING;
 		}
+
+		// Desync diagnostics, error path only (first few per session): where the bad word was read, whether the memory
+		// there still holds what the RSX executed (the Atomic fetch executes from a copy taken up to 1 KiB earlier), and
+		// the surrounding command memory as it is now. Reads through the unprotected mapping: no texture cache side effects.
+		static void report_desync(const FIFO_control& fifo, u32 pos, u32 word, u32 list_start, u32 ret_addr, u32 restore, u32 put)
+		{
+			static u32 s_reports = 0; // RSX thread only
+
+			if (s_reports >= 6)
+			{
+				return;
+			}
+
+			s_reports++;
+
+			auto read_word = [&](u32 offset) -> u64
+			{
+				if (const u32 ea = fifo.translate_address(offset); ea != umax && vm::check_addr(ea))
+				{
+					return *vm::get_super_ptr<const be_t<u32>>(ea);
+				}
+
+				return umax;
+			};
+
+			const u64 now = read_word(pos);
+			std::string around;
+
+			for (u32 offset = pos - 16; offset != pos + 20; offset += 4)
+			{
+				const u64 value = read_word(offset);
+				const std::string text = value == umax ? std::string("--------") : fmt::format("%08x", value);
+
+				if (offset == pos)
+				{
+					fmt::append(around, " [%s]", text);
+				}
+				else
+				{
+					fmt::append(around, " %s", text);
+				}
+			}
+
+			rsx_log.error("FIFO desync: 0x%x read at 0x%x (memory now: %s), list entered at 0x%x (+0x%x), return address 0x%x, restore point 0x%x, PUT 0x%x; memory at 0x%x..0x%x:%s",
+				word, pos, now == umax ? std::string("unmapped") : now == word ? std::string("same") : fmt::format("0x%x, changed since fetched", now),
+				list_start, pos - list_start, ret_addr, restore, put, pos - 16, pos + 16, around);
+		}
 	}
 
 	void thread::run_FIFO()
@@ -691,20 +750,15 @@ namespace rsx
 			}
 			case FIFO::FIFO_EMPTY:
 			{
-				// Back off after sustained emptiness: yield-storming a core while the
-				// game feeds in bursts starves the producer PPU threads (bursty feeding
-				// reads as micro-stutter). A 50us nap is nothing against a 16ms frame.
-				thread_local u32 fifo_empty_spins = 0;
-
+				// Never sleep here. The RSX thread services its sub-units (zcull reports, labels held back for them,
+				// backend tasks) only every 64 turns of its loop (rsx::thread::on_task), and new commands are only
+				// seen by polling the put pointer: any nap is multiplied into the latency of labels and flips the
+				// guest waits on, while the guest (and the GPU) sit idle. Timed waits can also oversleep a lot on
+				// macOS (timer coalescing).
 				if (performance_counters.state == FIFO::state::running)
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
 					performance_counters.state = FIFO::state::empty;
-					fifo_empty_spins = 0;
-				}
-				else if (++fifo_empty_spins > 2000)
-				{
-					thread_ctrl::wait_for(50);
 				}
 				else
 				{
@@ -721,6 +775,7 @@ namespace rsx
 			case FIFO::FIFO_ERROR:
 			{
 				rsx_log.error("FIFO error: possible desync event (last cmd = 0x%x)", get_fifo_cmd());
+				FIFO::report_desync(*fifo_ctrl, fifo_ctrl->get_pos(), get_fifo_cmd(), last_known_code_start, fifo_ret_addr, restore_point, ctrl->put);
 				recover_fifo();
 				return;
 			}
@@ -746,6 +801,12 @@ namespace rsx
 				}
 				else
 				{
+					if (fifo_ctrl->translate_address(offs) == umax) [[unlikely]]
+					{
+						// Fails as a FIFO error at the target: report the jump itself, the target says nothing
+						FIFO::report_desync(*fifo_ctrl, fifo_ctrl->get_pos(), cmd, last_known_code_start, fifo_ret_addr, restore_point, ctrl->put);
+					}
+
 					last_known_code_start = offs;
 				}
 
@@ -759,11 +820,18 @@ namespace rsx
 				{
 					// Only one layer is allowed in the call stack.
 					rsx_log.error("FIFO: CALL found inside a subroutine (last cmd = 0x%x)", get_fifo_cmd());
+					FIFO::report_desync(*fifo_ctrl, fifo_ctrl->get_pos(), cmd, last_known_code_start, fifo_ret_addr, restore_point, ctrl->put);
 					recover_fifo();
 					return;
 				}
 
 				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
+
+				if (fifo_ctrl->translate_address(offs) == umax) [[unlikely]]
+				{
+					FIFO::report_desync(*fifo_ctrl, fifo_ctrl->get_pos(), cmd, last_known_code_start, fifo_ret_addr, restore_point, ctrl->put);
+				}
+
 				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
 				fifo_ctrl->set_get(offs);
 				last_known_code_start = offs;
@@ -774,6 +842,7 @@ namespace rsx
 				if (fifo_ret_addr == RSX_CALL_STACK_EMPTY)
 				{
 					rsx_log.error("FIFO: RET found without corresponding CALL (last cmd = 0x%x)", get_fifo_cmd());
+					FIFO::report_desync(*fifo_ctrl, fifo_ctrl->get_pos(), cmd, last_known_code_start, fifo_ret_addr, restore_point, ctrl->put);
 					recover_fifo();
 					return;
 				}
@@ -819,7 +888,9 @@ namespace rsx
 			}
 
 			// Update performance counters with time spent in idle mode
-			performance_counters.idle_time += (get_system_time() - performance_counters.FIFO_idle_timestamp);
+			const u64 idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp;
+			performance_counters.idle_time += idle_us;
+			g_sync_wait_stats.add(sync_wait::fifo_empty, idle_us);
 		}
 
 		do

@@ -476,6 +476,7 @@ namespace gcm
 		RSX_SHADER_CONTROL_ROP_MULTISAMPLED         = 0x10000000, // ROP outputs are multisampled
 		RSX_SHADER_CONTROL_ROP_OUTPUT_REMAP         = 0x20000000, // ROP outputs need channel swizzles.
 		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING    = 0x40000000, // Enable programmable blending.
+		RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST        = 0x80000000, // The fragment program performs the depth bounds test (no hardware support) on its own fragment depth, at pixel rate.
 
 		// Meta
 		RSX_SHADER_CONTROL_META_USES_DISCARD       = (RSX_SHADER_CONTROL_USES_KIL | RSX_SHADER_CONTROL_TEXTURE_ALPHA_KILL | RSX_SHADER_CONTROL_ALPHA_TEST | RSX_SHADER_CONTROL_POLYGON_STIPPLE | RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE),

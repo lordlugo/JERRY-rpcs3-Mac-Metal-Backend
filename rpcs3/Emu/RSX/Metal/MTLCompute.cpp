@@ -99,8 +99,8 @@ namespace mtl
 
 		bind_resources(cmd);
 
-		// Sets the pipeline on cmd.compute() (ends any open render pass, orders against the previous compute command),
-		// uploads push constants and binds the argument table.
+		// Begins the dispatch command (cmd.dispatch(): ends any open render pass, orders the dispatch after the earlier
+		// commands its bound buffers/images conflict with), sets the pipeline, uploads push constants, binds the table.
 		m_program->bind(cmd, get_scratch_heap());
 	}
 
@@ -115,8 +115,8 @@ namespace mtl
 
 		const u32 group_x = workgroup_size_x ? workgroup_size_x : optimal_group_size;
 
-		// The barrier for this dispatch was recorded by program::bind() (cmd.compute()); do not add another one.
-		cmd.compute_unordered()->dispatchThreadgroups(
+		// Declared (and ordered) by program::bind()
+		cmd.compute_encoder()->dispatchThreadgroups(
 			MTL::Size(invocations_x, invocations_y, invocations_z),
 			MTL::Size(group_x, workgroup_size_y, workgroup_size_z));
 	}

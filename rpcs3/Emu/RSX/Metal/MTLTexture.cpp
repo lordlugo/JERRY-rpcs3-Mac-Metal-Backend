@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "MTLCompute.h"
 #include "MTLDMA.h"
+#include "MTLGraphicsLog.h"
 #include "MTLHelpers.h"
 #include "MTLFormats.h"
 #include "MTLResourceManager.h"
@@ -21,8 +22,9 @@
 // Port of VK/VKTexture.cpp (+ the scratch resource helpers of VK/vkutils/scratch.cpp and the auxiliary upload heap).
 //
 // Metal specifics:
-//  - No image layouts, no explicit barriers: every transfer is recorded through cmd.compute(), which ends any open
-//    render pass and serializes against the previous command (see mtl::command_list).
+//  - No image layouts. Every transfer declares what it reads and writes (cmd.blit(), or program::bind() for compute
+//    kernels): the command list ends any open render pass and orders the transfer after the earlier work it conflicts
+//    with (see mtl::command_list). The copies of one transfer (rows, layers, regions of an upload) form one command.
 //  - One buffer <-> texture copy addresses a single array slice; multi-layer regions are split per layer.
 //  - Combined depth-stencil textures (Depth32Float_Stencil8) are copied one plane at a time with
 //    MTLBlitOptionDepthFromDepthStencil (4 bytes/texel, float) or MTLBlitOptionStencilFromDepthStencil (1 byte/texel).
@@ -277,15 +279,19 @@ namespace mtl
 		const u64 alignment_bits = src_offset | dst_offset | row_length | (rows > 1 ? (src_pitch | dst_pitch) : 0);
 		if ((alignment_bits & (s_buffer_copy_alignment - 1)) == 0)
 		{
+			const auto src_range = read_buffer(src, src_offset, u64{ rows - 1 } * src_pitch + row_length);
+			const auto dst_range = write_buffer(dst, dst_offset, u64{ rows - 1 } * dst_pitch + row_length);
+			auto encoder = ordered ? cmd.blit({ src_range, dst_range }) : cmd.blit_concurrent({ src_range, dst_range });
+
 			for (u32 row = 0; row < rows; ++row)
 			{
-				auto encoder = (ordered && row == 0) ? cmd.compute() : cmd.compute_unordered();
 				encoder->copyFromBuffer(src->value(), src_offset + row * src_pitch, dst->value(), dst_offset + row * dst_pitch, row_length);
 			}
 			return;
 		}
 
-		// Always ordered (program::bind records a barrier), so edge-word read-modify-writes never race
+		// A dispatch of its own (declared by program::bind), ordered after whatever wrote the edge words it
+		// read-modify-writes
 		mtl::get_compute_task<cs_byte_copy_task>()->run(cmd, src, src_offset, src_pitch, dst, dst_offset, dst_pitch, row_length, rows);
 	}
 
@@ -321,7 +327,8 @@ namespace mtl
 		};
 	}
 
-	// vkCmdCopyBufferToImage equivalent (one region, any number of layers)
+	// vkCmdCopyBufferToImage equivalent (one region, any number of layers). `ordered` = false: part of the command begun
+	// by the previous transfer (the caller guarantees they are independent, e.g. other levels of one upload).
 	static void copy_buffer_to_image_impl(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region, bool ordered = true)
 	{
 		const u32 aspect = get_transfer_aspect(dst, region);
@@ -338,26 +345,29 @@ namespace mtl
 			const u64 offset = region.buffer_offset + layer * layer_stride;
 			const u32 slice = is_3d ? 0 : (region.base_layer + layer);
 
+			const auto extent = get_region_rows(dst, region, aspect);
+			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
+			const auto dst_range = write_image(dst, region.mip_level, 1, slice, 1);
+
 			if ((offset % s_texture_copy_buffer_alignment) == 0) [[likely]]
 			{
-				auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
+				const auto src_range = read_buffer(src, offset, span);
+				auto encoder = (ordered && layer == 0) ? cmd.blit({ src_range, dst_range }) : cmd.blit_concurrent({ src_range, dst_range });
 				encoder->copyFromBuffer(src->value(), offset, bytes_per_row, bytes_per_image_arg,
 					region.image_extent, dst->value, slice, region.mip_level, region.image_offset, options);
 				continue;
 			}
 
 			// Misaligned source (e.g. zero-copy guest memory): move the data into the aligned staging area first
-			const auto extent = get_region_rows(dst, region, aspect);
-			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
 			const auto staging = get_transfer_staging_buffer(span);
 
 			copy_buffer_rows_impl(cmd, src, offset, span, staging, 0, span, span, 1, true);
-			cmd.compute()->copyFromBuffer(staging->value(), 0, bytes_per_row, bytes_per_image_arg,
+			cmd.blit({ read_buffer(staging, 0, span), dst_range })->copyFromBuffer(staging->value(), 0, bytes_per_row, bytes_per_image_arg,
 				region.image_extent, dst->value, slice, region.mip_level, region.image_offset, options);
 		}
 	}
 
-	// vkCmdCopyImageToBuffer equivalent (one region, any number of layers)
+	// vkCmdCopyImageToBuffer equivalent (one region, any number of layers). `ordered`: see copy_buffer_to_image_impl.
 	static void copy_image_to_buffer_impl(mtl::command_list& cmd, const mtl::image* src, const mtl::buffer* dst, const buffer_image_copy& region, bool ordered = true)
 	{
 		ensure(src->samples() == 1, "Metal cannot copy multisampled textures to buffers");
@@ -375,9 +385,14 @@ namespace mtl
 			const u64 offset = region.buffer_offset + layer * layer_stride;
 			const u32 slice = is_3d ? 0 : (region.base_layer + layer);
 
+			const auto extent = get_region_rows(src, region, aspect);
+			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
+			const auto src_range = read_image(src, region.mip_level, 1, slice, 1);
+
 			if ((offset % s_texture_copy_buffer_alignment) == 0) [[likely]]
 			{
-				auto encoder = (ordered && layer == 0) ? cmd.compute() : cmd.compute_unordered();
+				const auto dst_range = write_buffer(dst, offset, span);
+				auto encoder = (ordered && layer == 0) ? cmd.blit({ src_range, dst_range }) : cmd.blit_concurrent({ src_range, dst_range });
 				encoder->copyFromTexture(src->value, slice, region.mip_level, region.image_offset, region.image_extent,
 					dst->value(), offset, bytes_per_row, bytes_per_image_arg, options);
 				continue;
@@ -385,11 +400,9 @@ namespace mtl
 
 			// Misaligned destination (e.g. a DMA block at an arbitrary guest address): copy into the aligned staging area,
 			// then move only the texel rows so the bytes between rows (pitch padding) stay untouched, like a direct copy.
-			const auto extent = get_region_rows(src, region, aspect);
-			const u64 span = u64{ extent.slices - 1 } * bytes_per_image + u64{ extent.rows - 1 } * bytes_per_row + extent.row_bytes;
 			const auto staging = get_transfer_staging_buffer(span);
 
-			cmd.compute()->copyFromTexture(src->value, slice, region.mip_level, region.image_offset, region.image_extent,
+			cmd.blit({ src_range, write_buffer(staging, 0, span) })->copyFromTexture(src->value, slice, region.mip_level, region.image_offset, region.image_extent,
 				staging->value(), 0, bytes_per_row, bytes_per_image_arg, options);
 
 			for (u32 z = 0; z < extent.slices; ++z)
@@ -432,21 +445,28 @@ namespace mtl
 		}
 	}
 
-	// vkCmdCopyImage equivalent (identical formats only; copies all planes)
+	// vkCmdCopyImage equivalent (identical formats only; copies all planes). One command: the regions of one call are
+	// independent of each other (disjoint destinations).
 	static void copy_image_regions(mtl::command_list& cmd, const mtl::image* src, const mtl::image* dst, const image_copy_t* regions, usz count)
 	{
 		const bool src_3d = src->type() == MTL::TextureType3D;
 		const bool dst_3d = dst->type() == MTL::TextureType3D;
-		bool first = true;
+
+		gpu_access src_range = read_image(src, 0, 0);
+		gpu_access dst_range = write_image(dst, 0, 0);
+		for (usz i = 0; i < count; ++i)
+		{
+			src_range.lo |= read_image(src, regions[i].src_level, 1, regions[i].src_layer, regions[i].layer_count).lo;
+			dst_range.lo |= write_image(dst, regions[i].dst_level, 1, regions[i].dst_layer, regions[i].layer_count).lo;
+		}
+
+		auto encoder = cmd.blit({ src_range, dst_range });
 
 		for (usz i = 0; i < count; ++i)
 		{
 			const auto& rgn = regions[i];
 			for (u32 layer = 0; layer < rgn.layer_count; ++layer)
 			{
-				auto encoder = first ? cmd.compute() : cmd.compute_unordered();
-				first = false;
-
 				encoder->copyFromTexture(
 					src->value, src_3d ? 0 : (rgn.src_layer + layer), rgn.src_level, rgn.src_offset, rgn.extent,
 					dst->value, dst_3d ? 0 : (rgn.dst_layer + layer), rgn.dst_level, rgn.dst_offset);
@@ -456,6 +476,7 @@ namespace mtl
 
 	static void gpu_swap_bytes_impl(mtl::command_list& cmd, mtl::buffer* buf, u32 element_size, u32 data_offset, u32 data_length)
 	{
+		note_compute("shuffle");
 		if (element_size == 4)
 		{
 			mtl::get_compute_task<mtl::cs_shuffle_32>()->run(cmd, buf, data_length, data_offset);
@@ -550,7 +571,11 @@ namespace mtl
 		ensure((region.image_extent.width + region.image_offset.x) <= src->width());
 		ensure((region.image_extent.height + region.image_offset.y) <= src->height());
 
-		// NOTE: options.sync_region only requested a post-transfer barrier in VK. Every Metal transfer is serialized.
+		note_readback(static_cast<unsigned long long>(region.image_extent.width) * region.image_extent.height *
+			region.image_extent.depth * mtl::get_format_texel_width(src->format()));
+
+		// NOTE: options.sync_region only requested a post-transfer barrier in VK. Metal consumers of the buffer declare
+		// their reads and are ordered after this transfer by the command list.
 		switch (src->format())
 		{
 		default:
@@ -561,7 +586,10 @@ namespace mtl
 		}
 		case MTL::PixelFormatDepth32Float:
 		{
-			rsx_log.error("Unsupported transfer (D16_FLOAT)"); // Need real games to test this.
+			// Write Depth Buffer readback of a D16 guest surface stored as D32F on
+			// the host: blit the depth plane to a scratch bank, then pack it to
+			// half floats with a GPU conversion kernel ([D32->D16F] below).
+			rsx_log.trace("Depth32Float readback with D32->D16F GPU conversion.");
 			ensure(get_transfer_aspect(src, region) == aspect_depth);
 
 			const u32 out_w = region.buffer_row_length ? region.buffer_row_length : static_cast<u32>(region.image_extent.width);
@@ -581,6 +609,7 @@ namespace mtl
 			copy_image_to_buffer_impl(cmd, src, dst, region2);
 
 			// 2. Do conversion with byteswap [D32->D16F]
+			note_compute("fconvert");
 			if (!options.swap_bytes) [[likely]]
 			{
 				auto job = mtl::get_compute_task<mtl::cs_fconvert_task<f32, f16>>();
@@ -654,6 +683,7 @@ namespace mtl
 				}
 			}
 
+			note_compute("gather");
 			job->run(cmd, dst, data_offset, packed_length, z_offset, s_offset);
 			break;
 		}
@@ -662,6 +692,7 @@ namespace mtl
 
 	void copy_buffer_to_image(mtl::command_list& cmd, const mtl::buffer* src, const mtl::image* dst, const buffer_image_copy& region)
 	{
+		// Internal staging copies fan out from one upload_image() call, which is the counted flow below.
 		if (cmd.is_render_pass_open())
 		{
 			cmd.end_render_pass();
@@ -691,6 +722,7 @@ namespace mtl
 			const auto z32_offset = utils::align<u32>(data_offset + packed16_length, 256);
 
 			// 1. Do conversion with byteswap [D16F->D32F]
+			note_compute("fconvert");
 			auto job = mtl::get_compute_task<mtl::cs_fconvert_task<f16, f32>>();
 			job->run(cmd, src, data_offset, packed16_length, z32_offset);
 
@@ -717,7 +749,8 @@ namespace mtl
 			const auto s_offset = utils::align<u32>(z_offset + in_depth_size, 256);
 
 			// Zero out the stencil block
-			cmd.compute()->fillBuffer(src->value(), NS::Range::Make(s_offset, utils::align(in_stencil_size, 4)), 0);
+			const auto stencil_block = NS::Range::Make(s_offset, utils::align(in_stencil_size, 4));
+			cmd.blit({ write_buffer(src, stencil_block.location, stencil_block.length) })->fillBuffer(src->value(), stencil_block, 0);
 
 			// 1. Scatter the interleaved data into separate depth and stencil blocks
 			mtl::cs_interleave_task *job;
@@ -734,6 +767,7 @@ namespace mtl
 				job = mtl::get_compute_task<mtl::cs_scatter_d32x8<false>>();
 			}
 
+			note_compute("scatter");
 			job->run(cmd, src, data_offset, packed_length, z_offset, s_offset);
 
 			// 2. Copy the separated blocks into the target, one plane per copy
@@ -1030,8 +1064,34 @@ namespace mtl
 
 		ensure(job);
 
+		const auto packed_size_of = [block_size](const buffer_image_copy& section)
+		{
+			return u64{ block_size } * section.image_extent.width * section.image_extent.height * section.image_extent.depth;
+		};
+
+		// One dispatch deswizzles a run of consecutive levels of one layer, and the kernel expects their swizzled data
+		// back to back (level N+1 right after the last byte of level N). upload_image() stages every subresource at a
+		// 16-byte aligned scratch offset, so a level whose size is not a multiple of 16 bytes (the 2x1 and 1x1 tails of
+		// 32-bit textures, the 2x2 and smaller levels of 8/16-bit ones, the small levels of 3D textures) is followed
+		// by padding. Such a level ends the run: the next level starts a dispatch of its own at its real offset.
+		// Merging across the gap made the kernel read the following levels shifted by the padding (garbage texels in
+		// the smallest mips), and write the partial last word of the short level over the start of the next one.
+		// The kernel also derives the extent of every further level of a run from the first one (GPUDeswizzle.glsl):
+		// width (in 32-bit words for wider texels, see scale_x) and height halve down to 1, depth stays the same. A level
+		// whose real extent differs (every level after the first of a 3D texture, whose depth halves too; levels of
+		// 64/128-bit textures after the width reached one texel) would be read and written with the wrong extent and
+		// offset, so it starts a dispatch of its own as well.
+		const auto kernel_width_of = [scale_x](const buffer_image_copy& section)
+		{
+			return static_cast<u32>(section.image_extent.width) * scale_x;
+		};
+
 		auto next_layer = sections.front().base_layer;
 		auto next_level = sections.front().mip_level;
+		u64 next_src_offset = sections.front().buffer_offset;
+		u32 next_width = kernel_width_of(sections.front());
+		u32 next_height = static_cast<u32>(sections.front().image_extent.height);
+		u32 run_depth = static_cast<u32>(sections.front().image_extent.depth);
 		unsigned base = 0;
 		unsigned lods = 0;
 
@@ -1042,18 +1102,30 @@ namespace mtl
 
 			const auto layer = sections[i].base_layer;
 			const auto level = sections[i].mip_level;
+			const u32 width = kernel_width_of(sections[i]);
+			const u32 height = static_cast<u32>(sections[i].image_extent.height);
+			const u32 depth = static_cast<u32>(sections[i].image_extent.depth);
 
 			if (layer == next_layer &&
-				level == next_level)
+				level == next_level &&
+				sections[i].buffer_offset == next_src_offset &&
+				width == next_width && height == next_height && depth == run_depth)
 			{
 				next_level++;
+				next_src_offset += packed_size_of(sections[i]);
+				next_width = std::max(width / 2, 1u);
+				next_height = std::max(height / 2, 1u);
 				lods++;
 				continue;
 			}
 
 			packets.emplace_back(base, lods);
 			next_layer = layer;
-			next_level = 1;
+			next_level = level + 1;
+			next_src_offset = sections[i].buffer_offset + packed_size_of(sections[i]);
+			next_width = std::max(width / 2, 1u);
+			next_height = std::max(height / 2, 1u);
+			run_depth = depth;
 			base = i;
 			lods = 1;
 		}
@@ -1084,6 +1156,7 @@ namespace mtl
 			const u32 buf_off32 = static_cast<u32>(section.buffer_offset);
 			const u32 src_off32 = static_cast<u32>(src_offset);
 
+			note_compute("deswizzle");
 			job->run(cmd, scratch_buf, buf_off32, scratch_buf, src_off32, data_length,
 				static_cast<u32>(section.image_extent.width) * scale_x, static_cast<u32>(section.image_extent.height), static_cast<u32>(section.image_extent.depth), packet.second);
 		}
@@ -1167,6 +1240,8 @@ namespace mtl
 		const std::vector<rsx::subresource_layout>& subresource_layout, int format, bool is_swizzled, u16 layer_count,
 		u32 flags, mtl::data_heap& upload_heap, u32 heap_align, rsx::flags32_t image_setup_flags)
 	{
+		note_upload(dst_image->width(), dst_image->height(), layer_count);
+
 		const bool requires_depth_processing = (dst_image->aspect() & aspect_stencil) || (format == CELL_GCM_TEXTURE_DEPTH16_FLOAT);
 		auto pdev = mtl::get_current_renderer();
 		rsx::texture_uploader_capabilities caps{ .supports_dxt = pdev->caps().bc_texture_compression, .alignment = heap_align };
@@ -1476,6 +1551,7 @@ namespace mtl
 		const auto linear_data_scratch_offset = 0u;
 
 		// Schedule the job
+		note_compute("detile");
 		const RSX_detiler_config config =
 		{
 			.tile_base_address = tiled_region.base_address,
@@ -1790,7 +1866,11 @@ namespace mtl
 			}
 
 			auto zero_buf = get_scratch_buffer(cmd, max_level_size, true);
-			bool first = true;
+
+			// One command: every copy reads the zeroed block and writes its own level / layer
+			const auto [first_layer, end_layer] = get_slice_range(layer_count);
+			auto encoder = cmd.blit({ read_buffer(zero_buf, 0, max_level_size),
+				write_image(image, base_level, level_count, first_layer, end_layer - first_layer) });
 
 			for (u32 level = base_level; level < base_level + level_count; ++level)
 			{
@@ -1810,20 +1890,13 @@ namespace mtl
 						continue;
 					}
 
-					auto encoder = first ? cmd.compute() : cmd.compute_unordered();
-					first = false;
-
 					encoder->copyFromBuffer(zero_buf->value(), 0, row, count > 1 ? image_size : 0, MTL::Size::Make(w, h, count),
 						image->value, 0, level, MTL::Origin::Make(0, 0, first_slice));
 					continue;
 				}
 
-				const auto [first_layer, end_layer] = get_slice_range(layer_count);
 				for (u32 layer = first_layer; layer < end_layer; ++layer)
 				{
-					auto encoder = first ? cmd.compute() : cmd.compute_unordered();
-					first = false;
-
 					encoder->copyFromBuffer(zero_buf->value(), 0, row, 0, MTL::Size::Make(w, h, 1),
 						image->value, layer, level, MTL::Origin::Make(0, 0, 0));
 				}
@@ -1833,6 +1906,21 @@ namespace mtl
 		}
 
 		const u32 aspect = image->aspect();
+
+		// Level 0 of a single-layer 2D render target (surface initialization, most texture cache clears): the clear
+		// becomes the load action of the next pass rendering into it, or a clear-only pass (command_list::defer_clear)
+		if (base_level == 0 && level_count == 1 && layer_count == 1 && base_slice == 0 && slice_count &&
+			(image->type() == MTL::TextureType2D || image->type() == MTL::TextureType2DMultisample))
+		{
+			attachment_clear_value clear_value{};
+			clear_value.color = MTL::ClearColor::Make(value.color.r, value.color.g, value.color.b, value.color.a);
+			clear_value.depth = value.depth;
+			clear_value.stencil = value.stencil;
+
+			cmd.defer_clear(image->value, aspect, image->width(), image->height(), clear_value);
+			return;
+		}
+
 		autorelease_scope pool;
 
 		for (u32 level = base_level; level < base_level + level_count; ++level)
@@ -1900,12 +1988,14 @@ namespace mtl
 	static std::unordered_map<u64, std::unique_ptr<image>> g_typeless_textures;
 	static std::unique_ptr<mtl::sampler> g_null_sampler;
 
-	// Scratch memory handling. Use double-buffered resource to significantly cut down on GPU stalls.
+	// Scratch memory handling. Use double-buffered resource to significantly cut down on GPU stalls (a transfer through
+	// one buffer only waits for the transfers that used the same buffer: every use declares its accesses).
 	// Prologue uploads (command_list::prologue()) share these buffers with the main lists. That is safe: scratch data is
 	// only read by work recorded right after its producer on the same list (upload: copy from the upload heap ->
-	// swap/deswizzle -> copy to the image; detile -> upload), never across submissions, and prologue work never overlaps
-	// other work (its encoders wait for all earlier queue work, all work of its main list waits for it). Running it
-	// before main-list work that was recorded earlier cannot clobber scratch data that work still needs.
+	// swap/deswizzle -> copy to the image; detile -> upload), the prologue's accesses are checked against earlier
+	// submissions like the list's, and every prologue encoder ends with a producer barrier: all work of its main list,
+	// even work recorded before it, runs after the prologue. Running it before main-list work that was recorded earlier
+	// cannot clobber scratch data that work still needs.
 	struct scratch_buffer_pool_t
 	{
 		std::array<std::unique_ptr<buffer>, 2> scratch_buffers;
@@ -2087,7 +2177,7 @@ namespace mtl
 		{
 			// Zero-initialize the allocated VRAM
 			const u64 zero_length = init_mem ? buf->size() : utils::align(min_required_size, 4);
-			cmd.compute()->fillBuffer(buf->value(), NS::Range::Make(0, zero_length), 0);
+			cmd.blit({ write_buffer(buf, 0, zero_length) })->fillBuffer(buf->value(), NS::Range::Make(0, zero_length), 0);
 		}
 
 		return buf;

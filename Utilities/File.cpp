@@ -5,14 +5,19 @@
 #include <span>
 #include <unordered_map>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <iostream>
 
 #include "util/asm.hpp"
 #include "util/coro.hpp"
+#include "util/logs.hpp"
 
 using namespace std::literals::string_literals;
+
+LOG_CHANNEL(iso_log, "ISO");
 
 #ifdef ANDROID
 std::string g_android_executable_dir;
@@ -163,6 +168,21 @@ static fs::error to_error(DWORD e)
 #include <sys/disk.h>
 #include <sys/param.h>
 #include <sys/mount.h>
+#include <CoreFoundation/CFBase.h>
+#include <CoreFoundation/CFData.h>
+#include <CoreFoundation/CFDictionary.h>
+#include <CoreFoundation/CFString.h>
+#include <CoreFoundation/CFURL.h>
+#include <CoreFoundation/CFArray.h>
+#include <CoreFoundation/CFPropertyList.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOStorageProtocolCharacteristics.h>
+#include <crt_externs.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <chrono>
 #elif defined(__linux__) || defined(__sun)
 #include <sys/sendfile.h>
 #include <sys/syscall.h>
@@ -1250,15 +1270,13 @@ bool fs::is_optical_raw_device(const std::string& path)
 #endif
 }
 
-bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device)
+// Find the raw device of an optical drive or of a mounted disc image, given the raw device itself or the mount point of the
+// disc/image (see fs::get_optical_disc_source())
+static bool find_optical_raw_device(const std::string& path, std::string& raw_device)
 {
 	if (fs::is_optical_raw_device(path))
 	{
-		if (raw_device)
-		{
-			*raw_device = path;
-		}
-
+		raw_device = path;
 		return true;
 	}
 
@@ -1277,11 +1295,7 @@ bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device
 
 	if (GetDriveTypeA(drive_path.c_str()) == DRIVE_CDROM)
 	{
-		if (raw_device)
-		{
-			*raw_device = "\\\\.\\" + drive_letter;
-		}
-
+		raw_device = "\\\\.\\" + drive_letter;
 		return true;
 	}
 
@@ -1345,11 +1359,7 @@ bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device
 		return false;
 	}
 
-	if (raw_device)
-	{
-		*raw_device = device_path;
-	}
-
+	raw_device = std::move(device_path);
 	return true;
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
 	// Here the path points to a mounted optical disc or to a mounted disc image (e.g. attached with "hdiutil"/"mdconfig"),
@@ -1400,16 +1410,615 @@ bool fs::get_optical_raw_device(const std::string& path, std::string* raw_device
 		return false;
 	}
 
-	if (raw_device)
-	{
-		*raw_device = device_path;
-	}
-
+	raw_device = std::move(device_path);
 	return true;
 #else
 	// Not supported on this platform
 	return false;
 #endif
+}
+
+#ifdef __APPLE__
+namespace
+{
+	// ISO 9660: the first volume descriptor ("CD001" follows its type) is in the sector following the system area
+	constexpr u64 s_disc_sector_size = 2048;
+	constexpr u64 s_disc_descriptor_offset = s_disc_sector_size * 16;
+
+	// Identity of a device node. macOS creates the nodes of a disc (or of an attached disc image) when it appears and removes
+	// them when it goes away, and devfs numbers each node it creates with a new inode number: a node with the same name and
+	// device number but another inode number belongs to another disc
+	struct disc_node_id
+	{
+		dev_t rdev{};
+		ino_t ino{};
+		timespec ctime{}; // Creation time of the node (changed by an attribute change too), not part of its identity
+
+		disc_node_id() = default;
+
+		explicit disc_node_id(const struct ::stat& info)
+			: rdev(info.st_rdev), ino(info.st_ino), ctime(info.st_ctimespec)
+		{
+		}
+
+		bool operator==(const disc_node_id& r) const
+		{
+			return rdev == r.rdev && ino == r.ino;
+		}
+	};
+
+	// Identity of an image file: a disc is only read from the very file which was checked against it
+	struct disc_image_id
+	{
+		dev_t dev{};
+		ino_t ino{};
+		off_t size{};
+		timespec mtime{};
+
+		disc_image_id() = default;
+
+		explicit disc_image_id(const struct ::stat& info)
+			: dev(info.st_dev), ino(info.st_ino), size(info.st_size), mtime(info.st_mtimespec)
+		{
+		}
+
+		bool operator==(const disc_image_id& r) const
+		{
+			return dev == r.dev && ino == r.ino && size == r.size && mtime.tv_sec == r.mtime.tv_sec && mtime.tv_nsec == r.mtime.tv_nsec;
+		}
+	};
+
+	struct disc_image_entry
+	{
+		disc_node_id node{};
+		std::string image{}; // Image file the disc is read from, empty if it is read through its raw device
+		disc_image_id image_id{};
+	};
+
+	// Source of each disc seen so far, by device number (see get_disc_image_file())
+	struct disc_image_cache
+	{
+		shared_mutex mutex;
+		std::unordered_map<dev_t, disc_image_entry> entries;
+
+		// Last listing of the attached disc images (see find_disc_image_file()) and when it was started
+		std::vector<std::pair<std::string, std::string>> attached_images;
+		std::optional<timespec> attached_images_time;
+	};
+
+	disc_image_cache& get_disc_image_cache()
+	{
+		static disc_image_cache s_cache;
+		return s_cache;
+	}
+
+	std::string get_cf_string(CFTypeRef value)
+	{
+		if (!value || CFGetTypeID(value) != CFStringGetTypeID())
+		{
+			return {};
+		}
+
+		const auto string = static_cast<CFStringRef>(value);
+		std::string buffer(static_cast<usz>(CFStringGetMaximumSizeForEncoding(CFStringGetLength(string), kCFStringEncodingUTF8)) + 1, '\0');
+
+		if (!CFStringGetCString(string, buffer.data(), static_cast<CFIndex>(buffer.size()), kCFStringEncodingUTF8))
+		{
+			return {};
+		}
+
+		buffer.resize(std::strlen(buffer.c_str()));
+		return buffer;
+	}
+
+	// Path of the image file held by an I/O Registry property of a disc image device (a C string, a string or a file URL)
+	std::string get_image_path_property(CFTypeRef value)
+	{
+		std::string path;
+
+		if (value && CFGetTypeID(value) == CFDataGetTypeID())
+		{
+			const auto data = static_cast<CFDataRef>(value);
+			path.assign(reinterpret_cast<const char*>(CFDataGetBytePtr(data)), static_cast<usz>(CFDataGetLength(data)));
+
+			// Stored as a C string
+			path.resize(std::strlen(path.c_str()));
+		}
+		else
+		{
+			path = get_cf_string(value);
+		}
+
+		if (path.starts_with("file://"))
+		{
+			// A file URL: let CoreFoundation decode it (percent escapes)
+			std::string decoded;
+
+			if (const CFURLRef url = CFURLCreateWithBytes(kCFAllocatorDefault, reinterpret_cast<const UInt8*>(path.data()), static_cast<CFIndex>(path.size()), kCFStringEncodingUTF8, nullptr))
+			{
+				std::string buffer(PATH_MAX * 4, '\0');
+
+				if (CFURLGetFileSystemRepresentation(url, true, reinterpret_cast<UInt8*>(buffer.data()), static_cast<CFIndex>(buffer.size())))
+				{
+					decoded = buffer.c_str();
+				}
+
+				CFRelease(url);
+			}
+
+			path = std::move(decoded);
+		}
+
+		// Only an absolute path can be used
+		if (!path.starts_with('/'))
+		{
+			path.clear();
+		}
+
+		return path;
+	}
+
+	// Image files of the attached disc images, by device node (e.g. {"/dev/disk2", "/Users/user/game.iso"}), as listed by "hdiutil
+	// info -plist": the documented way to find them, Apple provides no API for it. Empty if "hdiutil" fails
+	std::vector<std::pair<std::string, std::string>> list_attached_disc_images()
+	{
+		std::vector<std::pair<std::string, std::string>> result;
+		int pipe_fds[2];
+
+		if (::pipe(pipe_fds) != 0)
+		{
+			return result;
+		}
+
+		// Not inherited by the children of other threads, which would keep the pipe open
+		::fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
+		::fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+
+		posix_spawn_file_actions_t actions;
+		posix_spawnattr_t attributes;
+		posix_spawn_file_actions_init(&actions);
+		posix_spawnattr_init(&attributes);
+
+		// The child only gets its standard descriptors, its output being the pipe
+		posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+		posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+		posix_spawn_file_actions_adddup2(&actions, pipe_fds[1], STDOUT_FILENO);
+		posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+		char arg0[] = "hdiutil";
+		char arg1[] = "info";
+		char arg2[] = "-plist";
+		char* const argv[] = {arg0, arg1, arg2, nullptr};
+
+		pid_t pid = -1;
+		const int spawned = ::posix_spawn(&pid, "/usr/bin/hdiutil", &actions, &attributes, argv, *_NSGetEnviron());
+
+		posix_spawn_file_actions_destroy(&actions);
+		posix_spawnattr_destroy(&attributes);
+		::close(pipe_fds[1]);
+
+		std::string output;
+
+		if (spawned == 0)
+		{
+			// Its output takes a few KiB: read it within 10 seconds at most, so that a stuck disc image service can't hang the caller
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+			bool timed_out = false;
+
+			while (true)
+			{
+				const auto time_left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+
+				if (time_left <= 0)
+				{
+					timed_out = true;
+					break;
+				}
+
+				::pollfd poll_fd{pipe_fds[0], POLLIN, 0};
+				const int ready = ::poll(&poll_fd, 1, static_cast<int>(time_left));
+
+				if (ready < 0 && errno == EINTR)
+				{
+					continue;
+				}
+
+				if (ready <= 0)
+				{
+					timed_out = ready == 0;
+					break;
+				}
+
+				char buffer[16384];
+				const ssize_t count = ::read(pipe_fds[0], buffer, sizeof(buffer));
+
+				if (count < 0 && errno == EINTR)
+				{
+					continue;
+				}
+
+				if (count <= 0)
+				{
+					break;
+				}
+
+				output.append(buffer, static_cast<usz>(count));
+			}
+
+			if (timed_out)
+			{
+				::kill(pid, SIGKILL);
+			}
+
+			int status = 0;
+
+			while (::waitpid(pid, &status, 0) < 0 && errno == EINTR)
+			{
+			}
+
+			if (timed_out || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			{
+				output.clear();
+			}
+		}
+
+		::close(pipe_fds[0]);
+
+		if (output.empty())
+		{
+			return result;
+		}
+
+		// {"images": [{"image-path": "/Users/user/game.iso", "system-entities": [{"dev-entry": "/dev/disk2", ...}, ...], ...}, ...]}
+		const CFDataRef data = CFDataCreate(kCFAllocatorDefault, reinterpret_cast<const UInt8*>(output.data()), static_cast<CFIndex>(output.size()));
+		const CFPropertyListRef info = data ? CFPropertyListCreateWithData(kCFAllocatorDefault, data, kCFPropertyListImmutable, nullptr, nullptr) : nullptr;
+
+		if (data)
+		{
+			CFRelease(data);
+		}
+
+		const auto get_array = [](CFTypeRef dict, CFStringRef key) -> CFArrayRef
+		{
+			if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID())
+			{
+				return nullptr;
+			}
+
+			const CFTypeRef value = CFDictionaryGetValue(static_cast<CFDictionaryRef>(dict), key);
+			return value && CFGetTypeID(value) == CFArrayGetTypeID() ? static_cast<CFArrayRef>(value) : nullptr;
+		};
+
+		if (const CFArrayRef images = get_array(info, CFSTR("images")))
+		{
+			for (CFIndex i = 0; i < CFArrayGetCount(images); i++)
+			{
+				const CFTypeRef image = CFArrayGetValueAtIndex(images, i);
+				const CFArrayRef entities = get_array(image, CFSTR("system-entities"));
+
+				if (!entities)
+				{
+					continue;
+				}
+
+				const std::string image_path = get_image_path_property(CFDictionaryGetValue(static_cast<CFDictionaryRef>(image), CFSTR("image-path")));
+
+				for (CFIndex j = 0; j < CFArrayGetCount(entities); j++)
+				{
+					const CFTypeRef entity = CFArrayGetValueAtIndex(entities, j);
+
+					if (entity && CFGetTypeID(entity) == CFDictionaryGetTypeID() && !image_path.empty())
+					{
+						result.emplace_back(get_cf_string(CFDictionaryGetValue(static_cast<CFDictionaryRef>(entity), CFSTR("dev-entry"))), image_path);
+					}
+				}
+			}
+		}
+
+		if (info)
+		{
+			CFRelease(info);
+		}
+
+		return result;
+	}
+
+	// Find the image file of a disc image attached by macOS (e.g. by Finder or "hdiutil attach") and check that it can be read in
+	// place of the raw device: a regular file holding exactly the data of the device, that is a plain ISO image (a compressed,
+	// sparse or partitioned image holds other data at other offsets). Return it (empty if none) with its identity and how it was
+	// found, or the reason why the raw device must be used
+	std::string find_disc_image_file(const std::string& device_path, const disc_node_id& node, disc_image_cache& cache, disc_image_id& image_id, std::string& found_by, std::string& reason)
+	{
+		// The data of the device the image file must match: its size and its first volume descriptor
+		const int device_fd = ::open(device_path.c_str(), O_RDONLY | O_CLOEXEC);
+
+		if (device_fd < 0)
+		{
+			reason = fmt::format("the device can't be opened (%s)", strerror(errno));
+			return {};
+		}
+
+		// A raw device only accepts whole sectors, read into an aligned buffer
+		alignas(4096) std::array<u8, s_disc_sector_size> device_descriptor;
+		const u64 device_size = get_raw_device_size(device_fd);
+		const bool device_read = ::pread(device_fd, device_descriptor.data(), device_descriptor.size(), s_disc_descriptor_offset) == static_cast<ssize_t>(device_descriptor.size());
+		::close(device_fd);
+
+		if (!device_size || !device_read || std::memcmp(device_descriptor.data() + 1, "CD001", 5) != 0)
+		{
+			reason = "the disc holds no ISO 9660 volume descriptor";
+			return {};
+		}
+
+		const auto check_image_file = [&](const std::string& image) -> bool
+		{
+			const int fd = ::open(image.c_str(), O_RDONLY | O_CLOEXEC);
+
+			if (fd < 0)
+			{
+				reason = fmt::format("the image file '%s' can't be opened (%s)", image, strerror(errno));
+				return false;
+			}
+
+			struct ::stat image_info;
+			std::array<u8, s_disc_sector_size> image_descriptor;
+
+			const bool is_file = ::fstat(fd, &image_info) == 0 && S_ISREG(image_info.st_mode);
+			const bool same_size = is_file && static_cast<u64>(image_info.st_size) == device_size;
+			const bool same_data = same_size && ::pread(fd, image_descriptor.data(), image_descriptor.size(), s_disc_descriptor_offset) == static_cast<ssize_t>(image_descriptor.size())
+				&& image_descriptor == device_descriptor;
+			::close(fd);
+
+			if (!is_file)
+			{
+				reason = fmt::format("'%s' is not a regular file", image);
+			}
+			else if (!same_size)
+			{
+				reason = fmt::format("the image file '%s' is not a plain ISO image (compressed, sparse or partitioned: %u bytes for a disc of %u bytes)", image, image_info.st_size, device_size);
+			}
+			else if (!same_data)
+			{
+				reason = fmt::format("the image file '%s' does not hold the data of the disc", image);
+			}
+			else
+			{
+				image_id = disc_image_id(image_info);
+				return true;
+			}
+
+			return false;
+		};
+
+		// Paths already checked
+		std::vector<std::string> checked;
+
+		// I/O Kit media of the device (e.g. "/dev/rdisk2" -> "disk2")
+		std::string bsd_name = device_path.substr(5);
+
+		if (bsd_name.starts_with('r'))
+		{
+			bsd_name.erase(0, 1);
+		}
+
+		// A disc image device (a parent of its media, hence the search through the parents) describes itself as a file behind a
+		// virtual interface in its protocol characteristics (IOStorageProtocolCharacteristics.h). The disc image drivers have
+		// also published the path of the image file in properties of the device: "Virtual Interface Location Path" (protocol
+		// characteristics), "image-path" (IOHDIX) and "DiskImageURL" (DiskImages2). None of them is documented, so any path found
+		// is only used once checked against the data of the device, and "hdiutil" is asked if none is found
+		std::string interconnect;
+		bool physical_device = false;
+
+		if (const io_service_t media = IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, bsd_name.c_str())))
+		{
+			constexpr IOOptionBits search_parents = kIORegistryIterateRecursively | kIORegistryIterateParents;
+
+			std::vector<std::string> candidates;
+
+			const auto add_candidate = [&candidates](CFTypeRef value)
+			{
+				if (std::string path = get_image_path_property(value); !path.empty() && std::find(candidates.begin(), candidates.end(), path) == candidates.end())
+				{
+					candidates.push_back(std::move(path));
+				}
+			};
+
+			if (const CFTypeRef protocol = IORegistryEntrySearchCFProperty(media, kIOServicePlane, CFSTR(kIOPropertyProtocolCharacteristicsKey), kCFAllocatorDefault, search_parents))
+			{
+				if (CFGetTypeID(protocol) == CFDictionaryGetTypeID())
+				{
+					const auto characteristics = static_cast<CFDictionaryRef>(protocol);
+					const std::string type = get_cf_string(CFDictionaryGetValue(characteristics, CFSTR(kIOPropertyPhysicalInterconnectTypeKey)));
+					const std::string location = get_cf_string(CFDictionaryGetValue(characteristics, CFSTR(kIOPropertyPhysicalInterconnectLocationKey)));
+
+					interconnect = fmt::format(" (interconnect: %s, %s)", type, location);
+					physical_device = !type.empty() && type != kIOPropertyPhysicalInterconnectTypeVirtual;
+
+					add_candidate(CFDictionaryGetValue(characteristics, CFSTR("Virtual Interface Location Path")));
+				}
+
+				CFRelease(protocol);
+			}
+
+			for (const CFStringRef key : {CFSTR("image-path"), CFSTR("DiskImageURL")})
+			{
+				if (const CFTypeRef value = IORegistryEntrySearchCFProperty(media, kIOServicePlane, key, kCFAllocatorDefault, search_parents))
+				{
+					add_candidate(value);
+					CFRelease(value);
+				}
+			}
+
+			IOObjectRelease(media);
+
+			for (const std::string& image : candidates)
+			{
+				if (check_image_file(image))
+				{
+					found_by = "I/O Registry";
+					return image;
+				}
+
+				checked.push_back(image);
+			}
+		}
+
+		if (physical_device)
+		{
+			reason = "not a disc image" + interconnect;
+			return {};
+		}
+
+		if (checked.empty())
+		{
+			reason = "no image file found for it" + interconnect;
+		}
+
+		// "hdiutil info" lists every attached disc image: its last listing serves the discs whose node was created before it was
+		// made (a disc image attached later gets a new device node, see disc_node_id), so it runs once for all the discs mounted
+		// at startup
+		const std::string device_node = "/dev/" + bsd_name;
+
+		const auto is_listed = [&]()
+		{
+			return std::any_of(cache.attached_images.begin(), cache.attached_images.end(), [&](const auto& entry) { return entry.first == device_node; });
+		};
+
+		const auto is_before = [](const timespec& a, const timespec& b)
+		{
+			return a.tv_sec < b.tv_sec || (a.tv_sec == b.tv_sec && a.tv_nsec < b.tv_nsec);
+		};
+
+		if (!cache.attached_images_time || !is_before(node.ctime, *cache.attached_images_time) || !is_listed())
+		{
+			timespec now{};
+			::clock_gettime(CLOCK_REALTIME, &now);
+
+			cache.attached_images = list_attached_disc_images();
+			cache.attached_images_time = now;
+		}
+
+		for (const auto& [listed_node, image] : cache.attached_images)
+		{
+			if (listed_node == device_node && std::find(checked.begin(), checked.end(), image) == checked.end() && check_image_file(image))
+			{
+				found_by = "hdiutil";
+				return image;
+			}
+		}
+
+		return {};
+	}
+
+	// Image file to read a disc from in place of its raw device (see find_disc_image_file()), empty to read the raw device.
+	// It is found once per disc: later calls only check with two "stat()" that the disc and its image file are still the same
+	std::string get_disc_image_file(const std::string& device_path)
+	{
+		struct ::stat device_info;
+
+		if (::stat(device_path.c_str(), &device_info) != 0)
+		{
+			return {};
+		}
+
+		const disc_node_id node(device_info);
+		disc_image_cache& cache = get_disc_image_cache();
+
+		// The source found earlier for this disc, if it still applies
+		const auto lookup = [&]() -> std::optional<std::string>
+		{
+			const auto found = cache.entries.find(node.rdev);
+
+			if (found == cache.entries.end() || !(found->second.node == node))
+			{
+				return std::nullopt;
+			}
+
+			const disc_image_entry& entry = found->second;
+			struct ::stat image_info;
+
+			if (!entry.image.empty() && (::stat(entry.image.c_str(), &image_info) != 0 || !(disc_image_id(image_info) == entry.image_id)))
+			{
+				// The image file was moved, replaced or modified: check again
+				return std::nullopt;
+			}
+
+			return entry.image;
+		};
+
+		{
+			reader_lock lock(cache.mutex);
+
+			if (auto image = lookup())
+			{
+				return std::move(*image);
+			}
+		}
+
+		std::lock_guard lock(cache.mutex);
+
+		// Another thread may have found it meanwhile
+		if (auto image = lookup())
+		{
+			return std::move(*image);
+		}
+
+		disc_image_id image_id{};
+		std::string found_by;
+		std::string reason;
+		std::string image = find_disc_image_file(device_path, node, cache, image_id, found_by, reason);
+
+		if (!image.empty())
+		{
+			iso_log.notice("Disc %s is read from its image file '%s' (found by %s)", device_path, image, found_by);
+		}
+		else
+		{
+			iso_log.notice("Disc %s is read through its raw device: %s", device_path, reason);
+		}
+
+		cache.entries[node.rdev] = disc_image_entry{node, image, image_id};
+		return image;
+	}
+}
+#endif
+
+bool fs::get_optical_disc_source(const std::string& path, std::string* source, bool* is_raw_device)
+{
+	std::string raw_device;
+
+	if (!find_optical_raw_device(path, raw_device))
+	{
+		return false;
+	}
+
+	if (!source && !is_raw_device)
+	{
+		// Only the kind of path was requested
+		return true;
+	}
+
+	bool raw = true;
+
+#ifdef __APPLE__
+	if (std::string image = get_disc_image_file(raw_device); !image.empty())
+	{
+		raw_device = std::move(image);
+		raw = false;
+	}
+#endif
+
+	if (source)
+	{
+		*source = std::move(raw_device);
+	}
+
+	if (is_raw_device)
+	{
+		*is_raw_device = raw;
+	}
+
+	return true;
 }
 
 bool fs::statfs(const std::string& path, fs::device_stat& info)

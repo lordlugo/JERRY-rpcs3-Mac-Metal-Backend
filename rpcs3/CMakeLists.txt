@@ -222,14 +222,27 @@ if(BUILD_RPCS3_TESTS)
             tests/test_cctype.cpp
             tests/test_dmux_pamf.cpp
             tests/test_fmt.cpp
+            tests/test_game_patches.cpp
+            tests/test_guest_frame_limit.cpp
+            tests/test_host_gpu_labels.cpp
             tests/test_iso_open.cpp
             tests/test_iso_extent.cpp
             tests/test_pair.cpp
             tests/test_rsx_cfg.cpp
             tests/test_rsx_fp_asm.cpp
             tests/test_rsx_mm_queue.cpp
+            tests/test_metal_sampler_liveness.cpp
+            tests/test_metal_sampler_lod.cpp
+            tests/test_metal_sampler_trace.cpp
+            tests/test_metal_spam_meter.cpp
+            tests/test_metal_binding_layout.cpp
+            tests/test_mtl_depth_bounds.cpp
+            tests/test_crash_report.cpp
+            tests/test_rsx_stall_report.cpp
+            tests/test_rsx_offload_sync.cpp
             tests/test_simple_array.cpp
             tests/test_spu_analyser.cpp
+            tests/test_spu_boot_settle.cpp
             tests/test_sys_fs.cpp
             tests/test_tuple.cpp
             tests/test_types_util.cpp

@@ -6,6 +6,7 @@
 
 #include <QMovie>
 #include <QBuffer>
+#include <QFutureWatcher>
 #include <QMediaPlayer>
 #include <QVideoSink>
 #include <QVideoFrame>
@@ -45,6 +46,11 @@ public:
 protected:
 	void init_movie();
 
+	// Reads the video and sound stored in the ISO on a worker thread. Returns true while they are being read: start_movie()
+	// is called again once they are available
+	bool load_archive_media();
+	void drop_archive_media();
+
 	shared_mutex m_image_mutex;
 
 	atomic_t<bool> m_active = false;
@@ -67,6 +73,18 @@ protected:
 	std::unique_ptr<QMediaPlayer> m_media_player;
 	std::unique_ptr<QVideoSink> m_video_sink;
 	std::unique_ptr<QMovie> m_movie;
+
+	// Content of the video and sound files stored in the ISO (m_iso_path), read through the ISO media cache
+	using archive_media = std::pair<std::shared_ptr<const std::vector<u8>>, std::shared_ptr<const std::vector<u8>>>;
+	enum class archive_media_state
+	{
+		none,
+		loading,
+		loaded
+	};
+	archive_media_state m_archive_media_state = archive_media_state::none;
+	archive_media m_archive_media{};
+	std::unique_ptr<QFutureWatcher<archive_media>> m_archive_media_watcher;
 
 	std::function<void(const QVideoFrame&)> m_image_change_callback = nullptr;
 

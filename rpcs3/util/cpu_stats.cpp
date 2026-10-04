@@ -5,6 +5,7 @@
 #include "Utilities/StrUtil.h"
 
 #include <algorithm>
+#include <cmath>
 
 #ifdef _WIN32
 #include "util/asm.hpp"
@@ -22,8 +23,15 @@
 
 #ifdef __APPLE__
 # include <mach/mach_init.h>
+# include <mach/mach_host.h>
+# include <mach/mach_port.h>
+# include <mach/processor_info.h>
 # include <mach/task.h>
+# include <mach/thread_act.h>
+# include <mach/thread_info.h>
 # include <mach/vm_map.h>
+# include <sys/sysctl.h>
+# include <time.h>
 #endif
 
 #ifdef __linux__
@@ -56,6 +64,37 @@ LOG_CHANNEL(perf_log, "PERF");
 
 namespace utils
 {
+#ifdef __APPLE__
+	// Busy and total scheduler ticks of every CPU since boot (u32 counters that wrap)
+	static bool get_cpu_ticks(std::vector<u32>& busy, std::vector<u32>& total)
+	{
+		static const host_t host = mach_host_self();
+
+		natural_t cpu_count = 0;
+		processor_info_array_t info = nullptr;
+		mach_msg_type_number_t info_count = 0;
+
+		if (host_processor_info(host, PROCESSOR_CPU_LOAD_INFO, &cpu_count, &info, &info_count) != KERN_SUCCESS)
+		{
+			return false;
+		}
+
+		const auto load = reinterpret_cast<const processor_cpu_load_info*>(info);
+		busy.resize(cpu_count);
+		total.resize(cpu_count);
+
+		for (natural_t i = 0; i < cpu_count; i++)
+		{
+			const auto& ticks = load[i].cpu_ticks;
+			busy[i] = ticks[CPU_STATE_USER] + ticks[CPU_STATE_SYSTEM] + ticks[CPU_STATE_NICE];
+			total[i] = busy[i] + ticks[CPU_STATE_IDLE];
+		}
+
+		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(info), info_count * sizeof(integer_t));
+		return true;
+	}
+#endif
+
 #ifdef _WIN32
 	fmt::win_error pdh_error(PDH_STATUS status)
 	{
@@ -118,6 +157,8 @@ namespace utils
 			perf_log.error("Failed to collect per core cpu usage: %s", pdh_error(status));
 			return;
 		}
+#elif defined(__APPLE__)
+		get_cpu_ticks(m_previous_busy_ticks_per_cpu, m_previous_total_ticks_per_cpu);
 #endif
 	}
 
@@ -291,6 +332,22 @@ namespace utils
 			perf_log.error("Failed to open /proc/stat (%s)", strerror(errno));
 		}
 #endif
+#elif defined(__APPLE__)
+		// Load of every CPU (all processes) since the previous call. Total: this process (get_usage), as before
+		if (std::vector<u32> busy, total; get_cpu_ticks(busy, total))
+		{
+			m_previous_busy_ticks_per_cpu.resize(busy.size());
+			m_previous_total_ticks_per_cpu.resize(total.size());
+
+			for (usz i = 0; i < busy.size() && i < per_core_usage.size(); i++)
+			{
+				const u32 busy_delta = busy[i] - std::exchange(m_previous_busy_ticks_per_cpu[i], busy[i]);
+				const u32 total_delta = total[i] - std::exchange(m_previous_total_ticks_per_cpu[i], total[i]);
+				per_core_usage[i] = total_delta ? std::min(100.0, 100.0 * busy_delta / total_delta) : 0.0;
+			}
+		}
+
+		total_usage = get_usage();
 #else
 		total_usage = get_usage();
 #endif
@@ -298,6 +355,69 @@ namespace utils
 
 	double cpu_stats::get_usage()
 	{
+#ifdef __APPLE__
+		// RPCS3 Metal fork: whole-system CPU load, measured the way Redline (mac-resource-monitor) does it: the
+		// aggregate scheduler ticks of host_statistics(HOST_CPU_LOAD_INFO), (user + system + nice) / (those + idle)
+		// since the previous call, with wrapping 32-bit deltas. The process-time estimate below (times(), 10 ms
+		// resolution, divided by the logical CPU count) read low and jumpy next to Activity Monitor. Smoothed with
+		// a time-scaled EMA (gain 0.4 per second) so the overlay neither lags nor jitters at any refresh rate.
+		{
+			static const host_t host = mach_host_self();
+
+			host_cpu_load_info_data_t info{};
+			mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+
+			if (host_statistics(host, HOST_CPU_LOAD_INFO, reinterpret_cast<host_info_t>(&info), &count) == KERN_SUCCESS && count >= HOST_CPU_LOAD_INFO_COUNT)
+			{
+				const u32 now[4] =
+				{
+					static_cast<u32>(info.cpu_ticks[CPU_STATE_USER]),
+					static_cast<u32>(info.cpu_ticks[CPU_STATE_SYSTEM]),
+					static_cast<u32>(info.cpu_ticks[CPU_STATE_IDLE]),
+					static_cast<u32>(info.cpu_ticks[CPU_STATE_NICE]),
+				};
+
+				const u64 now_ns = static_cast<u64>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+
+				if (m_have_prev_load)
+				{
+					const u64 used = u64{static_cast<u32>(now[0] - m_prev_load_ticks[0])} + u64{static_cast<u32>(now[1] - m_prev_load_ticks[1])} +
+						u64{static_cast<u32>(now[3] - m_prev_load_ticks[3])};
+					const u64 total = used + u64{static_cast<u32>(now[2] - m_prev_load_ticks[2])};
+
+					if (total)
+					{
+						const double sample = 100. * static_cast<double>(used) / static_cast<double>(total);
+
+						if (m_load_ema < 0.)
+						{
+							m_load_ema = sample;
+						}
+						else
+						{
+							const double elapsed_s = m_load_last_ns && now_ns > m_load_last_ns ? static_cast<double>(now_ns - m_load_last_ns) / 1e9 : 1.;
+							const double alpha = -std::expm1(std::log(0.6) * elapsed_s);
+							m_load_ema += alpha * (sample - m_load_ema);
+						}
+					}
+				}
+
+				std::copy(std::begin(now), std::end(now), std::begin(m_prev_load_ticks));
+				m_have_prev_load = true;
+				m_load_last_ns = now_ns;
+
+				// First call only sets the baseline; until a delta exists report 0 rather than a made-up value
+				return std::clamp(m_load_ema < 0. ? 0. : m_load_ema, 0., 100.);
+			}
+
+			// host_statistics failed: hold the last good value if there is one, else fall back to the process estimate
+			if (m_load_ema >= 0.)
+			{
+				return std::clamp(m_load_ema, 0., 100.);
+			}
+		}
+#endif
+
 #ifdef _WIN32
 		FILETIME ftime, fsys, fusr;
 		ULARGE_INTEGER now, sys, usr;
@@ -382,6 +502,11 @@ namespace utils
 		{
 			return 0;
 		}
+		for (mach_msg_type_number_t i = 0; i < thread_count; i++)
+		{
+			// task_threads() hands out a send right per thread
+			mach_port_deallocate(task, thread_list[i]);
+		}
 		vm_deallocate(task, reinterpret_cast<vm_address_t>(thread_list),
 			      sizeof(thread_t) * thread_count);
 		return static_cast<u32>(thread_count);
@@ -460,6 +585,74 @@ namespace utils
 #else
 		// unimplemented
 		return 0;
+#endif
+	}
+
+	u32 cpu_stats::get_efficiency_core_count() // static
+	{
+#ifdef __APPLE__
+		// Apple silicon: performance level 0 = P-cores, 1 = E-cores. The E-cores have the lowest CPU numbers (the kernel
+		// numbers the CPUs in device tree order, efficiency cluster first; M1 Pro/Max: CPU 0-1)
+		int levels = 0;
+		usz size = sizeof(levels);
+
+		if (sysctlbyname("hw.nperflevels", &levels, &size, nullptr, 0) != 0 || levels < 2)
+		{
+			return 0;
+		}
+
+		int count = 0;
+		size = sizeof(count);
+
+		if (sysctlbyname("hw.perflevel1.logicalcpu", &count, &size, nullptr, 0) != 0 || count <= 0)
+		{
+			return 0;
+		}
+
+		return static_cast<u32>(count);
+#else
+		return 0;
+#endif
+	}
+
+	bool cpu_stats::get_thread_cpu_times(std::vector<thread_cpu_time>& threads) // static
+	{
+		threads.clear();
+
+#ifdef __APPLE__
+		const task_t task = mach_task_self();
+		thread_act_array_t thread_list = nullptr;
+		mach_msg_type_number_t thread_count = 0;
+
+		if (task_threads(task, &thread_list, &thread_count) != KERN_SUCCESS)
+		{
+			return false;
+		}
+
+		threads.reserve(thread_count);
+
+		for (mach_msg_type_number_t i = 0; i < thread_count; i++)
+		{
+			// Only the kernel is asked: a thread that exited in the meantime just fails these calls (dead port name)
+			thread_identifier_info_data_t id_info{};
+			mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
+			thread_extended_info_data_t ext_info{};
+			mach_msg_type_number_t ext_count = THREAD_EXTENDED_INFO_COUNT;
+
+			if (thread_info(thread_list[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id_info), &id_count) == KERN_SUCCESS &&
+				thread_info(thread_list[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&ext_info), &ext_count) == KERN_SUCCESS)
+			{
+				ext_info.pth_name[MAXTHREADNAMESIZE - 1] = '\0';
+				threads.push_back({id_info.thread_id, ext_info.pth_user_time + ext_info.pth_system_time, ext_info.pth_name});
+			}
+
+			mach_port_deallocate(task, thread_list[i]);
+		}
+
+		vm_deallocate(task, reinterpret_cast<vm_address_t>(thread_list), sizeof(thread_t) * thread_count);
+		return true;
+#else
+		return false;
 #endif
 	}
 }

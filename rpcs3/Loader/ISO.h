@@ -3,15 +3,23 @@
 #include "PSF.h"
 
 #include "Utilities/File.h"
+#include "Utilities/mutex.h"
 #include "util/types.hpp"
 #include "Crypto/aes.h"
 
+#include <memory>
 #include <span>
 
+// Check whether the path points to an ISO: an ISO file, an optical drive or a mounted disc image (see fs::get_optical_disc_source()).
+// "is_raw_device" tells whether it is read through a raw device (an optical drive, or a disc image which is not a plain ISO
+// image): a mounted plain ISO image is read from its image file, like an ISO file
 bool is_iso_file(const std::string& path, u64* size = nullptr, bool* is_raw_device = nullptr);
 
 void load_iso(const std::string& path);
 void unload_iso();
+
+// Disc reads since the previous call (every ISO file, disc image file and raw device), for the performance log. Empty if none
+std::string get_iso_read_stats();
 
 constexpr u64 ISO_SECTOR_SIZE = 2048;
 
@@ -73,14 +81,17 @@ private:
 	std::vector<iso_region_info> m_region_info;
 
 	static iso_type_status get_key(const std::string& key_path, aes_context* aes_ctx = nullptr);
-	static iso_type_status retrieve_key(iso_archive& archive, std::string& key_path, aes_context& aes_ctx);
+	static iso_type_status find_key_file(const std::string& path, std::string* key_path, aes_context* aes_ctx);
+	static iso_type_status retrieve_key(iso_archive& archive, const fs::file& iso, std::string& key_path, aes_context& aes_ctx);
 
 public:
 	static iso_type_status check_type(const std::string& path, std::string* key_path = nullptr, aes_context* aes_ctx = nullptr);
 
 	iso_encryption_type get_enc_type() const { return m_enc_type; }
 
-	bool init(const std::string& path, iso_archive* archive = nullptr);
+	// "iso" is the ISO (already recognized) read from "path". "disc_archive" is provided for a disc (optical drive or mounted
+	// disc image): any key of the redump keys folder which decrypts it is then looked for
+	bool init(const fs::file& iso, const std::string& path, iso_archive* disc_archive);
 	bool decrypt(u64 offset, const std::span<u8> buffer, const std::string& name);
 };
 
@@ -107,6 +118,11 @@ struct iso_fs_node
 	std::vector<std::unique_ptr<iso_fs_node>> children;
 };
 
+struct iso_aligned_deleter
+{
+	void operator()(u8* ptr) const;
+};
+
 class iso_file : public fs::file_base
 {
 protected:
@@ -114,6 +130,16 @@ protected:
 	iso_fs_metadata m_meta;
 	bool m_raw_device = false;
 	u64 m_pos = 0;
+
+	// Raw device only: read-ahead window, the sectors following the last small read, which serves the next small reads (e.g.
+	// directory records, file headers) from memory
+	shared_mutex m_window_mutex;
+	std::unique_ptr<u8[], iso_aligned_deleter> m_window;
+	u64 m_window_address = 0;
+	u64 m_window_size = 0;
+
+	// Read [address, address + size) of the ISO file or raw device (any offset, size and destination)
+	u64 read_source(u64 address, void* buffer, u64 size);
 
 	std::pair<u64, iso_extent_info> get_extent_pos(u64 pos) const;
 	u64 local_extent_remaining(u64 pos) const;

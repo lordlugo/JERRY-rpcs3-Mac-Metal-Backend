@@ -104,7 +104,8 @@ namespace rsx
 			occlusion_query_count = 2048,  // Number of occlusion query slots available. Real hardware actually has far fewer units before choking
 			max_safe_queue_depth  = 1792,  // Number of in-flight queries before we start forcefully flushing data from the GPU device.
 			max_stat_registers    = 8192,  // Size of the statistics cache
-			max_label_delay_us    = 100000 // Safety net: deferred labels older than this are forced out (a GPU bound frame takes tens of ms)
+			max_label_delay_us    = 100000, // Safety net: deferred labels older than this are forced out (a GPU bound frame takes tens of ms)
+			min_soft_sync_interval_us = 1000 // Early submits for reports the CPU will read (and labels waiting on them) are at most this frequent
 		};
 
 		class ZCULL_control
@@ -139,6 +140,7 @@ namespace rsx
 
 			// Incremental tag used for tracking sync events. Hardware clock resolution is too low for the job.
 			u64 m_sync_tag = 0;
+			u64 m_last_soft_sync_us = 0; // Last early submit for reports/labels (see min_soft_sync_interval_us)
 			u64 m_timer = 0;
 
 			std::vector<queued_report_write> m_pending_writes{};
@@ -197,7 +199,7 @@ namespace rsx
 			void clear(class ::rsx::thread* ptimer, u32 type);
 
 			// Forcefully flushes all
-			void sync(class ::rsx::thread* ptimer);
+			void sync(class ::rsx::thread* ptimer, bool all_reports = false); // all_reports: also write reports the CPU is not known to read
 
 			// Conditionally sync any pending writes if range overlaps
 			flags32_t read_barrier(class ::rsx::thread* ptimer, u32 memory_address, u32 memory_range, flags32_t flags);
@@ -211,6 +213,8 @@ namespace rsx
 
 			// Sync hint notification
 			void on_sync_hint(sync_hint_payload_t payload);
+			bool soft_sync_due(u64 now) const { return now - m_last_soft_sync_us >= min_soft_sync_interval_us; }
+			void hint_deferred_label_fence(class ::rsx::thread* ptimer);
 
 			// Check for pending writes
 			bool has_pending() const { return !m_pending_writes.empty(); }

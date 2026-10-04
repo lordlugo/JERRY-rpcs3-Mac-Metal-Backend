@@ -4429,7 +4429,14 @@ bool spu_thread::process_mfc_cmd()
 								else
 #endif
 								{
+#if defined(ARCH_ARM64)
+									// Wait on the reservation's cache line (LDAXR + WFE) instead of a blind spin: the blind
+									// busy_wait starved the SPURS producer/consumer handshake on Apple silicon, freezing SPURS
+									// games seconds after boot (upstream RPCS3 issue #17640, fix PR #18913; GoW Ascension here)
+									utils::spin_on_cacheline_once(vm::reservation_acquire(addr), +rtime, 150);
+#else
 									busy_wait(300);
+#endif
 								}
 
 								if (getllar_spin_count == 3)
@@ -5569,6 +5576,9 @@ s64 spu_thread::get_ch_value(u32 ch)
 
 		lv2_obj::prepare_for_sleep(*this);
 
+		// Forensics for the stall dumper: which lock this wait parks on.
+		wait_raddr = raddr;
+
 		using resrv_ptr = std::add_pointer_t<const decltype(rdata)>;
 
 		resrv_mem = vm::get_super_ptr<decltype(rdata)>(raddr);
@@ -5799,7 +5809,13 @@ s64 spu_thread::get_ch_value(u32 ch)
 				else
 #endif
 				{
+#if defined(ARCH_ARM64)
+					// Lock line reservation wait: sleep on the reservation's cache line (LDAXR + WFE, woken by the writer or
+					// the event stream) instead of a blind spin (upstream RPCS3 issue #17640 / PR #18913, see GETLLAR above)
+					utils::spin_on_cacheline_once(vm::reservation_acquire(raddr), +rtime, 150);
+#else
 					busy_wait(300);
+#endif
 				}
 
 				// Check other reservations in other threads

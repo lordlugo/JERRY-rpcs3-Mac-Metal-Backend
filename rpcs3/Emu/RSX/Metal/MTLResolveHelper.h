@@ -61,8 +61,15 @@ namespace mtl
 			program->push_constants(glsl::binding_set_index_fragment, 0, size_to_push, static_parameters);
 		}
 
-		void update_sample_configuration(mtl::image* msaa_image)
+		// PS3 MSAA: the resolve image is the sample-expanded image (2x1 / 2x2 pixels per pixel), every sample is one pixel.
+		// Forced host MSAA (surface_sample_layout::forced): the resolve image has the multisample image's own size; the
+		// layout is 1x1, so depth/stencil resolve reads sample 0 and every unresolve broadcasts the pixel to all samples,
+		// and the color resolve averages all samples (static_parameters[2] = sample count, 0 for PS3 MSAA).
+		void update_sample_configuration(mtl::image* msaa_image, mtl::image* resolve_image)
 		{
+			const bool forced = resolve_image &&
+				resolve_image->width() == msaa_image->width() && resolve_image->height() == msaa_image->height();
+
 			switch (msaa_image->samples())
 			{
 			case 1:
@@ -79,8 +86,16 @@ namespace mtl
 				fmt::throw_exception("Unsupported sample count %d", msaa_image->samples());
 			}
 
+			if (forced)
+			{
+				samples_x = samples_y = 1;
+			}
+
 			static_parameters[0] = samples_x;
 			static_parameters[1] = samples_y;
+			static_parameters[2] = forced ? msaa_image->samples() : 0;
+			static_parameters[3] = 0;
+			static_parameters_width = 4;
 		}
 	};
 
@@ -110,7 +125,7 @@ namespace mtl
 
 		void run(mtl::command_list& cmd, mtl::viewable_image* msaa_image, mtl::viewable_image* resolve_image)
 		{
-			update_sample_configuration(msaa_image);
+			update_sample_configuration(msaa_image, resolve_image);
 			auto src_view = msaa_image->get_identity_view(aspect_depth);
 
 			// Depth only: a stencil plane of the target (if any) is loaded and preserved
@@ -132,7 +147,7 @@ namespace mtl
 		void run(mtl::command_list& cmd, mtl::viewable_image* msaa_image, mtl::viewable_image* resolve_image)
 		{
 			// Per-sample shading is implied by gl_SampleID ([[sample_id]]) in the fragment shader
-			update_sample_configuration(msaa_image);
+			update_sample_configuration(msaa_image, resolve_image);
 
 			auto src_view = resolve_image->get_identity_view(aspect_depth);
 
@@ -163,7 +178,7 @@ namespace mtl
 
 		void run(mtl::command_list& cmd, mtl::viewable_image* msaa_image, mtl::viewable_image* resolve_image)
 		{
-			update_sample_configuration(msaa_image);
+			update_sample_configuration(msaa_image, resolve_image);
 			mtl::image_view* views[] =
 			{
 				msaa_image->get_identity_view(aspect_depth),
@@ -197,7 +212,7 @@ namespace mtl
 
 		void run(mtl::command_list& cmd, mtl::viewable_image* msaa_image, mtl::viewable_image* resolve_image)
 		{
-			update_sample_configuration(msaa_image);
+			update_sample_configuration(msaa_image, resolve_image);
 
 			mtl::image_view* views[] =
 			{

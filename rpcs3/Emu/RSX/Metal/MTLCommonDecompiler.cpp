@@ -6,7 +6,7 @@
 
 namespace mtl
 {
-	static constexpr std::array<std::pair<std::string_view, int>, 17> varying_registers =
+	static constexpr std::array<std::pair<std::string_view, int>, 16> varying_registers =
 	{ {
 		{ "tc0", 0 },
 		{ "tc1", 1 },
@@ -24,7 +24,6 @@ namespace mtl
 		{ "spec_color1", 13 },
 		{ "fog_c", 14 },
 		{ "fogc", 14 },
-		{ "usr", 15 }, // custom injected stuff
 	} };
 
 	int get_varying_register_location(std::string_view varying_register_name)

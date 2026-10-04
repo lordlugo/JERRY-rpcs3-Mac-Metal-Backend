@@ -402,9 +402,31 @@ namespace rsx
 				rsx_log.notice("ZCULL: semaphores now wait for the zcull reports queued before them instead of stalling the RSX (reports are read by the CPU)");
 			}
 
-			m_deferred_labels.push_back({ address, value, fence, get_system_time() });
+			const u64 now = get_system_time();
+			m_deferred_labels.push_back({ address, value, fence, now });
 
-			// Submit the work the label waits for now, so it lands as soon as the GPU is done with it
+			// Submit the work the label waits for now, so it lands as soon as the GPU is done with it. At most once per
+			// min_soft_sync_interval_us: games that write a label after every few reports (God of War: Ascension, ~75 per
+			// frame) otherwise cut every frame into dozens of submissions, and every submission ends the render pass
+			// (attachments stored and loaded again). Labels deferred in between go out with the next submission, at
+			// the latest from the periodic check in update() once the interval has passed.
+			if (soft_sync_due(now))
+			{
+				hint_deferred_label_fence(ptimer);
+			}
+
+			return true;
+		}
+
+		void ZCULL_control::hint_deferred_label_fence(::rsx::thread* ptimer)
+		{
+			if (m_deferred_labels.empty())
+			{
+				return;
+			}
+
+			// The newest report the labels wait for; submitting the list holding it submits everything before it too
+			const u64 fence = m_deferred_labels.back().fence;
 			for (auto It = m_pending_writes.rbegin(); It != m_pending_writes.rend(); ++It)
 			{
 				if (!It->sink || It->seq > fence)
@@ -416,14 +438,13 @@ namespace rsx
 				{
 					if (It->query->sync_tag > m_sync_tag)
 					{
+						m_last_soft_sync_us = get_system_time();
 						ptimer->sync_hint(FIFO::interrupt_hint::zcull_sync, { .query = It->query });
 					}
 
 					break;
 				}
 			}
-
-			return true;
 		}
 
 		void ZCULL_control::retire_deferred_labels()
@@ -589,7 +610,7 @@ namespace rsx
 			}
 		}
 
-		void ZCULL_control::sync(::rsx::thread* ptimer)
+		void ZCULL_control::sync(::rsx::thread* ptimer, bool all_reports)
 		{
 			if (m_pending_writes.empty())
 			{
@@ -598,14 +619,14 @@ namespace rsx
 				return;
 			}
 
-			if (!m_critical_reports_in_flight)
+			if (!m_critical_reports_in_flight && !all_reports)
 			{
 				// Valid call, but nothing important queued up (except labels waiting for reports, if any)
 				flush_deferred_labels(ptimer);
 				return;
 			}
 
-			if (g_cfg.video.relaxed_zcull_sync)
+			if (g_cfg.video.relaxed_zcull_sync && !all_reports)
 			{
 				update(ptimer, 0, true);
 				return;
@@ -768,13 +789,23 @@ namespace rsx
 					// Schedule ahead
 					m_next_tsc = m_tsc + min_zcull_tick_us;
 
-					// Schedule a queue flush if needed (deferred labels are waiting for the front of the queue too)
+					// Labels deferred while early submits were throttled (see defer_label_write): submit what they wait for
+					if (!m_deferred_labels.empty() && soft_sync_due(m_tsc) &&
+						m_tsc - m_deferred_labels.front().timestamp > max_zcull_delay_us)
+					{
+						hint_deferred_label_fence(ptimer);
+					}
+
+					// Schedule a queue flush if needed (deferred labels are waiting for the front of the queue too).
+					// Throttled like the label submits: the reports still reach the CPU within a millisecond or two, and
+					// a read of a report that is not there yet syncs on its own (sync()).
 					if (!g_cfg.video.relaxed_zcull_sync && (m_critical_reports_in_flight || !m_deferred_labels.empty()) &&
 						front.query && front.query->num_draws && front.query->sync_tag > m_sync_tag)
 					{
 						const auto elapsed = m_tsc - front.query->timestamp;
-						if (elapsed > max_zcull_delay_us)
+						if (elapsed > max_zcull_delay_us && soft_sync_due(m_tsc))
 						{
+							m_last_soft_sync_us = m_tsc;
 							ptimer->sync_hint(FIFO::interrupt_hint::zcull_sync, { .query = front.query });
 							ensure(front.query->sync_tag <= m_sync_tag);
 						}
@@ -1237,4 +1268,4 @@ namespace rsx
 			set_eval_result(pthr, failed);
 		}
 	}
-}
+}

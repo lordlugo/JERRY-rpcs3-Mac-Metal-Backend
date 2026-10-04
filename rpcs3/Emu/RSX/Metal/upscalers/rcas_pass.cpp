@@ -210,7 +210,7 @@ namespace mtl
 			const u32 groups_x = utils::aligned_div(dst->width(), tile_size);
 			const u32 groups_y = utils::aligned_div(dst->height(), tile_size);
 
-			// Binds the pipeline on cmd.compute() (intra-encoder barrier / queue barrier of a new encoder) and dispatches
+			// Binds the pipeline (the dispatch is ordered after what it conflicts with, see rcas_pass.h) and dispatches
 			compute_task::run(cmd, groups_x, groups_y, 1);
 		}
 	}

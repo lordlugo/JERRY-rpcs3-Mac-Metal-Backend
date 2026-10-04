@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/types.hpp"
+#include "Loader/ISO.h"
 #include <string>
 
 struct GameInfo
@@ -32,4 +33,8 @@ struct GameInfo
 	bool icon_in_archive = false;
 	bool movie_in_archive = false;
 	bool audio_in_archive = false;
+
+	// Encryption type of an ISO (iso_file_decryption::check_type()), determined with "is_iso_file" by the game
+	// enumeration so that the game list never reads the disc for it
+	iso_type_status iso_type = iso_type_status::NOT_ISO;
 };

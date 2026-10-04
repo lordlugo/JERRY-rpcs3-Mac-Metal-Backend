@@ -32,38 +32,20 @@ namespace mtl
 		std::array<const MTL::Texture*, 5> get_textures() const;
 	};
 
-	// Load operation overrides used when opening a pass that clears its attachments (fast clears)
-	struct attachment_clear_info
-	{
-		u32 color_mask = 0;          // Bit N: clear colour attachment N instead of loading it
-		MTL::ClearColor color{};
-		bool clear_depth = false;
-		bool clear_stencil = false;
-		double depth = 1.0;
-		u32 stencil = 0;
-
-		bool empty() const { return !color_mask && !clear_depth && !clear_stencil; }
-	};
-
 	// Key describing attachment formats + sample count (the part of a render pass a pipeline must be compatible with).
 	u64 get_renderpass_key(const std::vector<mtl::image*>& images);
 	u64 get_renderpass_key(MTL::PixelFormat color_format, MTL::PixelFormat depth_format = MTL::PixelFormatInvalid, u8 color_attachment_count = 1, u8 sample_count = 1);
 
-	// Creates a render pass descriptor (+1 reference) for a framebuffer. All attachments load and store their contents.
+	// Creates a render pass descriptor (+1 reference) for a framebuffer. All attachments load and store their contents
+	// (deferred clears of the attachments turn loads into clears when the pass begins, see command_list::defer_clear).
 	// `visibility_result_buffer` may be null. Visibility results accumulate across passes (see MTLQueryPool.h).
 	MTL4::RenderPassDescriptor* create_render_pass_descriptor(const framebuffer_info& fb, const MTL::Buffer* visibility_result_buffer = nullptr);
 
 	// Updates the visibility result buffer of an existing descriptor
 	void set_visibility_result_buffer(MTL4::RenderPassDescriptor* desc, const MTL::Buffer* visibility_result_buffer);
 
-	// Temporarily switches load actions of a descriptor to Clear for the requested attachments and back to Load.
-	void apply_clear_load_ops(MTL4::RenderPassDescriptor* desc, const framebuffer_info& fb, const attachment_clear_info& clear);
-	void restore_load_ops(MTL4::RenderPassDescriptor* desc, const framebuffer_info& fb);
-
-	// Single colour target pass (presentation, screenshots). Clears to `clear_color` if provided, otherwise loads.
-	MTL4::RenderCommandEncoder* begin_single_target_pass(mtl::command_list& cmd, MTL::Texture* target, u32 width, u32 height, const MTL::ClearColor* clear_color = nullptr);
-
-	// Clears a colour texture by running an empty pass with loadAction=Clear
+	// Clears [0, width) x [0, height) of a colour texture: the load action (Clear) of the next pass rendering into it,
+	// or a clear-only pass (command_list::defer_clear)
 	void clear_color_texture(mtl::command_list& cmd, MTL::Texture* target, u32 width, u32 height, const MTL::ClearColor& color);
 
 	// Tracks the renderer's main render pass on a command list (vk::begin_renderpass/renderpass_op equivalent).
@@ -79,8 +61,8 @@ namespace mtl
 	public:
 		render_pass_tracker() = default;
 
-		MTL4::RenderCommandEncoder* begin(mtl::command_list& cmd, const MTL4::RenderPassDescriptor* desc);
-		void end(mtl::command_list& cmd);
+		// Begins the renderer's draw pass (see command_list::begin_render_pass)
+		MTL4::RenderCommandEncoder* begin(mtl::command_list& cmd, MTL4::RenderPassDescriptor* desc);
 		void reset();
 
 		// True if the pass we opened is still the active encoder of `cmd`

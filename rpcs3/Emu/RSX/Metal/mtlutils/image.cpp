@@ -1,13 +1,155 @@
 #include "stdafx.h"
+#include <bit>
+#include <algorithm>
 #include "image.h"
 #include "buffer_object.h"
 #include "garbage_collector.h"
 #include "Emu/system_config.h"
 
 #include <cstdlib>
+#include <mutex>
+#include <vector>
 
 namespace mtl
 {
+	namespace
+	{
+		// MTL4 texture view pools backing transient views (image_view::make_transient). Setting a view at a pool index
+		// allocates nothing; the index is reused once the view object is destroyed, which its owner defers through the
+		// GC until the GPU has executed the commands that use it.
+		class transient_view_pool
+		{
+			static constexpr u32 views_per_pool = 256;
+
+			std::mutex m_mutex;
+			std::vector<MTL::TextureViewPool*> m_pools;
+			std::vector<u32> m_free_entries;                   // pool index * views_per_pool + view index
+			MTL::TextureViewDescriptor* m_descriptor = nullptr; // Reused for every view (under m_mutex)
+			bool m_unavailable = false;
+			u64 m_views_created = 0;
+
+			bool grow()
+			{
+				autorelease_scope pool;
+
+				auto desc = ref(MTL::ResourceViewPoolDescriptor::alloc()->init());
+				desc->setResourceViewCount(views_per_pool);
+				desc->setLabel(ns_str("RSX transient texture views"));
+
+				NS::Error* error = nullptr;
+				MTL::TextureViewPool* view_pool = g_render_device->handle()->newTextureViewPool(desc.get(), &error);
+				if (!view_pool)
+				{
+					rsx_log.error("Metal: failed to create a texture view pool (%s). Transient views are created as texture view objects.", to_string(error));
+					return false;
+				}
+
+				const u32 base = ::size32(m_pools) * views_per_pool;
+				m_pools.push_back(view_pool);
+
+				for (u32 i = views_per_pool; i > 0; --i)
+				{
+					m_free_entries.push_back(base + i - 1);
+				}
+
+				return true;
+			}
+
+		public:
+			// Sets a view of `texture` at a free entry. False if pools are unavailable (API failure, logged once).
+			bool create_view(const MTL::Texture* texture, MTL::PixelFormat format, const image_view_info& info, u32& entry, MTL::ResourceID& id)
+			{
+				std::lock_guard lock(m_mutex);
+
+				if (m_unavailable)
+				{
+					return false;
+				}
+
+				if (!m_descriptor)
+				{
+					m_descriptor = MTL::TextureViewDescriptor::alloc()->init();
+				}
+
+				if (m_free_entries.empty() && !grow())
+				{
+					m_unavailable = true;
+					return false;
+				}
+
+				entry = m_free_entries.back();
+
+				m_descriptor->setPixelFormat(format);
+				m_descriptor->setTextureType(info.type);
+				m_descriptor->setLevelRange(NS::Range::Make(info.base_level, info.level_count));
+				m_descriptor->setSliceRange(NS::Range::Make(info.base_layer, info.layer_count));
+				m_descriptor->setSwizzle(info.swizzle);
+
+				id = m_pools[entry / views_per_pool]->setTextureView(texture, m_descriptor, entry % views_per_pool);
+				if (!id._impl)
+				{
+					rsx_log.error("Metal: a texture view pool returned no resource ID. Transient views are created as texture view objects.");
+					m_unavailable = true;
+					return false;
+				}
+
+				m_free_entries.pop_back();
+				m_views_created++;
+				return true;
+			}
+
+			void release_view(u32 entry)
+			{
+				std::lock_guard lock(m_mutex);
+				m_free_entries.push_back(entry);
+			}
+
+			u64 take_views_created()
+			{
+				std::lock_guard lock(m_mutex);
+				return std::exchange(m_views_created, 0);
+			}
+
+			void destroy()
+			{
+				std::lock_guard lock(m_mutex);
+
+				if (m_free_entries.size() != m_pools.size() * views_per_pool)
+				{
+					rsx_log.error("Metal: %u transient texture view(s) still alive at renderer teardown",
+						static_cast<u32>(m_pools.size() * views_per_pool - m_free_entries.size()));
+				}
+
+				for (MTL::TextureViewPool* view_pool : m_pools)
+				{
+					view_pool->release();
+				}
+
+				if (m_descriptor)
+				{
+					m_descriptor->release();
+					m_descriptor = nullptr;
+				}
+
+				m_pools.clear();
+				m_free_entries.clear();
+				m_unavailable = false;
+			}
+		};
+
+		transient_view_pool g_transient_views;
+	}
+
+	void destroy_transient_view_pools()
+	{
+		g_transient_views.destroy();
+	}
+
+	u64 get_transient_views_and_reset()
+	{
+		return g_transient_views.take_views_created();
+	}
+
 	bool debug_labels_enabled()
 	{
 		static const bool s_env_enabled = []()
@@ -96,10 +238,72 @@ namespace mtl
 		return (get_format_aspect(format) & aspect_depth_stencil) == aspect_depth_stencil;
 	}
 
+	// Channel order of the 4-channel formats that exist in both orders. A view reinterpreting one order as the other
+	// sees red and blue exchanged (BGRA8Unorm memory read as RGBA8Snorm: logical red is the stored blue byte).
+	namespace
+	{
+		enum class rgb_order { none, rgb, bgr };
+	}
+
+	static rgb_order get_rgb_order(MTL::PixelFormat format)
+	{
+		switch (format)
+		{
+		case MTL::PixelFormatRGBA8Unorm:
+		case MTL::PixelFormatRGBA8Unorm_sRGB:
+		case MTL::PixelFormatRGBA8Snorm:
+		case MTL::PixelFormatRGBA8Uint:
+		case MTL::PixelFormatRGBA8Sint:
+		case MTL::PixelFormatRGB10A2Unorm:
+		case MTL::PixelFormatRGB10A2Uint:
+			return rgb_order::rgb;
+		case MTL::PixelFormatBGRA8Unorm:
+		case MTL::PixelFormatBGRA8Unorm_sRGB:
+		case MTL::PixelFormatBGR10A2Unorm:
+			return rgb_order::bgr;
+		default:
+			return rgb_order::none;
+		}
+	}
+
+	static MTL::TextureSwizzle swap_red_blue(MTL::TextureSwizzle source)
+	{
+		switch (source)
+		{
+		case MTL::TextureSwizzleRed: return MTL::TextureSwizzleBlue;
+		case MTL::TextureSwizzleBlue: return MTL::TextureSwizzleRed;
+		default: return source;
+		}
+	}
+
 	void image::create_impl(const render_device& dev, const image_create_info& create_info)
 	{
 		info = create_info;
 		m_format_class = create_info.format_class;
+
+		// Metal aborts the process on an invalid texture descriptor (MTLTextureDescriptor validateWithDevice). Keep the
+		// dimensions and the mip count inside its limits; callers that ask for more get what can exist (logged once).
+		{
+			const u32 w0 = info.width, h0 = info.height, d0 = info.depth, m0 = info.mipmaps;
+			constexpr u32 max_dim = 16384;
+			info.width = std::clamp<u32>(info.width, 1, max_dim);
+			info.height = std::clamp<u32>(info.height, 1, max_dim);
+			info.depth = std::clamp<u32>(info.depth, 1, 2048);
+
+			const u32 largest = std::max({ info.width, info.height, info.type == MTL::TextureType3D ? info.depth : 1u });
+			const u32 max_levels = (info.samples > 1) ? 1u : static_cast<u32>(std::bit_width(largest));
+			info.mipmaps = std::clamp<u32>(info.mipmaps, 1, max_levels);
+
+			if (info.width != w0 || info.height != h0 || (info.type == MTL::TextureType3D && info.depth != d0) || (m0 > info.mipmaps))
+			{
+				static atomic_t<u32> s_reports = 0;
+				if (s_reports++ < 8)
+				{
+					rsx_log.error("Metal: texture '%s' requested %ux%ux%u with %u mip level(s), outside Metal's limits: created as %ux%ux%u with %u",
+						m_debug_name, w0, h0, d0, m0, info.width, info.height, info.depth, info.mipmaps);
+				}
+			}
+		}
 
 		autorelease_scope pool;
 		auto desc = ref(MTL::TextureDescriptor::alloc()->init());
@@ -164,6 +368,11 @@ namespace mtl
 		}
 	}
 
+	bool image::supports_view_format(MTL::PixelFormat view_format) const
+	{
+		return (info.usage & MTL::TextureUsagePixelFormatView) || !is_reinterpreting_view(format(), view_format);
+	}
+
 	void image::set_debug_name(const std::string& name)
 	{
 		m_debug_name = name;
@@ -181,12 +390,24 @@ namespace mtl
 	image_view::image_view(mtl::image* resource, const image_view_info& view_info)
 		: m_resource(resource), info(view_info)
 	{
-		create_impl();
+		create_impl(false);
 	}
 
-	void image_view::create_impl()
+	image_view::image_view(mtl::image* resource, const image_view_info& view_info, transient_tag)
+		: m_resource(resource), info(view_info)
+	{
+		create_impl(true);
+	}
+
+	std::unique_ptr<image_view> image_view::make_transient(mtl::image* resource, const image_view_info& view_info)
+	{
+		return std::unique_ptr<image_view>(new image_view(resource, view_info, transient_tag{}));
+	}
+
+	void image_view::create_impl(bool transient)
 	{
 		ensure(m_resource && m_resource->value);
+		m_parent_texture = m_resource->value;
 
 		if (info.format == MTL::PixelFormatInvalid)
 		{
@@ -228,6 +449,11 @@ namespace mtl
 				static_cast<int>(view_format), m_resource->debug_name(), static_cast<int>(m_resource->format()));
 		}
 
+		if (transient && g_transient_views.create_view(m_resource->value, view_format, info, m_pool_entry, resource_id))
+		{
+			return;
+		}
+
 		value = m_resource->value->newTextureView(
 			view_format,
 			info.type,
@@ -246,6 +472,11 @@ namespace mtl
 	image_view::~image_view()
 	{
 		m_subviews.clear();
+
+		if (m_pool_entry != umax)
+		{
+			g_transient_views.release_view(m_pool_entry);
+		}
 
 		if (value)
 		{
@@ -269,6 +500,18 @@ namespace mtl
 
 		image_view_info sub_info = info;
 		sub_info.format = format;
+
+		// The swizzle selects channels of the view format: across BGR/RGB orders the stored red and blue bytes trade
+		// places, so exchange the selectors to keep returning the channels this view returns.
+		const auto from_order = get_rgb_order(info.format);
+		const auto to_order = get_rgb_order(format);
+		if (from_order != rgb_order::none && to_order != rgb_order::none && from_order != to_order)
+		{
+			sub_info.swizzle.red = swap_red_blue(sub_info.swizzle.red);
+			sub_info.swizzle.green = swap_red_blue(sub_info.swizzle.green);
+			sub_info.swizzle.blue = swap_red_blue(sub_info.swizzle.blue);
+			sub_info.swizzle.alpha = swap_red_blue(sub_info.swizzle.alpha);
+		}
 
 		auto view = std::make_unique<image_view>(m_resource, sub_info);
 		view->m_root_view = self;

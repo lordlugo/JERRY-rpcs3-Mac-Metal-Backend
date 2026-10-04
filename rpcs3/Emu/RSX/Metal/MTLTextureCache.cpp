@@ -1,11 +1,13 @@
 #include "stdafx.h"
 #include "MTLTextureCache.h"
 #include "MTLCompute.h"
+#include "MTLGraphicsLog.h"
 #include "MTLGSRender.h"
 #include "MTLCommandStream.h"
 
 #include "mtlutils/data_heap.h"
 #include "Emu/Memory/vm.h"
+#include <bit>
 #include "Emu/system_config.h"
 
 #include "util/asm.hpp"
@@ -236,6 +238,7 @@ namespace mtl
 
 				if (shuffle_kernel)
 				{
+					note_compute("shuffle");
 					shuffle_kernel->run(cmd, working_buffer, task_length);
 				}
 			}
@@ -289,6 +292,7 @@ namespace mtl
 
 				// Execute
 				const auto job = mtl::get_compute_task<mtl::cs_tile_memcpy<RSX_detiler_op::encode>>();
+				note_compute("tile-encode");
 				job->run(cmd, config);
 
 				// Update internal variables
@@ -331,6 +335,8 @@ namespace mtl
 			mtl::copy_image_to_buffer_raw(cmd, src, dma_mapping.second, region);
 		}
 
+		note_readback(static_cast<unsigned long long>(transfer_width) * transfer_height * internal_bpp);
+
 		// Create the completion marker for this transfer. It retires with the submission of `cmd`.
 		dma_fence.emplace(cmd);
 
@@ -361,11 +367,55 @@ namespace mtl
 		sync_timestamp = rsx::get_shared_tag();
 	}
 
+	// Diagnostic: GPU data written into IO-mapped main memory, where the guest's command buffers live (a flush over a
+	// command list the RSX is about to execute desyncs the FIFO). Surfaces normally live in local memory. Logged for the
+	// first flush into each 1 MiB page (at most 64 pages), with the FIFO position for comparison.
+	static void log_io_memory_flush(u32 address, u32 length, rsx::texture_upload_context context)
+	{
+		const auto rsxthr = rsx::get_current_renderer();
+		if (!rsxthr || rsx::classify_location(address) != CELL_GCM_LOCATION_MAIN)
+		{
+			return;
+		}
+
+		const u32 io_base = rsxthr->iomap_table.io[address >> 20].load();
+		if (io_base == umax)
+		{
+			return;
+		}
+
+		static shared_mutex s_lock;
+		static std::vector<u32> s_logged_pages;
+
+		{
+			std::lock_guard lock(s_lock);
+			if (s_logged_pages.size() >= 64 || std::find(s_logged_pages.begin(), s_logged_pages.end(), address >> 20) != s_logged_pages.end())
+			{
+				return;
+			}
+
+			s_logged_pages.push_back(address >> 20);
+		}
+
+		const char* kind = "section";
+		switch (context)
+		{
+		case rsx::texture_upload_context::framebuffer_storage: kind = "surface"; break;
+		case rsx::texture_upload_context::blit_engine_dst: kind = "blit destination"; break;
+		case rsx::texture_upload_context::dma: kind = "blit copy into memory"; break;
+		default: break;
+		}
+
+		rsx_log.warning("Metal: texture cache flush wrote GPU data (%s) to IO-mapped main memory 0x%x..0x%x (IO offset 0x%x); FIFO GET=0x%x (logged once per 1 MiB page)",
+			kind, address, address + length - 1, io_base | (address & 0xFFFFF), rsxthr->ctrl ? u32{ rsxthr->ctrl->get } : 0u);
+	}
+
 	void cached_texture_section::imp_flush()
 	{
 		AUDIT(synchronized);
 
 		// Synchronize, reset dma_fence after waiting
+		mtl::wait_site_scope wait_site("surface flush to guest memory (Write Color/Depth Buffers, DMA)");
 		if (!dma_fence->wait(GENERAL_WAIT_TIMEOUT))
 		{
 			rsx_log.error("[Metal] DMA fence wait has timed out!");
@@ -383,6 +433,7 @@ namespace mtl
 			flush_length = std::min(max_content_size, available_tile_size);
 		}
 
+		log_io_memory_flush(range.start, flush_length, context);
 		mtl::flush_dma(range.start, flush_length);
 
 #if DEBUG_DMA_TILING
@@ -583,10 +634,10 @@ namespace mtl
 	// object proves that no write was recorded since the copy: the copy's contents are what a new copy would read now.
 	// Sources without such a tag (texture cache images, MSAA surfaces) are copied on every request.
 	//
-	// Ordering needs no extra barrier: copies into a reused image are recorded after the draws that sampled it, and
-	// every compute encoder or render pass waits for all earlier work of the queue (mtl::command_list), so they do not
-	// overtake those reads; a draw sampling a reused image runs in a pass that began after its last copy. The image is
-	// never an attachment of the renderer's passes.
+	// Ordering needs no extra barrier: copies into a reused image are recorded after the draws that sampled it, which
+	// declared those reads (glsl::program::bind), so the hazard tracker orders the copies after them (mtl::command_list);
+	// a draw sampling a reused image declares the read and is ordered after its last copy. The image is never an
+	// attachment of the renderer's passes.
 
 	bool texture_cache::gather_reuse_allowed(const deferred_subresource& desc) const
 	{
@@ -1129,12 +1180,16 @@ namespace mtl
 				window.w == section.dst_w && window.h == section.dst_h;
 		};
 
-		// Same command as copy_output_region() -> mtl::copy_image() for a plain copy, with the ordering chosen here
-		const auto record_plain_copy = [&](const copy_region_descriptor& section, bool ordered)
+		// Same command as copy_output_region() -> mtl::copy_image() for a plain copy, with the ordering chosen here: the
+		// first copy of the run begins a command, the others join it (they write disjoint rectangles)
+		const auto record_plain_copy = [&](const copy_region_descriptor& section, bool first)
 		{
+			note_plain_copy();
 			const auto window = get_source_window(section);
 			const bool dst_3d = (dst->type() == MTL::TextureType3D);
-			auto encoder = ordered ? cmd.compute() : cmd.compute_unordered();
+			const auto src_range = read_image(section.src, 0, 1, 0, 1);
+			const auto dst_range = write_image(dst, section.level, 1, dst_3d ? 0 : section.dst_z, 1);
+			auto encoder = first ? cmd.blit({ src_range, dst_range }) : cmd.blit_concurrent({ src_range, dst_range });
 
 			encoder->copyFromTexture(
 				section.src->value, 0, 0, MTL::Origin::Make(window.x, window.y, 0), MTL::Size::Make(window.w, window.h, 1),
@@ -1176,11 +1231,11 @@ namespace mtl
 		if (sections_to_transfer.size() > 1 && !g_cfg.video.strict_rendering_mode)
 		{
 			// Gathers mix plain copies (blit commands) with scaled copies (a render pass each) and conversions. Recorded
-			// in order, every plain copy after a scaled one opens a new compute encoder and each one waits for all
-			// earlier work. When no two sections write the same texels the order does not matter: record the plain
-			// copies first as one run, where only the first waits (for the clears and other earlier work) and the
-			// others, which write disjoint regions and only read their sources, run concurrently. Scaled copies and
-			// conversions follow in their original order and order themselves after all earlier work.
+			// in order, every plain copy after a scaled one opens a new compute encoder, and copies into the same level
+			// are ordered after each other (the hazard tracker does not know rectangles). When no two sections write the
+			// same texels the order does not matter: record the plain copies first as one command, ordered after the
+			// earlier work they conflict with (the clears), whose copies write disjoint regions and only read their
+			// sources, and so run concurrently. Scaled copies and conversions follow in their original order.
 			std::vector<u8> plain(sections_to_transfer.size(), 0);
 			usz plain_count = 0;
 
@@ -1519,12 +1574,48 @@ namespace mtl
 		{
 			if (auto view = reuse_gather(cmd, desc))
 			{
+				note_gather(true);
 				return view;
 			}
 		}
 
-		const auto& sections_to_copy = desc.sections_to_copy;
-		const auto mipmaps = ::narrow<u8>(sections_to_copy.size());
+		if (!desc.width || !desc.height || desc.sections_to_copy.empty()) [[unlikely]]
+		{
+			return nullptr;
+		}
+
+		// Metal rejects (aborts on) a mip count above floor(log2(max(w, h))) + 1. The gather takes one level per
+		// source section, and games can describe more levels than the size has (GTA IV crashed loading into gameplay):
+		// keep the levels that exist and drop the sections for the others, like the hardware never reading them.
+		const u32 max_levels = std::bit_width(std::max<u32>(desc.width, desc.height));
+		const bool too_many_levels = desc.sections_to_copy.size() > max_levels;
+		std::remove_cvref_t<decltype(desc.sections_to_copy)> clamped_sections;
+
+		if (too_many_levels) [[unlikely]]
+		{
+			static atomic_t<bool> s_logged = false;
+			if (!s_logged.exchange(true))
+			{
+				rsx_log.warning("Metal: mip-chain gather of %ux%u requested %u levels, the size has %u: extra levels dropped",
+					desc.width, desc.height, static_cast<u32>(desc.sections_to_copy.size()), max_levels);
+			}
+
+			for (const auto& section : desc.sections_to_copy)
+			{
+				if (section.level < max_levels)
+				{
+					clamped_sections.push_back(section);
+				}
+			}
+
+			if (clamped_sections.empty())
+			{
+				return nullptr;
+			}
+		}
+
+		const auto& sections_to_copy = too_many_levels ? clamped_sections : desc.sections_to_copy;
+		const auto mipmaps = ::narrow<u8>(std::min<usz>(sections_to_copy.size(), max_levels));
 		auto _template = get_template_from_collection_impl(sections_to_copy);
 		auto result = create_temporary_subresource_view_impl(cmd, _template, MTL::TextureType2D,
 			desc.gcm_format, desc.width, desc.height, 1, mipmaps, desc.remap);
@@ -1549,8 +1640,9 @@ namespace mtl
 		}
 
 		copy_transfer_regions_impl(cmd, image, sections_to_copy);
+		note_gather(false);
 
-		if (reusable)
+		if (reusable && !too_many_levels)
 		{
 			remember_gather(desc, result);
 		}
@@ -1870,8 +1962,8 @@ namespace mtl
 
 		mtl::leave_uninterruptible();
 
-		// VK transitioned the image to its preferred layout here. Metal has no layouts; the next consumer is ordered
-		// after the upload by the command list's barriers (after the whole prologue for an upload recorded there).
+		// VK transitioned the image to its preferred layout here. Metal has no layouts; the next consumer declares its
+		// read and is ordered after the upload by the command list (after the whole prologue for an upload recorded there).
 
 		section->last_write_tag = rsx::get_shared_tag();
 		return section;
@@ -1895,7 +1987,7 @@ namespace mtl
 	{
 		if (!strong_ordering && !cmd.is_render_pass_open())
 		{
-			// No pass to split: the next render pass begins with a barrier on all previous work already
+			// No pass to split: the draws of the next render pass are ordered after the writes of the earlier ones
 			return;
 		}
 
@@ -1965,16 +2057,34 @@ namespace mtl
 		// End recording
 		cmd.end();
 
+		// The readbacks read surfaces that earlier lists render into. With Multithreaded RSX the renderer's lists are
+		// committed by the offloader thread, possibly after this direct commit: a flush request is serviced by queueing the
+		// primary list, then the waiting thread records and commits its readbacks right away. The GPU would then copy the
+		// surfaces before that rendering (stale data flushed into guest memory). Commit order is queue order.
+		mtl::wait_for_queued_submits();
+
 		if (cmd.access_hint != mtl::command_list::access_type_hint::all)
 		{
 			// Primary access command queue, must restart it after.
 			// (No async compute scheduler to flush on Metal.) Commit through the renderer's submit path so ordering and
 			// the global submit lock match every other submission.
 			mtl::queue_submit_now(cmd);
+			mtl::wait_site_scope wait_site("DMA flush submission");
 			if (!cmd.wait(GENERAL_WAIT_TIMEOUT))
 			{
 				rsx_log.error("[Metal] Timed out waiting for the DMA flush submission");
 				cmd.wait();
+			}
+
+			// Everything recorded in the list so far has completed, but it keeps recording under the same reset id, which
+			// the occlusion queries recorded so far read as "pending in the open list" (occlusion_data::is_current,
+			// query_pool_manager owners). Their reports would then wait for the list's next submission, or a read would
+			// hard sync on it, and zcull's sync hint cannot bring that submission forward: the flags that make
+			// MTLGSRender::sync_hint flush the list are cleared below. Texture read labels deferred behind those reports
+			// (no host GPU labels on Metal, rsx::thread::defer_label) would wait with them. A new id marks them complete.
+			if (auto chunk = dynamic_cast<mtl::command_buffer_chunk*>(&cmd))
+			{
+				chunk->reset_id++;
 			}
 
 			cmd.clear_flags();
@@ -2243,7 +2353,12 @@ namespace mtl
 		const auto total_device_memory = m_device->caps().recommended_working_set / 0x100000;
 		u64 quota = 0;
 
-		if (total_device_memory >= 2048)
+		if (total_device_memory >= 24576)
+		{
+			// Large unified memory: keep more temporary/cached images before evicting (see the surface cache quota)
+			quota = std::min<u64>(8192, (total_device_memory * 40) / 100);
+		}
+		else if (total_device_memory >= 2048)
 		{
 			quota = std::min<u64>(3072, (total_device_memory * 40) / 100);
 		}

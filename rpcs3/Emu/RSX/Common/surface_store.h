@@ -74,7 +74,11 @@ namespace rsx
 		std::vector<surface_type> superseded_surfaces;
 
 		std::list<surface_storage_type> invalidated_resources;
-		const u64 max_invalidated_resources_count = 256ull;
+		// RPCS3 Metal fork: 1024 (was 256). Above the limit every cleanup trims the pool and then collapses dirty
+		// surfaces, which forces memory barriers (copies, and MSAA resolves with forced host MSAA) on surfaces nothing
+		// reads yet; resolution-scaled games with many render targets (God of War: Ascension at 200%) sat at 260-320
+		// and paid that every few frames. Memory use is still bounded by the surface cache quota (check_memory_usage).
+		const u64 max_invalidated_resources_count = 1024ull;
 		u64 cache_tag = 1ull; // Use 1 as the start since 0 is default tag on new surfaces
 		u64 write_tag = 1ull;
 
@@ -1652,7 +1656,7 @@ namespace rsx
 			u32 max_surface_store_memory_mb,
 			std::function<void(command_list_type)> pre_task_callback)
 		{
-			if (check_memory_usage(max_surface_store_memory_mb * 0x100000))
+			if (check_memory_usage(u64{ max_surface_store_memory_mb } * 0x100000)) // u64: budgets of 4 GiB and more overflow u32
 			{
 				pre_task_callback(cmd);
 

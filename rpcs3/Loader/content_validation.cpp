@@ -111,7 +111,8 @@ bool content_validation::init_hash(const std::string& path)
 {
 	std::string new_path = path;
 
-	fs::get_optical_raw_device(path, &new_path);
+	// "new_path" is updated with the file the disc is read from in case "path" points to an optical drive or a mounted disc image
+	fs::get_optical_disc_source(path, &new_path);
 
 	iso_file file(new_path);
 
@@ -150,8 +151,9 @@ content_hash_status content_validation::calculate_hash(std::string& hash)
 		return m_status;
 	}
 
-	constexpr u64 block_size = 4096;
-	std::array<u8, block_size> buf;
+	// One read per MiB rather than per 4 KiB
+	constexpr u64 block_size = 1024 * 1024;
+	std::vector<u8> buf(block_size);
 	u64 bytes_read;
 	mbedtls_md5_context md5_ctx;
 	unsigned char md5_hash[16];

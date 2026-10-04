@@ -20,7 +20,7 @@ void main()
 	ivec2 pixel_coord = ivec2(gl_FragCoord.xy);
 	pixel_coord *= sample_count.xy;
 	pixel_coord.x += (gl_SampleID % sample_count.x);
-	pixel_coord.y += (gl_SampleID / sample_count.x);
+	pixel_coord.y += ((gl_SampleID / sample_count.x) % sample_count.y); // Forced host MSAA has a 1x1 layout: every sample reads the pixel itself
 	uint frag_stencil = texelFetch(fs0, pixel_coord, 0).x;
 	if ((frag_stencil & uint(stencil_mask)) == 0) discard;
 }

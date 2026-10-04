@@ -6,8 +6,10 @@
 #include "Emu/Cell/lv2/sys_ppu_thread.h"
 #include "Emu/Cell/lv2/sys_rsx.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Common/sync_wait_stats.hpp"
 
 #include "cellGcmSys.h"
+#include "Emu/Cell/timing_probe.h"
 #include "sysPrxForUser.h"
 
 #include "util/asm.hpp"
@@ -169,6 +171,7 @@ vm::ptr<CellGcmReportData> cellGcmGetReportDataAddressLocation(ppu_thread& ppu, 
 u64 cellGcmGetTimeStamp(u32 index)
 {
 	cellGcmSys.trace("cellGcmGetTimeStamp(index=%d)", index);
+	timing_probe::hit(timing_probe::gcm_get_timestamp);
 
 	if (index >= 2048)
 	{
@@ -350,6 +353,8 @@ u32 cellGcmGetFlipStatus()
 	u32 status = rsx::get_current_renderer()->flip_status;
 
 	cellGcmSys.trace("cellGcmGetFlipStatus() -> %d", status);
+
+	rsx::g_sync_wait_stats.on_flip_status_poll(status != CELL_GCM_DISPLAY_FLIP_STATUS_DONE);
 
 	return status;
 }
@@ -862,6 +867,7 @@ s32 cellGcmGetDisplayBufferByFlipIndex(u32 qid)
 u64 cellGcmGetLastFlipTime()
 {
 	cellGcmSys.trace("cellGcmGetLastFlipTime()");
+	timing_probe::hit(timing_probe::gcm_get_last_flip_time);
 
 	return rsx::get_current_renderer()->last_guest_flip_timestamp;
 }
@@ -881,6 +887,7 @@ u64 cellGcmGetLastSecondVTime()
 u64 cellGcmGetVBlankCount()
 {
 	cellGcmSys.trace("cellGcmGetVBlankCount()");
+	timing_probe::hit(timing_probe::gcm_get_vblank_count);
 
 	return rsx::get_current_renderer()->vblank_count;
 }
@@ -1490,6 +1497,8 @@ s32 cellGcmCallback(ppu_thread& ppu, vm::ptr<CellGcmContextData> context, u32 co
 	context->end.set(newCommandBuffer.second);
 
 	// Wait for rsx to "release" the new command buffer
+	u64 wait_start = 0;
+
 	while (true)
 	{
 		u32 getPos = ctrl.get.load();
@@ -1501,7 +1510,17 @@ s32 cellGcmCallback(ppu_thread& ppu, vm::ptr<CellGcmContextData> context, u32 co
 			return 0;
 		}
 
+		if (!wait_start)
+		{
+			wait_start = get_system_time();
+		}
+
 		busy_wait();
+	}
+
+	if (wait_start)
+	{
+		rsx::g_sync_wait_stats.add(rsx::sync_wait::ppu_command_buffer, get_system_time() - wait_start);
 	}
 
 	return CELL_OK;

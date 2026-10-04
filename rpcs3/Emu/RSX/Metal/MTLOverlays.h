@@ -209,9 +209,6 @@ namespace mtl
 		void end_pass(mtl::command_list& cmd);
 		void draw(mtl::command_list& cmd, const areau& viewport, const overlay_target& target, std::span<mtl::image_view* const> src);
 
-		// Hook to change attachment load/clear actions of the pass descriptor (called by begin_pass)
-		virtual void configure_attachments(MTL4::RenderPassDescriptor* /*desc*/, const overlay_target& /*target*/, bool /*covers_target*/) {}
-
 		virtual void emit_geometry(mtl::command_list& cmd, glsl::program* program);
 
 		virtual void set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h);
@@ -280,42 +277,6 @@ namespace mtl
 		// before the render pass is opened; all draw commands share one render pass.
 		void run(mtl::command_list& cmd, const areau& viewport, const overlay_target& target,
 			mtl::data_heap& upload_heap, rsx::overlays::overlay& ui);
-	};
-
-	struct attachment_clear_pass : public overlay_pass
-	{
-		color4f clear_color = { 0.f, 0.f, 0.f, 0.f };
-		color4f colormask = { 1.f, 1.f, 1.f, 1.f };
-		coordu region = {};
-
-		static constexpr u32 vertex_push_constants_size = 32;
-		static_assert(vertex_push_constants_size == (sizeof(clear_color) + sizeof(colormask)));
-
-		attachment_clear_pass();
-
-		std::vector<glsl::program_input> get_vertex_inputs() override;
-
-		void update_uniforms(mtl::command_list& cmd, glsl::program* program) override;
-
-		void set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h) override;
-
-		void configure_attachments(MTL4::RenderPassDescriptor* desc, const overlay_target& target, bool covers_target) override;
-
-		// Clears `rect` of the color target (color attachment only) with `color`, honouring the RSX clear mask
-		// (0x10 R, 0x20 G, 0x40 B, 0x80 A). For MRT, call once per color target.
-		void run(mtl::command_list& cmd, const overlay_target& target, const coordu& rect, u32 clearmask, color4f color);
-	};
-
-	struct stencil_clear_pass : public overlay_pass
-	{
-		coordu region = {};
-
-		stencil_clear_pass();
-
-		void set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h) override;
-
-		// Partial stencil clear of a depth-stencil target through the stencil write mask
-		void run(mtl::command_list& cmd, const overlay_target& target, const coordu& rect, u32 stencil_clear, u32 stencil_write_mask);
 	};
 
 	struct video_out_calibration_pass : public overlay_pass

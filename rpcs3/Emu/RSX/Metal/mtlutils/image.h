@@ -95,6 +95,10 @@ namespace mtl
 		u32 aspect() const { return get_format_aspect(info.format); }
 		rsx::format_class format_class() const { return m_format_class; }
 
+		// True if a view of this image may use `view_format`: same component layout (e.g. linear <-> sRGB), or the
+		// image was created with MTLTextureUsagePixelFormatView.
+		bool supports_view_format(MTL::PixelFormat view_format) const;
+
 		const std::string& debug_name() const { return m_debug_name; }
 		void set_debug_name(const std::string& name);
 	};
@@ -115,26 +119,43 @@ namespace mtl
 	{
 		std::unordered_map<MTL::PixelFormat, std::unique_ptr<image_view>> m_subviews;
 		mtl::image* m_resource = nullptr;
+		const MTL::Texture* m_parent_texture = nullptr; // m_resource->value when the view was made (a clone may take it)
 		image_view* m_root_view = nullptr;
+		u32 m_pool_entry = umax; // Transient view: entry of the texture view pool (value is nullptr)
 
-		void create_impl();
+		struct transient_tag {};
+		image_view(mtl::image* resource, const image_view_info& view_info, transient_tag);
+
+		void create_impl(bool transient);
 
 	public:
-		MTL::Texture* value = nullptr;
-		MTL::ResourceID resource_id{};   // value->gpuResourceID(), fixed for the view's lifetime (bound by resource ID)
+		MTL::Texture* value = nullptr;   // nullptr for a transient view
+		MTL::ResourceID resource_id{};   // Fixed for the view's lifetime (views are bound by resource ID)
 		image_view_info info{};
 
 		image_view(mtl::image* resource, const image_view_info& view_info = {});
 		~image_view();
+
+		// A view for the commands being recorded only (e.g. the source of one scaled blit), created where views would
+		// otherwise be created and destroyed at a high rate: an entry of an MTL4 texture view pool instead of a new
+		// MTLTexture view object (no allocation, nothing to release). It has a resource ID but no MTL::Texture, so it
+		// can only be bound through argument tables (never as an attachment or a copy source/destination). Dispose of it
+		// through the GC like any view: its pool entry is reused once it is destroyed.
+		static std::unique_ptr<image_view> make_transient(mtl::image* resource, const image_view_info& view_info);
 
 		image_view(const image_view&) = delete;
 		image_view& operator=(const image_view&) = delete;
 
 		// Returns a view of the same subresources reinterpreted as `format` (cached, owned by the root view).
 		// Unless `format` only toggles sRGB, the image must have been created with MTLTextureUsagePixelFormatView.
+		// Between BGR- and RGB-ordered 4-channel formats (BGRA8Unorm viewed as RGBA8Snorm) the red and blue swizzle
+		// selectors are swapped, so the new view returns the same channels as this one.
 		image_view* as(MTL::PixelFormat format);
 
 		mtl::image* image() const { return m_resource; }
+		// The texture whose memory the view reads (hazard tracking): the image's texture when the view was created. A
+		// destructive clone of the image (drawable_surface_t::clone) takes the texture and the views with it.
+		const MTL::Texture* parent_texture() const { return m_parent_texture; }
 		MTL::PixelFormat format() const { return info.format; }
 		MTL::Texture* handle() const { return value; }
 		u32 encoded_component_map() const { return 0; }
@@ -166,6 +187,10 @@ namespace mtl
 	// (MTL_DEBUG_LAYER=1), RPCS3_METAL_DEBUG_LABELS=1 or the "Debug output" setting. Otherwise image::set_debug_name
 	// only keeps the name for log messages, and hot paths skip formatting names altogether.
 	bool debug_labels_enabled();
+
+	// Texture view pools behind image_view::make_transient() (renderer teardown, after the final GC flush)
+	void destroy_transient_view_pools();
+	u64 get_transient_views_and_reset(); // Transient views created since the last call (telemetry)
 
 	// Applies an RSX remap vector on top of a base channel layout (a, r, g, b order like the VK helper)
 	MTL::TextureSwizzleChannels apply_swizzle_remap(const std::array<MTL::TextureSwizzle, 4>& base_remap_argb, const rsx::texture_channel_remap_t& remap);

@@ -98,7 +98,10 @@
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="test_spu_analyser.cpp" />
+    <ClCompile Include="test_spu_boot_settle.cpp" />
     <ClCompile Include="test_fmt.cpp" />
+    <ClCompile Include="test_game_patches.cpp" />
+    <ClCompile Include="test_guest_frame_limit.cpp" />
     <ClCompile Include="test_rsx_cfg.cpp" />
     <ClCompile Include="test_rsx_fp_asm.cpp" />
     <ClCompile Include="test_rsx_mm_queue.cpp" />

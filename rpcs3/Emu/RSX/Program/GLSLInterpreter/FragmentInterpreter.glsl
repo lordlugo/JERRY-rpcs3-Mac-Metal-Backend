@@ -1,8 +1,10 @@
 R"(
+#ifndef _EXTERNAL_ROP_EXPORT
 layout(location=0) out vec4 ocol0;
 layout(location=1) out vec4 ocol1;
 layout(location=2) out vec4 ocol2;
 layout(location=3) out vec4 ocol3;
+#endif
 
 layout(location=0) in vec4 in_regs[16];
 
@@ -83,6 +85,9 @@ layout(location=0) in vec4 in_regs[16];
 #define RSX_FP_REGISTER_TYPE_CONSTANT 2
 #define RSX_FP_REGISTER_TYPE_UNKNOWN 3
 
+#define RSX_FP_PRECISION_HALF 1
+#define RSX_FP_PRECISION_FIXED12 2
+#define RSX_FP_PRECISION_FIXED9 3
 #define RSX_FP_PRECISION_SATURATE 4
 
 #define CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT 0xe
@@ -96,6 +101,18 @@ layout(location=0) in vec4 in_regs[16];
 
 #define select mix
 #define reg_mov(d, s, m) d = select(d, s, m)
+
+// Feature switches. By default every path is compiled in; a backend that specializes the interpreter per program
+// (e.g. with specialization constants) defines them as constants before this file.
+#ifndef _INTERPRETER_FLOW_CONTROL
+#define _INTERPRETER_FLOW_CONTROL true
+#endif
+#ifndef _INTERPRETER_PRECISION_MODIFIERS
+#define _INTERPRETER_PRECISION_MODIFIERS true
+#endif
+#ifndef _INTERPRETER_TEXCOORD_CONTROL
+#define _INTERPRETER_TEXCOORD_CONTROL true
+#endif
 
 // GPR set
 vec4 vr0, vr1;     // GP vector register
@@ -113,6 +130,31 @@ vec4 fogc;         // Fog coordinate register FOGC
 
 const vec4 vr_zero = vec4(0.);
 const vec4 vr_one = vec4(1.);
+
+// Precision modifiers, as the recompiler applies them (FragmentProgramDecompiler::ClampValue): the fixed-point and
+// saturate clamps read NaN as 0, half precision rounds to fp16.
+vec4 _precision_clamp(const in vec4 value, const in float lo, const in float hi)
+{
+	return clamp(select(value, vr_zero, isnan(value)), lo, hi);
+}
+
+vec4 _apply_precision(const in vec4 value, const in uint precision_modifier)
+{
+	switch (precision_modifier)
+	{
+	case RSX_FP_PRECISION_HALF:
+		return vec4(unpackHalf2x16(packHalf2x16(value.xy)), unpackHalf2x16(packHalf2x16(value.zw)));
+	case RSX_FP_PRECISION_FIXED12:
+		return _precision_clamp(value, -2., 2.);
+	case RSX_FP_PRECISION_FIXED9:
+		return _precision_clamp(value, -1., 1.);
+	case RSX_FP_PRECISION_SATURATE:
+		return _precision_clamp(value, 0., 1.);
+	default:
+		// Full precision, or the unknown modifier 5 (no effect on hardware)
+		return value;
+	}
+}
 
 bool shader_attribute(const in uint mask)
 {
@@ -178,9 +220,34 @@ int loop_end_addr = -1;
 int counter = 0;
 #endif
 
+#ifdef WITH_TEXCOORD_CONTROL
+// Texture coordinate inputs as the recompiler reads them (FragmentProgramDecompiler::GetSRC). texcoord_control is
+// RSXFragmentProgram::texcoord_control_mask: bit N = TEXN is 2D (z = 0, w = 1/gl_FragCoord.w), bit N + 16 = TEXN is
+// the point sprite coordinate (WITH_POINT_COORD: point primitives only). SRC2 bit 31 is the perspective correction flag.
+vec4 _texcoord_control(const in vec4 value, const in uint texcoord)
+{
+	const bool is_2d = TEST_BIT(texcoord_control, int(texcoord));
+
+#ifdef WITH_POINT_COORD
+	if (TEST_BIT(texcoord_control, int(texcoord) + 16))
+	{
+		return is_2d ? vec4(gl_PointCoord, 0., 1. / gl_FragCoord.w) : vec4(gl_PointCoord, 1., 0.);
+	}
+#endif
+
+	if (TEST_INST_BIT(3, 31))
+	{
+		return is_2d ? vec4(value.xy * gl_FragCoord.w, 0., 1.) : value * gl_FragCoord.w;
+	}
+
+	return is_2d ? vec4(value.xy, 0., 1. / gl_FragCoord.w) : value;
+}
+#endif
+
 vec4 read_src(const in int index)
 {
 	ur0 = GET_INST_BITS(index + 1, 0, 2);
+	uint prec_mod = GET_INST_BITS(2, 19 + index * 3, 3);
 
 	switch (ur0)
 	{
@@ -199,6 +266,9 @@ vec4 read_src(const in int index)
 		if (TEST_INST_BIT(index + 1, 8))
 		{
 			vr0 = regs16[ur1];
+
+			// Already a half register: no fp16 rounding
+			if (prec_mod == RSX_FP_PRECISION_HALF) prec_mod = 0u;
 		}
 		else
 		{
@@ -214,20 +284,27 @@ vec4 read_src(const in int index)
 		case 0:
 			vr0 = wpos; break;
 		case 1:
-			vr0 = gl_FrontFacing? in_regs[3] : in_regs[1]; break;
+			// COL0 and COL1 reads are clamped to [0, 1] (hw tests) and take no precision modifier.
+			// The front colours are outputs 1 and 2 of the vertex program, the back colours 3 and 4.
+			vr0 = clamp(gl_FrontFacing? in_regs[1] : in_regs[3], 0., 1.); prec_mod = 0u; break;
 		case 2:
-			vr0 = gl_FrontFacing? in_regs[4] : in_regs[2]; break;
+			vr0 = clamp(gl_FrontFacing? in_regs[2] : in_regs[4], 0., 1.); prec_mod = 0u; break;
 		case 3:
 			vr0 = fogc; break;
 		case 13:
 			vr0 = in_regs[6]; break;
 		case 14:
-			vr0 = gl_FrontFacing? vr_one : -vr_one; break;
+			vr0 = gl_FrontFacing? vr_one : -vr_one; prec_mod = 0u; break;
 		default:
-			ur1 += 3;
-			vr0 = in_regs[ur1]; break;
+			vr0 = in_regs[min(ur1 + 3u, 15u)]; break;
 		}
 
+#ifdef WITH_TEXCOORD_CONTROL
+		if (_INTERPRETER_TEXCOORD_CONTROL && ur1 >= 4u && ur1 <= 13u)
+		{
+			vr0 = _texcoord_control(vr0, ur1 - 4u);
+		}
+#endif
 		break;
 	}
 	case RSX_FP_REGISTER_TYPE_CONSTANT:
@@ -244,9 +321,10 @@ vec4 read_src(const in int index)
 	ur1 = GET_INST_BITS(index + 1, 9, 8);
 	vr0 = shuffle(vr0, ur1);
 
-	if (GET_INST_BITS(2, 19 + index * 3, 3) == RSX_FP_PRECISION_SATURATE)
+	// Precision modifier: saturation applies before abs, the other ones after abs and before negation
+	if (prec_mod == RSX_FP_PRECISION_SATURATE)
 	{
-		vr0 = clamp(select(vr0, vr_zero, isnan(vr0)), 0., 1.);
+		vr0 = _precision_clamp(vr0, 0., 1.);
 	}
 
 	// abs
@@ -258,6 +336,11 @@ vec4 read_src(const in int index)
 	{
 		ur1 = index + 1;
 		if (TEST_INST_BIT(ur1, 18)) vr0 = abs(vr0);
+	}
+
+	if (_INTERPRETER_PRECISION_MODIFIERS && prec_mod != 0u && prec_mod != RSX_FP_PRECISION_SATURATE)
+	{
+		vr0 = _apply_precision(vr0, prec_mod);
 	}
 
 	// neg
@@ -307,7 +390,10 @@ bool check_cond()
 
 #endif
 
-#ifdef WITH_TEXTURES
+#if defined(WITH_TEXTURES) && !defined(_EXTERNAL_TEXTURE_OPS)
+// With _EXTERNAL_TEXTURE_OPS, the backend defines vec4 _texture(vec4 coord, float bias), _textureLod(vec4 coord,
+// float lod) and _textureGrad(vec4 coord, vec4 dpdx, vec4 dpdy) instead (declared before this file, defined after
+// it; they may read the current instruction).
 
 #define RSX_SAMPLE_TEXTURE_1D   0
 #define RSX_SAMPLE_TEXTURE_2D   1
@@ -451,9 +537,47 @@ void write_dst(const in vec4 value)
 	sr0 = modifier_scale[ur1];
 	vr0 = value * sr0;
 
-	if (TEST_INST_BIT(0, 31)) // SAT
+	// Saturation and destination precision only apply to instructions that write a register (FragmentProgramDecompiler::SetDst)
+	if (!TEST_INST_BIT(0, 30))
 	{
-		vr0 = clamp(vr0, 0, 1);
+		ur0 = GET_INST_BITS(0, 22, 2); // Destination precision
+
+		if (TEST_INST_BIT(0, 31)) // SAT
+		{
+			vr0 = _precision_clamp(vr0, 0., 1.);
+		}
+		else if (_INTERPRETER_PRECISION_MODIFIERS && ur0 != 0u)
+		{
+			bool exempt;
+			switch (inst.opcode)
+			{
+			case RSX_FP_OPCODE_NRM:
+			case RSX_FP_OPCODE_MAX:
+			case RSX_FP_OPCODE_MIN:
+			case RSX_FP_OPCODE_COS:
+			case RSX_FP_OPCODE_SIN:
+			case RSX_FP_OPCODE_REFL:
+			case RSX_FP_OPCODE_FRC:
+			case RSX_FP_OPCODE_LIT:
+			case RSX_FP_OPCODE_LIF:
+			case RSX_FP_OPCODE_LG2:
+				exempt = true;
+				break;
+			case RSX_FP_OPCODE_MOV:
+				// Half register copied to a half register
+				exempt = TEST_INST_BIT(0, 7) && TEST_INST_BIT(1, 8) && GET_INST_BITS(1, 0, 2) == RSX_FP_REGISTER_TYPE_TEMP;
+				break;
+			default:
+				exempt = false;
+				break;
+			}
+
+			// fp16 precision on a 32-bit register is ignored
+			if (!exempt && !(ur0 == RSX_FP_PRECISION_HALF && !TEST_INST_BIT(0, 7)))
+			{
+				vr0 = _apply_precision(vr0, ur0);
+			}
+		}
 	}
 
 	ur0 = GET_INST_BITS(1, 18, 3);
@@ -507,8 +631,8 @@ void initialize()
 		regs16[--ur0] = vr_zero;
 	}
 
-	// Fog coord
-	fogc = in_regs[5];
+	// Fog coord (x = fog, y = fog factor, zw = 0; the recompiler's fetch_fog_value)
+	fogc = vec4(in_regs[5].x, 0., 0., 0.);
 	switch(fog_mode)
 	{
 	case 0:
@@ -536,7 +660,7 @@ void initialize()
 		fogc.y = fog_param1 * abs(fogc.x) + (fog_param0 - 1.);
 		break;
 	default:
-		fogc = in_regs[5];
+		break;
 	}
 	fogc.y = clamp(fogc.y, 0., 1.);
 
@@ -583,7 +707,11 @@ void main()
 		inst_length = 1;
 
 #ifdef WITH_FLOW_CTRL
-		if (ip == test_addr)
+		if (!_INTERPRETER_FLOW_CONTROL)
+		{
+			// No flow control instruction in this program
+		}
+		else if (ip == test_addr)
 		{
 			ip = jump_addr;
 			test_addr = -1;
@@ -614,7 +742,7 @@ void main()
 		inst.end = TEST_INST_BIT(0, 0);
 
 #ifdef WITH_FLOW_CTRL
-		if (TEST_INST_BIT(2, 31))
+		if (_INTERPRETER_FLOW_CONTROL && TEST_INST_BIT(2, 31))
 		{
 			// Flow control
 			switch (inst.opcode | (1 << 6))
@@ -733,7 +861,8 @@ void main()
 		case RSX_FP_OPCODE_SIN:
 			vrr = sin(s0.xxxx); break;
 		case RSX_FP_OPCODE_NRM:
-			vrr = normalize(s0.xyz).xyzz; break;
+			// A zero-length vector is left as it is (recompiler: _builtin_normalize)
+			vrr = (length(s0.xyz) > 0.? normalize(s0.xyz) : s0.xyz).xyzz; break;
 		case RSX_FP_OPCODE_LIT:
 			vrr = _builtin_lit(s0); break;
 		case RSX_FP_OPCODE_LIF:
@@ -754,6 +883,10 @@ void main()
 		case RSX_FP_OPCODE_PK16:
 			vrr = vec4(uintBitsToFloat(packUnorm2x16(s0.xy))); break;
 		case RSX_FP_OPCODE_PKG:
+#ifdef _ENABLE_LINEAR_TO_SRGB
+			// PKB with gamma correction (PK4UBG, recompiler: _builtin_pkg)
+			vrr = vec4(uintBitsToFloat(packUnorm4x8(linear_to_srgb(s0)))); break;
+#endif
 			// Should be similar to PKB but with gamma correction, see description of PK4UBG in khronos page
 		case RSX_FP_OPCODE_PKB:
 			vrr = vec4(uintBitsToFloat(packUnorm4x8(s0))); break;
@@ -764,6 +897,10 @@ void main()
 		case RSX_FP_OPCODE_UP16:
 			vrr = unpackUnorm2x16(floatBitsToUint(s0.x)).xyxy; break;
 		case RSX_FP_OPCODE_UPG:
+#ifdef _ENABLE_SRGB_TO_LINEAR
+			// UPB with gamma correction (recompiler: _builtin_upg)
+			vrr = srgb_to_linear(unpackUnorm4x8(floatBitsToUint(s0.x))); break;
+#endif
 			// Same as UPB with gamma correction
 		case RSX_FP_OPCODE_UPB:
 			vrr = unpackUnorm4x8(floatBitsToUint(s0.x)); break;
@@ -846,6 +983,12 @@ void main()
 				vrr = mix(s2, s1, s0); break;
 			case RSX_FP_OPCODE_DP2A:
 				vrr = dot(s0.xy, s1.xy).xxxx + s2.xxxx; break;
+			case RSX_FP_OPCODE_BEM:
+				vrr = s0.xyxy + s1.xxxx * s2.xzxz + s1.yyyy * s2.ywyw; break;
+#if defined(WITH_TEXTURES) && defined(_EXTERNAL_TEXTURE_OPS)
+			case RSX_FP_OPCODE_TXD:
+				vrr = _textureGrad(s0, s1, s2); break;
+#endif
 			default:
 				// Fallback - just write zero
 				vrr = vr_zero;
@@ -859,6 +1002,10 @@ void main()
 #endif
 		write_dst(vrr);
 	}
+
+#ifndef _EXTERNAL_ROP_EXPORT
+	// With _EXTERNAL_ROP_EXPORT, the backend implements the output stage (colour and depth export, alpha test, output
+	// remapping) after this function returns, reading the result registers regs16/regs32.
 
 #ifdef WITH_HALF_OUTPUT_REGISTER
 		ocol0 = regs16[0];
@@ -903,6 +1050,7 @@ void main()
 	ocol2 = remap_ROP_output(ocol2, ROP_remap);
 	ocol3 = remap_ROP_output(ocol3, ROP_remap);
 #endif
+#endif // _EXTERNAL_ROP_EXPORT
 }
 
 )"

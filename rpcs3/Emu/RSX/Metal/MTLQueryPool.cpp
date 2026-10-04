@@ -47,6 +47,12 @@ namespace mtl
 		ref_count.release(static_cast<s32>(m_size));
 	}
 
+	void query_pool::release_unused(u32 count)
+	{
+		ensure(count <= m_size);
+		ref_count -= static_cast<s32>(count);
+	}
+
 	// ---------------------------------------------------------------------------------------------------------------
 	// query_pool_manager (VKQueryPool.cpp)
 
@@ -125,6 +131,17 @@ namespace mtl
 	{
 		if (m_current_query_pool)
 		{
+			// A pool holds one reference per slot it may hand out, and free_query() drops one per slot handed out. A
+			// pool retired before handing out all of them (allocate_query: the next free slot was already used in it,
+			// i.e. a query of this pool was freed before one of the previous pool, e.g. ZCULL discarding its newest
+			// query while older reports are pending) would keep the references of the slots it never handed out: it
+			// would stay in the discard pile forever and every retirement would allocate a new pool. Drop them now.
+			if (m_pool_lifetime_counter)
+			{
+				m_current_query_pool->release_unused(m_pool_lifetime_counter);
+				m_pool_lifetime_counter = 0;
+			}
+
 			if (!m_current_query_pool->has_refs())
 			{
 				auto ref = std::make_unique<query_pool_ref>(this, m_current_query_pool);
@@ -184,14 +201,20 @@ namespace mtl
 		query_info.owner = &cmd;
 		query_info.owner_sync_id = cmd.reset_id;
 
-		resume_query(active_pass, index);
+		resume_query(cmd, active_pass, index);
 	}
 
-	void query_pool_manager::resume_query(MTL4::RenderCommandEncoder* active_pass, u32 index)
+	void query_pool_manager::resume_query(mtl::command_list& cmd, MTL4::RenderCommandEncoder* active_pass, u32 index)
 	{
 		if (active_pass)
 		{
-			active_pass->setVisibilityResultMode(m_result_mode, u64{ index } * query_pool::slot_size);
+			// The pass accumulates into the slot (read-modify-write) from the fragment stage's tests: ordered after
+			// earlier passes that wrote it and copies that read it (the pass barriers), and later copies of the slot wait
+			// for this pass's fragment and tile work. The pool is the pass's visibility result buffer (allocate_query
+			// ends the pass when the pool changes).
+			const u64 offset = u64{ index } * query_pool::slot_size;
+			cmd.draw_access(write_buffer(ensure(query_slot_status[index].pool)->get(), offset, query_pool::slot_size), stages_attachment);
+			active_pass->setVisibilityResultMode(m_result_mode, offset);
 		}
 	}
 
@@ -233,6 +256,7 @@ namespace mtl
 				}
 				else
 				{
+					mtl::wait_site_scope wait_site("occlusion query owner list");
 					query_info.owner->wait();
 				}
 			}
@@ -252,23 +276,26 @@ namespace mtl
 
 	void query_pool_manager::get_query_result_indirect(mtl::command_list& cmd, u32 index, u32 count, const mtl::buffer* dst, u64 dst_offset, u64 bytes_per_slot)
 	{
-		// Results are written at the end of each render pass. compute() ends the active pass and waits for all prior
-		// work of the queue (see mtl::command_list), so the copy observes all results recorded so far.
+		// Results are written at the end of each render pass. blit() ends the active pass and orders the copy after the
+		// passes that wrote these slots (declared when the queries were armed, see resume_query), so the copy observes
+		// all results recorded so far.
 		ensure(bytes_per_slot == 4 || bytes_per_slot == query_pool::slot_size);
 
 		const auto pool = ensure(query_slot_status[index].pool);
 		const u64 src_offset = u64{ index } * query_pool::slot_size;
+		const u64 src_length = u64{ count } * query_pool::slot_size;
+		auto encoder = cmd.blit({ read_buffer(pool->get(), src_offset, src_length), write_buffer(dst, dst_offset, u64{ count } * bytes_per_slot) });
 
 		if (bytes_per_slot == query_pool::slot_size)
 		{
-			cmd.compute()->copyFromBuffer(pool->value(), src_offset, dst->value(), dst_offset, u64{ count } * query_pool::slot_size);
+			encoder->copyFromBuffer(pool->value(), src_offset, dst->value(), dst_offset, src_length);
 			return;
 		}
 
-		// Low dword only (little endian). Counts larger than 32 bits are not meaningful for RSX.
+		// Low dword only (little endian). Counts larger than 32 bits are not meaningful for RSX. One command.
 		for (u32 i = 0; i < count; ++i)
 		{
-			cmd.compute()->copyFromBuffer(pool->value(), src_offset + (u64{ i } * query_pool::slot_size), dst->value(), dst_offset + (u64{ i } * 4), 4);
+			encoder->copyFromBuffer(pool->value(), src_offset + (u64{ i } * query_pool::slot_size), dst->value(), dst_offset + (u64{ i } * 4), 4);
 		}
 	}
 
@@ -299,7 +326,7 @@ namespace mtl
 			// The visibility result buffer is part of the render pass descriptor, so the active pass has to end.
 			if (cmd.is_render_pass_open())
 			{
-				cmd.end_render_pass();
+				cmd.end_render_pass(pass_end_reason::query_pool);
 			}
 
 			reallocate_pool();

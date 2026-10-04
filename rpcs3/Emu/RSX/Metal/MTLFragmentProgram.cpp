@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "MTLFragmentProgram.h"
+#include "MTLDepthBounds.h"
 #include "MTLCommonDecompiler.h"
 #include "Emu/system_config.h"
 #include "mtlutils/device.h"
@@ -94,6 +95,13 @@ void MTLFragmentDecompilerThread::prepareBindingTable()
 	if (m_prog.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
 		mtl_prog->binding_table.frag_depth_input_location = location++;
+	}
+
+	if (m_prog.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST)
+	{
+		// After every other texture: programs without the test keep their layout. The copy of the draw's depth buffer
+		// the test reads (MTLDepthBounds.h); draw_reads_depth_bounds() also keys the per-draw bounds push off it.
+		mtl_prog->binding_table.depth_bounds_location = location++;
 	}
 
 	std::memset(mtl_prog->binding_table.frag_src_location, 0xff, sizeof(mtl_prog->binding_table.frag_src_location));
@@ -292,6 +300,28 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 		));
 	}
 
+	// The depth bounds test reads the depth stored in the draw's depth buffer, through a copy made outside the pass
+	// (MTLDepthBounds.h). Multisampled depth buffers (the program key follows them, see
+	// get_backend_fragment_program_export_config) are read at sample 0.
+	const bool depth_bounds_test = !!(m_prog.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST);
+
+	if (depth_bounds_test)
+	{
+		const auto depth_bounds_type = (m_prog.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED)
+			? "sampler2DMS"
+			: "sampler2D";
+
+		OS << "layout(set=" << mtl::glsl::binding_set_index_fragment << ", binding=" << mtl_prog->binding_table.depth_bounds_location << ") uniform " << depth_bounds_type << " depth_bounds_texture;\n";
+
+		inputs.push_back(mtl::glsl::program_input::make(
+			glsl::glsl_fragment_program,
+			"depth_bounds_texture",
+			mtl::glsl::input_type_texture,
+			mtl::glsl::binding_set_index_fragment,
+			mtl_prog->binding_table.depth_bounds_location
+		));
+	}
+
 	if (m_prog.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
 	{
 		const std::string_view att_type = (m_prog.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED)
@@ -312,18 +342,14 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 		}
 	}
 
-	// Draw params are always provided by vertex program. Instead of pointer chasing, they're provided as varyings.
-	if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
-	{
-		OS <<
-			"layout(location=" << mtl::get_varying_register_location("usr") << ") in flat uvec4 draw_params_payload;\n\n";
-	}
-
+	// Per-draw offsets into the constant, context, texture parameter and stipple rings are push constants (see
+	// MTLFragmentProgram::draw_offsets_push_offset), not a flat varying: the Metal compiler knows they are the same for
+	// every fragment, so every load indexed by them is uniform (hoistable, one fetch per draw instead of per fragment).
 	OS <<
-		"#define _fs_constants_offset draw_params_payload.x\n"
-		"#define _fs_context_offset draw_params_payload.y\n"
-		"#define _fs_texture_base_index draw_params_payload.z\n"
-		"#define _fs_stipple_pattern_array_offset draw_params_payload.w\n\n";
+		"#define _fs_constants_offset fs_draw_offsets.x\n"
+		"#define _fs_context_offset fs_draw_offsets.y\n"
+		"#define _fs_texture_base_index fs_draw_offsets.z\n"
+		"#define _fs_stipple_pattern_array_offset fs_draw_offsets.w\n\n";
 
 	if (!properties.constant_offsets.empty())
 	{
@@ -350,47 +376,58 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 	OS << "	uvec4 stipple_pattern[];\n";
 	OS << "};\n\n";
 
-	// Push constants (Vulkan-style shared space; the fragment stage owns offsets 4..96):
-	//   4..32  programmable blending parameters
-	//   32..96 per-unit texture LOD bias, only when samplers cannot apply mipLodBias (pre-Apple10 GPUs)
+	// Push constants (Vulkan-style shared space; the vertex stage owns 0..4, the fragment stage 4..120):
+	//   4..32   programmable blending parameters
+	//   32..96  per-unit texture LOD bias, only when samplers cannot apply mipLodBias (pre-Apple10 GPUs)
+	//   96..112 per-draw ring offsets (always)
+	//   112..120 depth bounds (min, max), only for programs performing the depth bounds test
 	const bool use_programmable_blending = !!(m_prog.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING);
 	const bool use_lod_bias = metal_props.emulate_sampler_lod_bias && properties.has_tex_op;
 	mtl_prog->requires_lod_bias = use_lod_bias;
 
-	if (use_programmable_blending || use_lod_bias)
+	static_assert(MTLFragmentProgram::lod_bias_push_offset + MTLFragmentProgram::lod_bias_push_size <= MTLFragmentProgram::draw_offsets_push_offset);
+	static_assert(MTLFragmentProgram::draw_offsets_push_offset + MTLFragmentProgram::draw_offsets_push_size <= MTLFragmentProgram::depth_bounds_push_offset);
+
+	OS << "layout(push_constant) uniform push_constants_block\n{\n";
+
+	if (use_programmable_blending)
 	{
-		OS << "layout(push_constant) uniform push_constants_block\n{\n";
-
-		if (use_programmable_blending)
-		{
-			OS <<
-				"	layout(offset = 4) uint blend_eqn;\n"
-				"	uint blend_sfactors;\n"
-				"	uint blend_dfactors;\n"
-				"	vec4 blend_constants;\n";
-		}
-
-		if (use_lod_bias)
-		{
-			OS << "	layout(offset = " << MTLFragmentProgram::lod_bias_push_offset << ") vec4 texture_lod_bias[4];\n";
-		}
-
-		OS << "};\n\n";
-
-		const u32 push_begin = use_programmable_blending ? 4u : MTLFragmentProgram::lod_bias_push_offset;
-		const u32 push_end = use_lod_bias ? (MTLFragmentProgram::lod_bias_push_offset + MTLFragmentProgram::lod_bias_push_size) : 32u;
-
-		mtl::glsl::program_input push_constants
-		{
-			.domain = glsl::glsl_fragment_program,
-			.type = mtl::glsl::input_type_push_constant,
-			.push_constant = mtl::glsl::push_constant_ref{ .offset = push_begin, .size = push_end - push_begin },
-			.set = mtl::glsl::binding_set_index_fragment,
-			.location = umax,
-			.name = "push_constants_block"
-		};
-		inputs.push_back(std::move(push_constants));
+		OS <<
+			"	layout(offset = 4) uint blend_eqn;\n"
+			"	uint blend_sfactors;\n"
+			"	uint blend_dfactors;\n"
+			"	vec4 blend_constants;\n";
 	}
+
+	if (use_lod_bias)
+	{
+		OS << "	layout(offset = " << MTLFragmentProgram::lod_bias_push_offset << ") vec4 texture_lod_bias[4];\n";
+	}
+
+	OS << "	layout(offset = " << MTLFragmentProgram::draw_offsets_push_offset << ") uvec4 fs_draw_offsets;\n";
+
+	if (depth_bounds_test)
+	{
+		OS << "	layout(offset = " << MTLFragmentProgram::depth_bounds_push_offset << ") vec2 depth_bounds;\n";
+	}
+
+	OS << "};\n\n";
+
+	const u32 push_begin = use_programmable_blending ? 4u : use_lod_bias ? MTLFragmentProgram::lod_bias_push_offset : MTLFragmentProgram::draw_offsets_push_offset;
+	const u32 push_end = depth_bounds_test
+		? MTLFragmentProgram::depth_bounds_push_offset + MTLFragmentProgram::depth_bounds_push_size
+		: MTLFragmentProgram::draw_offsets_push_offset + MTLFragmentProgram::draw_offsets_push_size;
+
+	mtl::glsl::program_input push_constants
+	{
+		.domain = glsl::glsl_fragment_program,
+		.type = mtl::glsl::input_type_push_constant,
+		.push_constant = mtl::glsl::push_constant_ref{ .offset = push_begin, .size = push_end - push_begin },
+		.set = mtl::glsl::binding_set_index_fragment,
+		.location = umax,
+		.name = "push_constants_block"
+	};
+	inputs.push_back(std::move(push_constants));
 
 	mtl::glsl::program_input in
 	{
@@ -514,18 +551,22 @@ void MTLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 	if (mtl_prog->requires_lod_bias)
 	{
 		// Metal: sampler LOD bias is only supported by Apple10 GPUs. Everywhere else the renderer pushes the per-unit
-		// bias (texture_lod_bias) and the implicit/explicit-LOD sampling macros add it, matching Vulkan where the
-		// sampler's mipLodBias applies to every LOD computation. Gradient sampling cannot take a bias (not biased).
+		// bias (texture_lod_bias) and the sampling macros apply it, matching Vulkan where the sampler's mipLodBias applies
+		// to every LOD computation: implicit/explicit LOD sampling adds it, gradient sampling scales both gradients by
+		// 2^bias (LOD = log2 of the scaled footprint = LOD + bias, also for anisotropic filtering: the ratio is unchanged).
 		OS <<
 			"// Metal: shader-side sampler LOD bias\n"
 			"#define _TEX_LOD_BIAS(index) texture_lod_bias[(index) / 4][(index) % 4]\n"
+			"#define _TEX_GRAD_SCALE(index) exp2(_TEX_LOD_BIAS(index))\n"
 			"#undef TEX2D\n"
 			"#undef TEX2D_BIAS\n"
 			"#undef TEX2D_LOD\n"
+			"#undef TEX2D_GRAD\n"
 			"#undef TEX2D_PROJ\n"
 			"#define TEX2D(index, coord2) _process_texel(texture(TEX_NAME(index), COORD_SCALE2(index, coord2), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 			"#define TEX2D_BIAS(index, coord2, bias) _process_texel(texture(TEX_NAME(index), COORD_SCALE2(index, coord2), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 			"#define TEX2D_LOD(index, coord2, lod) _process_texel(textureLod(TEX_NAME(index), COORD_SCALE2(index, coord2), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+			"#define TEX2D_GRAD(index, coord2, dpdx, dpdy) _process_texel(textureGrad(TEX_NAME(index), COORD_SCALE2(index, coord2), (dpdx) * _TEX_GRAD_SCALE(index), (dpdy) * _TEX_GRAD_SCALE(index)), TEX_FLAGS(index))\n"
 			"#define TEX2D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), COORD_PROJ2(index, coord4.xyw), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
 
 		if (m_shader_props.require_tex3D_ops)
@@ -534,10 +575,12 @@ void MTLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 				"#undef TEX3D\n"
 				"#undef TEX3D_BIAS\n"
 				"#undef TEX3D_LOD\n"
+				"#undef TEX3D_GRAD\n"
 				"#undef TEX3D_PROJ\n"
 				"#define TEX3D(index, coord3) _process_texel(texture(TEX_NAME(index), COORD_SCALE3(index, coord3), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 				"#define TEX3D_BIAS(index, coord3, bias) _process_texel(texture(TEX_NAME(index), COORD_SCALE3(index, coord3), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 				"#define TEX3D_LOD(index, coord3, lod) _process_texel(textureLod(TEX_NAME(index), COORD_SCALE3(index, coord3), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX3D_GRAD(index, coord3, dpdx, dpdy) _process_texel(textureGrad(TEX_NAME(index), COORD_SCALE3(index, coord3), (dpdx) * _TEX_GRAD_SCALE(index), (dpdy) * _TEX_GRAD_SCALE(index)), TEX_FLAGS(index))\n"
 				"#define TEX3D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), COORD_PROJ3(index, coord4).xyz, _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
 		}
 
@@ -547,10 +590,12 @@ void MTLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 				"#undef TEX1D\n"
 				"#undef TEX1D_BIAS\n"
 				"#undef TEX1D_LOD\n"
+				"#undef TEX1D_GRAD\n"
 				"#undef TEX1D_PROJ\n"
 				"#define TEX1D(index, coord1) _process_texel(texture(TEX_NAME(index), _TEX1D_COORD(index, coord1), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 				"#define TEX1D_BIAS(index, coord1, bias) _process_texel(texture(TEX_NAME(index), _TEX1D_COORD(index, coord1), (bias) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
 				"#define TEX1D_LOD(index, coord1, lod) _process_texel(textureLod(TEX_NAME(index), _TEX1D_COORD(index, coord1), (lod) + _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n"
+				"#define TEX1D_GRAD(index, coord1, dpdx, dpdy) _process_texel(textureGrad(TEX_NAME(index), _TEX1D_COORD(index, coord1), vec2(dpdx, 0.) * _TEX_GRAD_SCALE(index), vec2(dpdy, 0.) * _TEX_GRAD_SCALE(index)), TEX_FLAGS(index))\n"
 				"#define TEX1D_PROJ(index, coord4) _process_texel(texture(TEX_NAME(index), vec2(COORD_PROJ1(index, coord4.xw), 0.5), _TEX_LOD_BIAS(index)), TEX_FLAGS(index))\n";
 		}
 
@@ -658,6 +703,15 @@ void MTLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 	OS << "void main()\n";
 	OS << "{\n";
 
+	if (m_prog.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST)
+	{
+		// Depth bounds test (no hardware support before Apple10): the depth STORED in the depth buffer at this pixel
+		// must lie in [min, max], else the fragment is not rendered (no colour, depth or stencil write). See
+		// MTLDepthBounds.h. Runs before the program: it does not depend on anything the program computes. MSL
+		// discard_fragment() demotes (MSL 2.3+): the implicit derivatives of neighbouring fragments stay defined.
+		mtl::append_depth_bounds_test(OS);
+	}
+
 	constexpr u32 ROP_control_access_options =
 		RSX_SHADER_CONTROL_ALPHA_TEST |
 		RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE |
@@ -679,6 +733,7 @@ void MTLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 	::glsl::insert_rop_init(OS, m_prog.mrt_buffers_count);
 
 	OS << "\n" << "	fs_main();\n\n";
+
 
 	if (m_prog.ctrl & RSX_SHADER_CONTROL_DISABLE_EARLY_Z)
 	{

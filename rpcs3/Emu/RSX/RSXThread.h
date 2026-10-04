@@ -33,6 +33,12 @@
 
 extern atomic_t<bool> g_user_asked_for_frame_capture;
 extern atomic_t<bool> g_disable_frame_limit;
+// Guest simulation rate in multiples of the vblank rate: 1 for unpatched games (fixed 1/60 s step per frame), 2 when a
+// timestep patch retimed the game for 120 steps/s. Caps the guest frame rate when Lock Game Speed To VBlank is on.
+extern atomic_t<u32> g_guest_logic_rate_multiplier;
+// Set by the timestep governor for fixed-timestep games it cannot retime safely: the guest is held at the vblank rate
+// (60 fps, correct game speed) while the display keeps refreshing at its own rate
+extern atomic_t<bool> g_guest_speed_lock;
 extern rsx::frame_trace_data frame_debug;
 extern rsx::frame_capture_data frame_capture;
 
@@ -207,6 +213,12 @@ namespace rsx
 		}
 		performance_counters;
 
+		// Stall tripwire: armed by the first display flip, fired once per stall episode when the task loop
+		// keeps turning with no display progress. Diagnostic only, never blocks.
+		bool stall_tripwire_armed = false;
+		bool stall_tripwire_fired = false;
+		u32 stall_tripwire_last_put = 0;
+
 		enum class flip_request : u32
 		{
 			emu_requested = 1,
@@ -290,6 +302,10 @@ namespace rsx
 		// Update fragment program export configuration. Can invalidate the current program.
 		rsx::flags32_t get_fragment_program_export_config();
 
+		// Export configuration bits (fs_export_config_mask) the backend requires for the current draw, evaluated with the
+		// others for every draw (analyse_current_rsx_pipeline), after the draw's surfaces are bound
+		virtual rsx::flags32_t get_backend_fragment_program_export_config() const { return 0; }
+
 		// Gets the current vertex program and associated state. Can invalidate the bound progam.
 		void get_current_vertex_program(const std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count>& sampler_descriptors);
 
@@ -302,6 +318,8 @@ namespace rsx
 
 	public:
 		u64 target_rsx_flip_time = 0;
+		bool m_game_speed_lock_logged = false;
+		f64 target_rsx_flip_carry = 0.; // Fractional microseconds of the frame limiter interval (next_frame_interval_us)
 		u64 int_flip_index = 0;
 		u64 last_guest_flip_timestamp = 0;
 		u64 last_host_flip_timestamp = 0;
@@ -323,6 +341,8 @@ namespace rsx
 		bool in_begin_end = false;
 
 		std::queue<desync_fifo_cmd_info> recovered_fifo_cmds_history;
+		u32 last_fifo_recover_target = umax; // Where the previous FIFO recovery resumed (see recover_fifo)
+		u64 last_fifo_recover_time = 0;
 		std::deque<frame_time_t> frame_times;
 		u32 prevent_preempt_increase_tickets = 0;
 		u64 preempt_fail_old_preempt_count = 0;
@@ -352,6 +372,9 @@ namespace rsx
 		virtual void emit_geometry(u32) {}
 
 		void run_FIFO();
+
+		// Stall tripwire check (see on_task loop)
+		void check_stall_tripwire();
 
 	public:
 		thread(const thread&) = delete;
@@ -402,12 +425,18 @@ namespace rsx
 		// Writes the deferred labels now. Labels are strongly ordered: required before any other label write and
 		// before the FIFO waits on memory. Cheap when nothing is deferred. RSX thread only (no-op elsewhere).
 		void flush_deferred_labels();
+		void sync_all_zcull_reports(); // Full pipeline sync that writes every queued zcull report (see nv4097::texture_read_semaphore_release)
 
 		// A deferred label write to this address is pending
 		bool has_deferred_label_at(u32 address) const;
 
 		// Any deferred label write is pending
 		bool has_deferred_labels() const;
+
+		// Flip done: resets the flip semaphore (label 1, which cellGcmSetWaitFlip waits to become 0), ordered after a
+		// flip semaphore release that is still held back behind deferred labels
+		void reset_flip_semaphore();
+
 		flags32_t read_barrier(u32 memory_address, u32 memory_range, bool unconditional);
 		virtual void write_barrier(u32 /*memory_address*/, u32 /*memory_range*/) {}
 		virtual void sync_hint(FIFO::interrupt_hint hint, reports::sync_hint_payload_t payload);
@@ -504,6 +533,62 @@ namespace rsx
 	{
 		return g_fxo->try_get<rsx::thread>();
 	}
+
+	// One-shot fatal-report context (RSX FIFO position, last method). Never throws
+	// and returns empty when the RSX thread is unavailable; registered with
+	// thread_ctrl::add_fatal_context_provider() at emulator init.
+	std::string crash_context_provider();
+
+	// Pure one-line formatter for the stall-tripwire thread dump (unit-tested):
+	// "PPU[0x1000000] \"main_thread\": waiting in cellMutexLock at CIA 0x1234".
+	// Pass func=nullptr when unknown; waiting=false renders "running".
+	// pc_name labels the program counter ("CIA" for PPU, "PC" for SPU).
+	std::string format_stall_thread_line(const char* kind, u32 id, const std::string& name, bool waiting, u32 pc, const char* func, const char* pc_name = "CIA", const char* extra = nullptr);
+
+	// Pure SPU wait-detail suffix for the stall dump (unit-tested), e.g.
+	// " evmask=0x400 evpend=0x0 mfc=0 raddr=0xd0001000": the event mask the
+	// kernel waits on (LR=lock line, TG/SN=DMA completion, S1/S2/MB=PPU
+	// signal/mailbox), the sticky pending events, the MFC queue depth, and the
+	// reservation address the wait parks on (0 when not in an RdEventStat wait).
+	// Tells an MFC completion bug apart from a lock-line race apart from a lost
+	// PPU signal, and names the lock itself.
+	std::string format_spu_wait_detail(u32 ev_mask, u32 ev_pending, u32 mfc_depth, u32 raddr, u32 out_mbox = 0, u32 out_intr_mbox = 0);
+
+	// What a parked PPU thread waits FOR, decoded from the blocking syscall's argument
+	// registers (GPR3-GPR6 while parked inside the call). Pure function for tests; the
+	// dump passes the live registers. Empty when the wait site is not a known syscall.
+	std::string format_stall_wait_args(const char* func, u64 g3, u64 g4, u64 g5, u64 g6);
+
+	// Poll-loop context for a thread parked in a short usleep: raw guest code words
+	// ending at pc (the loop body that loads the polled flag) and the GPR file (the
+	// base register of the flag load). Pure functions for tests; the dump reads guest
+	// memory with checked reads only. Words are ascending from base; gprs are r0 first.
+	std::string format_stall_code_words(u32 base, const u32* words, usz count);
+	std::string format_stall_gprs(const u64* gpr);
+
+	// Find the last guest load (lwz/lbz/lhz/lha/lwarx) in ascending words and resolve
+	// its effective address from gpr. The poll load is the last load before the sleep
+	// call. Best-effort forensics: false when no load is present. Pure for tests.
+	bool decode_stall_poll_addr(const u32* words, usz count, const u64* gpr, u32& ea);
+	std::string format_stall_poll_value(u32 ea, u32 value);
+
+	// One LV2 event queue's backlog for the stall dump. Queues are where PPU-side
+	// dispatchers (SPURS handlers) starve: backlog>0 with a parked receiver means the
+	// wakeup never fired (emulator delivery bug); empty means nothing was posted
+	// (producer-side stall). Pure for tests.
+	std::string format_stall_event_queue(u32 id, u64 name, u64 key, usz backlog);
+
+	// What every PPU/SPU thread is blocked in (bounded, read-only). Called once
+	// per stall episode from the tripwire so the next wedge names its wait.
+	// Still logs to the log file and returns the same text for the sidecar.
+	std::string dump_stall_thread_states();
+
+	// Rotation-proof stall sidecar: an append-only file next to RPCS3.log that
+	// survives log rotation and relaunch churn (a frozen session's RPCS3.log is
+	// gone as soon as the user opens the app again). The path is explicit so
+	// tests can point it at a temp file. Best-effort, returns success.
+	std::string stall_sidecar_path();
+	bool append_stall_sidecar(const std::string& path, const std::string& text);
 
 	inline const backend_configuration& get_renderer_backend_config()
 	{

@@ -12,7 +12,7 @@
 
 #include "Emu/system_utils.hpp"
 #include "Utilities/File.h"
-#include "Loader/ISO.h"
+#include "Emu/iso_media_cache.h"
 #include "Loader/iso_cache.h"
 #include <cmath>
 
@@ -423,7 +423,8 @@ namespace gui
 				// Get Icon for the gs_frame from path. this handles presumably all possible use cases
 				std::vector<std::string> path_list;
 
-				const bool is_archive = is_iso_file(path);
+				// Answered without reading the disc when the game list has already parsed it (it is booted from there)
+				const bool is_archive = iso_media_cache::is_iso(path);
 				if (is_archive)
 				{
 					icon_path = "PS3_GAME/ICON0.PNG";
@@ -730,7 +731,7 @@ namespace gui
 			if (icon_path.empty() || archive_path.empty()) return false;
 
 			bool is_raw_device = false;
-			const bool is_archive = is_iso_file(archive_path, nullptr, &is_raw_device);
+			const bool is_archive = iso_media_cache::is_iso(archive_path, &is_raw_device);
 
 			if (!is_archive) return false;
 
@@ -745,19 +746,11 @@ namespace gui
 				return icon.loadFromData(data);
 			}
 
-			iso_archive archive(archive_path);
-			if (!archive.exists(icon_path)) return false;
+			// Reuses the archive parsed by the game enumeration and keeps the bytes (the icon is read from the disc once)
+			const iso_media_cache::file_data data = iso_media_cache::read_file(archive_path, icon_path);
+			if (!data) return false;
 
-			auto icon_file = archive.open(icon_path);
-			if (!icon_file) return false;
-
-			const auto icon_size = icon_file->size();
-			if (icon_size == 0) return false;
-
-			QByteArray data(icon_size, 0);
-			icon_file->read(data.data(), icon_size);
-
-			return icon.loadFromData(data);
+			return icon.loadFromData(data->data(), ::narrow<uint>(data->size()));
 		}
 
 		bool load_icon(QPixmap& icon, const std::string& icon_path, const std::string& archive_path, const std::string& game_dir)

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "MTLGraphicsLog.h"
 #include "MTLGSRender.h"
 #include "MTLCommandStream.h"
 #include "MTLFormats.h"
@@ -9,6 +10,7 @@
 #include "Emu/RSX/Overlays/overlay_manager.h"
 #include "Emu/RSX/Overlays/overlay_debug_overlay.h"
 #include "Emu/Cell/Modules/cellVideoOut.h"
+#include "Emu/RSX/Common/guest_frame_limit.hpp"
 
 #include "util/asm.hpp"
 #include "util/video_provider.h"
@@ -38,12 +40,66 @@ extern atomic_t<recording_mode> g_recording_mode;
 // (presentAfterMinimumDuration(k * R - R / 2)), e.g. 60 fps on a 120 Hz ProMotion panel = every other refresh, 30 fps =
 // every 4th, instead of jittering between 1, 2 and 3 refreshes. Fullscreen on an Adaptive-Sync screen:
 // presentAfterMinimumDuration(G - 0.5 ms). VSync off: plain present().
+//
+// Pacing must never make the game slower than it can run: it is a feedback loop (frames held on screen longer delay
+// the flips, and the guest may wait for them in ways the renderer cannot see, e.g. game logic that picks its own
+// swap interval from flip timings). Hence:
+//  - G is a low estimate (lower quartile) of the intervals measured without the time the RSX thread waited for the
+//    display, only ever snapped down to whole vblanks, and never below the frame limit;
+//  - the RSX thread keeps serving the guest (memory flushes, labels held back for zcull reports) while it waits for a
+//    frame context, so that the wait does not propagate to the guest;
+//  - while G paces the game slower than its frame limit, frames are paced at the frame limit for a moment now and then
+//    (update_pacing_probe). If the game keeps up, the history measured under the slower pacing is dropped;
+//  - the history is dropped when the presentation mode changes (fullscreen/windowed, refresh rate, VSync mode).
 
 namespace
 {
 	constexpr u64 guest_interval_reset_us = 250'000;         // Longer gaps (loading, pause) restart the guest interval history
 	constexpr u64 surface_poll_interval_us = 1'000'000;      // The window can move to another screen without a resize
 	constexpr u64 present_stats_interval_us = 30'000'000;    // Telemetry log rate limit
+	constexpr u64 display_backlog_threshold_us = 1'000;      // A flip that waited this long for the display: frames are queued
+
+	// Downward probes (MTLGSRender::update_pacing_probe)
+	constexpr u64 probe_initial_backoff_us = 2'000'000;      // First probe after the pace dropped below the frame limit
+	constexpr u64 probe_max_backoff_us = 32'000'000;         // Probes that find nothing double the delay up to this
+	constexpr u64 probe_min_duration_us = 300'000;           // Time for queued frames to drain and for the game to react
+	constexpr u64 probe_max_duration_us = 1'000'000;
+	constexpr u32 probe_min_samples = 8;
+
+	// Lower quartile of the `count` most recent entries of a ring buffer whose next write position is `next`.
+	// Overestimating the guest frame interval throttles the game (every frame is held on screen too long) while
+	// underestimating it only degrades to plain FIFO, so low values win: hitches never raise it, and a game alternating
+	// between two cadences is paced at the faster one.
+	template <usz N>
+	f64 recent_lower_quartile(const std::array<f64, N>& ring, u32 next, u32 count)
+	{
+		std::array<f64, N> values{};
+		for (u32 i = 0; i < count; ++i)
+		{
+			values[i] = ring[(next + N - 1 - i) % N];
+		}
+
+		const auto nth = values.begin() + count / 4;
+		std::nth_element(values.begin(), nth, values.begin() + count);
+		return *nth;
+	}
+
+	// Guest frames follow the emulated vblank (1/60 s by default): an interval somewhat above a whole number of vblanks
+	// (60, 30, 20, 15 fps) is snapped down to it, so that jitter does not move the pacing target. Never snapped up by more
+	// than timer jitter: rounding a game that runs between two cadences up would throttle it (30.5 ms -> 33.3 ms made
+	// it 4 refreshes per frame instead of 3 on a 120 Hz screen).
+	f64 snap_to_vblanks(f64 interval)
+	{
+		const f64 vblank = 1. / static_cast<f64>(std::max<s64>(1, g_cfg.video.vblank_rate));
+		const f64 vblanks = std::floor(interval / vblank + 0.06);
+
+		if (vblanks >= 1. && vblanks <= 4. && interval - vblanks * vblank <= vblank * 0.2)
+		{
+			return vblanks * vblank;
+		}
+
+		return interval;
+	}
 
 	MTL::PixelFormat RSX_display_format_to_mtl_format(u8 format)
 	{
@@ -84,6 +140,12 @@ void MTLGSRender::assert_metal_layer_state()
 	if (display_sync != m_metal_layer->displaySyncEnabled())
 	{
 		m_metal_layer->setDisplaySyncEnabled(display_sync);
+	}
+
+	if (m_vsync_mode != g_cfg.video.vsync)
+	{
+		// Intervals measured under the other presentation mode include its back-pressure
+		m_present_pacing.reset_guest_intervals();
 	}
 	m_vsync_mode = g_cfg.video.vsync;
 
@@ -202,6 +264,11 @@ void MTLGSRender::update_present_pacing(bool emu_flip)
 			// behind the renderer's back. Reassert the presentation state while sizes are stable, when no resize
 			// would do it.
 			assert_metal_layer_state();
+
+			// The intervals measured so far include the back-pressure of the previous presentation mode (Adaptive-Sync
+			// fullscreen or composited window, other refresh rate), and the transition itself stalls the display:
+			// start over at the frame limit
+			pacing.reset_guest_intervals();
 		}
 
 		pacing.refresh_interval = refresh_interval;
@@ -222,8 +289,7 @@ void MTLGSRender::update_present_pacing(bool emu_flip)
 		if (delta >= guest_interval_reset_us)
 		{
 			// Loading, pause or a stall: start over
-			pacing.guest_interval_count = 0;
-			pacing.guest_interval_next = 0;
+			pacing.reset_guest_intervals();
 		}
 		else
 		{
@@ -234,14 +300,98 @@ void MTLGSRender::update_present_pacing(bool emu_flip)
 			pacing.guest_intervals[pacing.guest_interval_next] = sample;
 			pacing.guest_interval_next = (pacing.guest_interval_next + 1) % pacing.guest_intervals.size();
 			pacing.guest_interval_count = std::min<u32>(pacing.guest_interval_count + 1, ::size32(pacing.guest_intervals));
+
+			update_pacing_probe(now);
 		}
 	}
 
 	pacing.last_emu_flip_time = now;
+	m_rsx_time_stats.display_wait_us += pacing.blocked_time;
 	pacing.blocked_time = 0;
 }
 
-f64 MTLGSRender::get_guest_frame_interval() const
+void MTLGSRender::update_pacing_probe(u64 now)
+{
+	// The subtraction of blocked_time only removes the display waits of the RSX thread. When the guest itself waits on
+	// flips that pacing delays (or adapts its own cadence to them), the measured intervals follow the pacing target and
+	// nothing would ever lower it again: a hitch could lock a 60 fps game at 30 or 15 fps. So while the target paces the
+	// game slower than its frame limit, it is tested now and then: frames are paced at the frame limit for a moment and
+	// if the game keeps up, the intervals measured under the slower pacing are dropped. A game that really runs slower
+	// only sees a short stretch of unpaced frames, less and less often.
+	auto& pacing = m_present_pacing;
+	const f64 limit_interval = get_frame_limit_interval();
+	const f64 tolerance = pacing.refresh_interval * 0.25;
+
+	if (pacing.probe_start_time)
+	{
+		// Probe running: get_guest_frame_interval() returns the frame limit
+		pacing.probe_samples++;
+
+		const u64 elapsed = now - pacing.probe_start_time;
+		if ((pacing.probe_samples < probe_min_samples || elapsed < probe_min_duration_us) && elapsed < probe_max_duration_us)
+		{
+			return;
+		}
+
+		pacing.probe_start_time = 0;
+
+		// The most recent intervals are the probe's. The first ones may still include frames queued at the old pace, but
+		// only low values count.
+		const u32 count = std::min({ pacing.probe_samples, pacing.guest_interval_count, ::size32(pacing.guest_intervals) });
+		const f64 probed = (count >= 4)
+			? std::max(snap_to_vblanks(recent_lower_quartile(pacing.guest_intervals, pacing.guest_interval_next, count)), limit_interval)
+			: 0.;
+
+		if (count >= 4 && get_pacing_slot(probed) < pacing.probe_from_slot - tolerance)
+		{
+			rsx_log.notice("Metal: pacing: the game kept up with faster presentation (frame interval %.2f ms, paced at %.2f ms before)",
+				probed * 1000., pacing.probe_from_slot * 1000.);
+
+			// Keep only the probe's intervals: the older ones were measured while pacing held the game back
+			std::array<f64, std::tuple_size_v<decltype(pacing.guest_intervals)>> recent{};
+			for (u32 i = 0; i < count; ++i)
+			{
+				recent[i] = pacing.guest_intervals[(pacing.guest_interval_next + ::size32(recent) - count + i) % ::size32(recent)];
+			}
+
+			pacing.guest_intervals = recent;
+			pacing.guest_interval_count = count;
+			pacing.guest_interval_next = count % ::size32(recent);
+			pacing.probe_backoff = probe_initial_backoff_us;
+		}
+		else
+		{
+			// The game really runs at that pace
+			pacing.probe_backoff = std::min(std::max(pacing.probe_backoff, probe_initial_backoff_us) * 2, probe_max_backoff_us);
+		}
+
+		pacing.next_probe_time = now + pacing.probe_backoff;
+		return;
+	}
+
+	const f64 slot = get_pacing_slot(get_guest_frame_interval());
+
+	if (m_vsync_mode == vsync_mode::off || slot <= get_pacing_slot(limit_interval) + tolerance)
+	{
+		// Paced at the frame limit (or not paced): nothing to test
+		pacing.next_probe_time = 0;
+		pacing.probe_backoff = probe_initial_backoff_us;
+		return;
+	}
+
+	if (!pacing.next_probe_time)
+	{
+		pacing.next_probe_time = now + std::max(pacing.probe_backoff, probe_initial_backoff_us);
+	}
+	else if (now >= pacing.next_probe_time)
+	{
+		pacing.probe_start_time = now;
+		pacing.probe_samples = 0;
+		pacing.probe_from_slot = slot;
+	}
+}
+
+f64 MTLGSRender::get_frame_limit_interval() const
 {
 	// Frame limit, as applied by rsx::thread::handle_emu_flip
 	f64 limit = 0.;
@@ -264,32 +414,72 @@ f64 MTLGSRender::get_guest_frame_interval() const
 		limit = limit2;
 	}
 
-	// Measured interval: the 25th percentile of the recent intervals. Overestimating the interval throttles the game
-	// (every frame is held on screen too long) while underestimating it only degrades to plain FIFO, so low values win:
-	// hitches (long frames) never raise the target, and a game alternating between two cadences is paced at the faster.
+	// Same cap as the guest flip limiter (RSXThread handle_emu_flip): a timestep-patched game is paced at exactly 2x the
+	// vblank rate (120 fps: one frame per refresh on a 120 Hz screen), and the optional lock holds other games at the vblank
+	if (!g_disable_frame_limit)
+	{
+		const u32 multiplier = g_guest_logic_rate_multiplier.load();
+		limit = multiplier > 1 ? rsx::apply_game_speed_lock(limit, 60., multiplier, true)
+		                       : rsx::apply_game_speed_lock(limit, rsx::effective_vblank_hz(g_cfg.video.vblank_rate.get(), g_cfg.video.vblank_ntsc.get()),
+			                         1, g_guest_speed_lock.load());
+	}
+
+	return limit > 0. ? 1. / limit : 0.;
+}
+
+f64 MTLGSRender::get_measured_frame_interval() const
+{
+	// Lower quartile of the recent intervals (see recent_lower_quartile), 0 until there are enough of them
 	const auto& pacing = m_present_pacing;
-	f64 measured = 0.;
 
 	if (const u32 count = pacing.guest_interval_count; count >= 4)
 	{
-		std::array<f64, std::tuple_size_v<decltype(pacing.guest_intervals)>> sorted = pacing.guest_intervals;
-		const auto nth = sorted.begin() + count / 4;
-		std::nth_element(sorted.begin(), nth, sorted.begin() + count);
-		measured = *nth;
+		return snap_to_vblanks(recent_lower_quartile(pacing.guest_intervals, pacing.guest_interval_next, count));
+	}
 
-		// Guest frames follow the emulated vblank (1/60 s by default): snap to a whole number of vblanks (60, 30, 20,
-		// 15 fps) so that jitter does not move the pacing target
-		const f64 vblank = 1. / static_cast<f64>(std::max<s64>(1, g_cfg.video.vblank_rate));
-		const f64 vblanks = std::round(measured / vblank);
+	return 0.;
+}
 
-		if (vblanks >= 1. && vblanks <= 4. && std::abs(measured - vblanks * vblank) <= vblank * 0.2)
-		{
-			measured = vblanks * vblank;
-		}
+f64 MTLGSRender::get_guest_frame_interval() const
+{
+	const f64 limit_interval = get_frame_limit_interval();
+
+	if (m_present_pacing.probe_start_time)
+	{
+		// Downward probe: pace at the frame limit (see update_pacing_probe)
+		return limit_interval;
 	}
 
 	// The limit is a lower bound: games often run below it (a 30 fps game with the default 60 fps limit)
-	return std::max(measured, limit > 0. ? 1. / limit : 0.);
+	return std::max(get_measured_frame_interval(), limit_interval);
+}
+
+f64 MTLGSRender::get_pacing_slot(f64 guest_interval, u32* refreshes) const
+{
+	const auto& pacing = m_present_pacing;
+	const f64 refresh = pacing.refresh_interval;
+
+	if (pacing.fullscreen && pacing.variable_refresh)
+	{
+		// Adaptive-Sync (fullscreen only): the display refreshes when the frame is due
+		if (refreshes)
+		{
+			*refreshes = 0;
+		}
+
+		return std::max(guest_interval, refresh);
+	}
+
+	// Fixed refresh grid: keep every frame on screen for the same whole number of refreshes. Intervals are only rounded
+	// up when they are close to the next multiple: rounding a game running between two cadences up would throttle it.
+	const u32 slot_refreshes = std::max(1u, static_cast<u32>(guest_interval / refresh + 0.25));
+
+	if (refreshes)
+	{
+		*refreshes = slot_refreshes;
+	}
+
+	return slot_refreshes * refresh;
 }
 
 void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
@@ -319,25 +509,24 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 	{
 		if (const f64 guest_interval = get_guest_frame_interval(); guest_interval > 0.)
 		{
-			f64 slot = 0.;
+			f64 slot = get_pacing_slot(guest_interval, &slot_refreshes);
 
-			if (pacing.fullscreen && pacing.variable_refresh)
+			if (const u64 flip_blocked = pacing.blocked_time - std::min(pacing.blocked_time, pacing.flip_blocked_start);
+				flip_blocked >= display_backlog_threshold_us && slot > refresh * 1.5)
 			{
-				// Adaptive-Sync (fullscreen only): the display refreshes when the frame is due
-				slot = std::max(guest_interval, refresh);
-				min_duration = slot - 0.0005;
+				// This flip had to wait for the display (a drawable or a frame context): frames are queued ahead of this
+				// one. A frame is never shown sooner than a slot after the previous one, so the queue would stay full
+				// for good after a hitch, and every later flip would wait for the display too: the flip completes late
+				// for the guest, and a guest slightly faster than the slot is throttled to it. One refresh less drains
+				// the queue.
+				slot -= refresh;
+				slot_refreshes = slot_refreshes ? slot_refreshes - 1 : 0;
+				pacing.catch_up_frames++;
 			}
-			else
-			{
-				// Fixed refresh grid: keep every frame on screen for the same whole number of refreshes. Intervals are
-				// only rounded up when they are close to the next multiple: rounding a game running between two
-				// cadences up would throttle it.
-				slot_refreshes = std::max(1u, static_cast<u32>(guest_interval / refresh + 0.25));
-				slot = slot_refreshes * refresh;
 
-				// Any time between the previous refresh and the target one: half a refresh of margin absorbs jitter
-				min_duration = slot - refresh * 0.5;
-			}
+			// Adaptive-Sync: shown when due. Fixed refresh grid: any time between the previous refresh and the target
+			// one, half a refresh of margin absorbs jitter.
+			min_duration = slot_refreshes ? slot - refresh * 0.5 : slot - 0.0005;
 
 			if (m_vsync_mode == vsync_mode::adaptive && pacing.last_present_time > 0. &&
 				now - pacing.last_present_time > slot + refresh * 0.5)
@@ -367,6 +556,7 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 	if (!pacing.stats_time)
 	{
 		pacing.stats_time = now_us;
+		m_rsx_time_stats = { .waits = rsx::g_sync_wait_stats.snapshot() };
 	}
 	else if (now_us - pacing.stats_time >= present_stats_interval_us)
 	{
@@ -378,17 +568,28 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 		}
 
 		const u32 dropped = feedback.dropped.exchange(0);
-		const std::string mode = (m_vsync_mode == vsync_mode::off) ? "vsync off" :
-			(min_duration <= 0.) ? "unpaced" :
-			slot_refreshes ? fmt::format("%u refresh(es) per frame", slot_refreshes) : std::string("variable refresh");
+		// The pacing target (this frame may have been shown sooner: adaptive VSync, queue drain)
+		const f64 target_interval = get_guest_frame_interval();
+		u32 target_refreshes = 0;
+		get_pacing_slot(target_interval, &target_refreshes);
+
+		std::string mode = (m_vsync_mode == vsync_mode::off) ? "vsync off" :
+			(target_interval <= 0.) ? "unpaced" :
+			target_refreshes ? fmt::format("%u refresh(es) per frame", target_refreshes) : std::string("variable refresh");
+
+		if (pacing.probe_start_time)
+		{
+			mode += " (testing the frame limit)";
+		}
 
 		rsx_log.notice("Metal: presentation over %us: frames on screen for 1/2/3/4/5/6+ refreshes (%.2f ms): %u/%u/%u/%u/%u/%u, not displayed: %u. "
-			"Pacing: %s, guest frame interval %.2f ms, minimum duration %.2f ms",
+			"Pacing: %s, guest frame interval %.2f ms, minimum duration %.2f ms, %u frame(s) shortened to drain queued frames",
 			(now_us - pacing.stats_time) / 1'000'000, refresh * 1000., counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], dropped,
-			mode, get_guest_frame_interval() * 1000., min_duration * 1000.);
+			mode, target_interval * 1000., min_duration * 1000., pacing.catch_up_frames);
 
-		// GPU load. A rising GPU time per frame in the same scene means the GPU clock dropped (heat); a high pass count
-		// means attachments are stored and reloaded often (feedback splits, clears, copies between draws).
+		pacing.catch_up_frames = 0;
+
+		// GPU load. A rising GPU time per frame in the same scene means the GPU clock dropped (heat).
 		u32 frames = dropped;
 		for (const u32 count : counts)
 		{
@@ -402,28 +603,173 @@ void MTLGSRender::present_drawable(mtl::frame_context_t* ctx)
 			const f64 busy_ms = gpu.busy_ns / 1'000'000.;
 			const auto per_frame = [frames](u64 count) { return static_cast<f64>(count) / frames; };
 			const auto program_cache_sizes = m_prog_buffer->get_cache_sizes();
-			const auto& reasons = gpu.splits_by_reason;
-			// Skipped draws / pipeline waits: shader compilation stutter (no shader interpreter on Metal)
-			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), %.1f render passes (%.1f for draws) and %.1f feedback splits per frame "
-				"(read after write %.1f, through a copy %.1f, write after read %.1f, depth compare %.1f, vertex read %.1f; %.1f feedback reads kept in the pass), "
+			// Skipped draws / pipeline waits: shader compilation stutter (the shader interpreter line says why draws
+			// were not interpreted). Render passes and feedback splits: the render passes line below.
+			rsx_log.notice("Metal: GPU busy %.2f ms per frame (%.0f%% of the time), "
 				"%.1f image uploads from memory per frame (%.1f ahead of the render pass, %.1f ended one). "
 				"Pipelines: %.1f draws skipped and %.2f ms waited per frame (program cache: %llu pipelines, %llu vertex and %llu fragment programs)",
-				busy_ms / frames, 100. * busy_ms / window_ms, per_frame(gpu.render_passes), per_frame(gpu.draw_render_passes), per_frame(gpu.feedback_splits),
-				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_after_write)]),
-				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::read_through_copy)]),
-				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::write_after_read)]),
-				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::depth_compare)]),
-				per_frame(reasons[static_cast<u32>(mtl::pass_split_reason::vertex_read)]),
-				per_frame(gpu.feedback_reads_in_pass),
+				busy_ms / frames, 100. * busy_ms / window_ms,
 				per_frame(gpu.uploads_ahead + gpu.uploads_inline), per_frame(gpu.uploads_ahead), per_frame(gpu.uploads_inline_split),
 				per_frame(m_skipped_draws), per_frame(m_pipeline_wait_us) / 1000.,
 				static_cast<unsigned long long>(program_cache_sizes.pipelines),
 				static_cast<unsigned long long>(program_cache_sizes.vertex_programs),
 				static_cast<unsigned long long>(program_cache_sizes.fragment_programs));
+
+			// Render pass structure: on a tile-based GPU every pass loads and stores its attachments, so a high pass count
+			// means attachments are stored and reloaded often (feedback splits, surface changes, clears, copies). Shader
+			// reads of the depth buffer a pass attaches (texture units, depth compare emulation) read a copy of it, made
+			// outside the pass (ending an open one) whenever depth changed since the previous copy. The depth bounds
+			// test reads no depth buffer, so its draws copy nothing.
+			const std::string depth_bounds = m_device->caps().depth_bounds ? std::string("in hardware") :
+				fmt::format("%.1f draws per frame emulated in the fragment shader", per_frame(m_depth_bounds_draws));
+			rsx_log.notice("Metal: render passes: %s; depth bounds test: %s; shader reads of the depth buffer during its pass: "
+				"%.1f copies of it per frame (%.1f pass splits)", mtl::describe_render_passes(gpu, frames), depth_bounds,
+				per_frame(m_depth_copies), per_frame(gpu.splits_by_reason[static_cast<u32>(mtl::pass_split_reason::depth_copy)]));
+
+			// CPU encoding cost: driver calls the argument table / encoder state caches avoided
+			rsx_log.notice("Metal: encoding per frame: %.1f submissions, %.0f argument table writes (%.0f skipped as redundant), "
+				"%.0f pipeline state / argument table sets (%.0f skipped), %.1f transient views from the texture view pool, %.1f residency set commits",
+				per_frame(gpu.submissions), per_frame(gpu.table_writes), per_frame(gpu.table_writes_skipped),
+				per_frame(gpu.state_sets), per_frame(gpu.state_sets_skipped), per_frame(mtl::get_transient_views_and_reset()),
+				per_frame(m_device->get_residency_commits_and_reset()));
+
+			// GPU concurrency (hazard-tracked barriers): compute commands that began without waiting for earlier work can
+			// overlap it; render passes begin with the two pass barriers (tile-based GPU: nothing after a pass's first draw
+			// orders it, so "after the first draw" must stay 0); submissions that did not conflict with earlier ones still
+			// running start right away
+			rsx_log.notice("Metal: barriers per frame: %.1f of %.1f compute commands began without a barrier; %.1f queue barriers "
+				"(%.1f render pass barriers, %.1f before a pass's first draw for what its vertex stage reads, %.1f after it), "
+				"%.1f pass splits for vertex reads, %.1f intra-encoder barriers, %.1f full-barrier fallbacks (undeclared accesses); "
+				"%.1f submissions waited for an earlier conflicting one, %.1f overlapped earlier work",
+				per_frame(gpu.ordering_points_free), per_frame(gpu.ordering_points), per_frame(gpu.queue_barriers), per_frame(gpu.pass_barriers),
+				per_frame(gpu.first_draw_barriers), per_frame(gpu.late_barriers),
+				per_frame(gpu.splits_by_reason[static_cast<u32>(mtl::pass_split_reason::vertex_read)]),
+				per_frame(gpu.encoder_barriers), per_frame(gpu.full_barriers), per_frame(gpu.submissions_waited), per_frame(gpu.submissions_overlapped));
+		}
+
+		// GPU -> CPU synchronization: time threads spent blocked on RSX timeline work (readbacks, zcull report reads,
+		// hard syncs). Rising RSX-thread waits with falling GPU utilization mean the CPU and GPU take turns.
+		const auto cpu_waits = mtl::get_cpu_wait_stats_and_reset();
+		if (frames)
+		{
+			const auto per_frame = [frames](u64 value) { return static_cast<f64>(value) / frames; };
+			rsx_log.notice("Metal: waits for GPU work per frame: RSX thread %.2f ms in %.2f waits (longest %.2f ms), other threads %.2f ms in %.2f waits (longest %.2f ms)",
+				per_frame(cpu_waits.renderer.total_us) / 1000., per_frame(cpu_waits.renderer.count), cpu_waits.renderer.max_us / 1000.,
+				per_frame(cpu_waits.others.total_us) / 1000., per_frame(cpu_waits.others.count), cpu_waits.others.max_us / 1000.);
+
+			// Where the RSX thread waits (the pass_context it was in): readback = guest reads of GPU data (Write Color
+			// Buffers, DMA), query = zcull reports, texture setup = texture cache, other = command list recycling etc.
+			static constexpr std::array<const char*, mtl::cpu_wait_stats_t::context_count> context_names =
+			{
+				"other", "surface setup", "texture setup", "clear", "blit", "query", "readback", "present"
+			};
+
+			std::string by_context;
+			for (u32 i = 0; i < mtl::cpu_wait_stats_t::context_count; i++)
+			{
+				if (const auto& b = cpu_waits.renderer_by_context[i]; b.count)
+				{
+					fmt::append(by_context, "%s%s %.2f ms in %.2f", by_context.empty() ? "" : ", ", context_names[i], per_frame(b.total_us) / 1000., per_frame(b.count));
+				}
+			}
+
+			if (!by_context.empty())
+			{
+				rsx_log.notice("Metal: RSX thread waits for GPU work per frame by cause: %s", by_context);
+			}
+
+			if (const std::string sites = mtl::take_other_wait_sites(static_cast<u32>(frames)); !sites.empty())
+			{
+				rsx_log.notice("Metal: RSX thread waits for GPU work by site: %s", sites);
+			}
+		}
+
+		// RSX thread load per guest frame: work (the RSX frame statistics, flip; "other" is FIFO command processing,
+		// surface/texture cache work, readbacks, GPU waits) and idle time (waiting for commands or semaphores from the
+		// guest, frame limiter), plus the PPU's waits for the RSX in HLE cellGcm. Idle near 0 with the PPU waiting: the
+		// RSX thread limits the frame rate. Idle mostly "waiting for commands": the guest (PPU/SPU) does.
+		const auto sync_waits = rsx::g_sync_wait_stats.snapshot();
+		if (const auto& rsx_time = m_rsx_time_stats; rsx_time.frames && window_ms > 0.)
+		{
+			using enum rsx::sync_wait;
+			const f64 frames_f = rsx_time.frames;
+			const auto ms = [frames_f](f64 us) { return us / 1000. / frames_f; };
+			const auto wait_ms = [&](rsx::sync_wait what) { return ms(static_cast<f64>(sync_waits.time_of(what) - rsx_time.waits.time_of(what))); };
+			const auto waits = [&](rsx::sync_wait what) { return static_cast<f64>(sync_waits.count_of(what) - rsx_time.waits.count_of(what)) / frames_f; };
+
+			const f64 frame_ms = window_ms / frames_f;
+			const f64 idle_ms = wait_ms(fifo_empty) + wait_ms(flip_semaphore) + wait_ms(semaphore) + wait_ms(frame_limiter);
+			const f64 work_ms = ms(static_cast<f64>(rsx_time.setup_us + rsx_time.vertex_upload_us + rsx_time.texture_upload_us + rsx_time.draw_exec_us)) +
+				ms(static_cast<f64>(rsx_time.flip_us));
+
+			rsx_log.notice("Metal: RSX thread per guest frame (%.2f ms, %.0f draw calls): busy %.2f ms (draw setup %.2f, vertex upload %.2f, texture upload %.2f, "
+				"draw execution %.2f, flip %.2f incl. %.2f waiting for the display, other %.2f), idle %.2f ms (waiting for commands %.2f in %.1f waits, "
+				"flip semaphore %.2f, other semaphores %.2f in %.1f waits, frame limiter %.2f). PPU waits for the RSX per frame: command buffer full %.2f ms "
+				"in %.2f waits, flip status polled %.1f times while pending (%.2f ms)",
+				frame_ms, rsx_time.draw_calls / frames_f, frame_ms - idle_ms, ms(static_cast<f64>(rsx_time.setup_us)), ms(static_cast<f64>(rsx_time.vertex_upload_us)),
+				ms(static_cast<f64>(rsx_time.texture_upload_us)), ms(static_cast<f64>(rsx_time.draw_exec_us)), ms(static_cast<f64>(rsx_time.flip_us)),
+				ms(static_cast<f64>(rsx_time.display_wait_us)), frame_ms - idle_ms - work_ms, idle_ms, wait_ms(fifo_empty), waits(fifo_empty),
+				wait_ms(flip_semaphore), wait_ms(semaphore), waits(semaphore), wait_ms(frame_limiter),
+				wait_ms(ppu_command_buffer), waits(ppu_command_buffer), waits(ppu_flip_status), wait_ms(ppu_flip_status));
+		}
+
+		m_rsx_time_stats = { .waits = sync_waits };
+
+		// Flexible render pipeline states: how new render pipelines were created in this window (MTLPipelineCompiler.h)
+		const auto pipelines = mtl::get_pipeline_creation_stats_and_reset();
+		const auto average_ms = [](u64 total_us, u32 count) { return count ? total_us / 1000. / count : 0.; };
+		rsx_log.notice("Metal: render pipelines over %us: %u created by specialization (%.2f ms on average, longest %.2f ms), %u with full state "
+			"(%u listed in the pipeline archive, %u after a failed specialization), %u unspecialized built (%.2f ms on average); "
+			"background full-state compiles: %u requested, %u built, %u swapped in",
+			(now_us - pacing.stats_time) / 1'000'000, pipelines.specialized, average_ms(pipelines.specialization_us, pipelines.specialized),
+			pipelines.specialization_max_us / 1000., pipelines.full_state, pipelines.full_state_archived, pipelines.fallbacks,
+			pipelines.unspecialized, average_ms(pipelines.unspecialized_us, pipelines.unspecialized),
+			pipelines.upgrades_requested, pipelines.upgrades_built, pipelines.upgrades_swapped);
+
+		// Where compile time went in this window, all threads (the shader cache preload also logs its own totals)
+		const auto timings = mtl::get_compile_timings_and_reset();
+		rsx_log.notice("Metal: shader builds over %us: GLSL->MSL %u (%.1f ms on average), MTLLibrary %u (%.1f ms on average); pipelines (render "
+			"and compute) with archive lookups %u (%.1f ms on average), compiled without %u (%.1f ms on average)",
+			(now_us - pacing.stats_time) / 1'000'000, timings.translated, average_ms(timings.translate_us, timings.translated),
+			timings.libraries, average_ms(timings.library_us, timings.libraries), timings.archive_pipelines,
+			average_ms(timings.archive_pipeline_us, timings.archive_pipelines), timings.compiled_pipelines,
+			average_ms(timings.compiled_pipeline_us, timings.compiled_pipelines));
+
+		if (frames && (g_cfg.video.shadermode == shader_mode::async_with_interpreter || g_cfg.video.shadermode == shader_mode::interpreter_only))
+		{
+			// Shader interpreter: draws it drew instead of skipping them, and why the others were skipped
+			using reason = mtl::shader_interpreter::skip_reason;
+			const auto per_frame = [frames](u64 value) { return static_cast<f64>(value) / frames; };
+			const auto skips = [this](reason r) { return m_interpreter_skips[static_cast<u32>(r)]; };
+			const auto interpreter = m_shader_interpreter.get_stats_and_reset();
+
+			rsx_log.notice("Metal: shader interpreter: %.1f draws per frame; skipped per frame: %.1f waiting for its pipeline, %.1f with programs "
+				"it does not run, %.1f whose pipeline failed. Pipelines built: %u (+%u specialized for a program, %u failed), %llu in total",
+				per_frame(m_interpreter_draws), per_frame(skips(reason::not_ready)), per_frame(skips(reason::unsupported) + skips(reason::inexact)),
+				per_frame(skips(reason::failed)), interpreter.pipelines_built, interpreter.variants_built, interpreter.pipelines_failed,
+				static_cast<unsigned long long>(m_shader_interpreter.get_pipeline_count()));
+		}
+
+		// GPU flows outside the draw passes (MSAA resolve/unresolve, blit/scale passes, compute kernels,
+		// uploads, DMA readbacks, surface init/spill, depth copies, presents) plus the worst graphics issues
+		// collected since the last window. This is the line to paste into a bug report.
+		if (frames)
+		{
+			mtl::graphics_log_report(frames);
+		}
+
+		// What the GPU actually produced: black / partly black screens, NaN/Inf from shader math, a screen map
+		if (m_frame_inspector)
+		{
+			m_frame_inspector->report();
 		}
 
 		m_skipped_draws = 0;
 		m_pipeline_wait_us = 0;
+		m_interpreter_draws = 0;
+		m_interpreter_skips.fill(0);
+		m_depth_bounds_draws = 0;
+		m_depth_copies = 0;
 		pacing.stats_time = now_us;
 	}
 }
@@ -463,7 +809,8 @@ void MTLGSRender::present(mtl::frame_context_t *ctx)
 	MTL::Texture* dst = ctx->drawable->texture();
 	const NS::UInteger width = std::min(src->width(), dst->width());
 	const NS::UInteger height = std::min(src->height(), dst->height());
-	cmd->compute()->copyFromTexture(src, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1), dst, 0, 0, MTL::Origin(0, 0, 0));
+	cmd->blit({ mtl::read_texture(src), mtl::write_texture(dst) })
+		->copyFromTexture(src, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(width, height, 1), dst, 0, 0, MTL::Origin(0, 0, 0));
 
 	// Present queue: wait for the frame's work and for the drawable, copy, signal the drawable
 	mtl::submit_info_t submit_info{};
@@ -526,6 +873,8 @@ void MTLGSRender::advance_queued_frames()
 	m_current_frame->flags |= frame_context_state::dirty;
 
 	mtl::advance_frame_counter();
+
+	report_resource_usage();
 }
 
 void MTLGSRender::queue_swap_request()
@@ -564,6 +913,7 @@ void MTLGSRender::frame_context_cleanup(mtl::frame_context_t *ctx)
 	ensure(ctx->swap_command_buffer);
 
 	// Perform hard swap here
+	mtl::wait_site_scope wait_site("frame context (an earlier frame still on the GPU)");
 	if (!ctx->swap_command_buffer->wait(FRAME_PRESENT_TIMEOUT))
 	{
 		// GPU hang, stop presenting
@@ -619,6 +969,70 @@ void MTLGSRender::frame_context_cleanup(mtl::frame_context_t *ctx)
 	}
 
 	mtl::advance_completed_frame_counter();
+}
+
+void MTLGSRender::serve_guest_during_display_wait()
+{
+	// The pacing only discounts the RSX thread's own display waits (blocked_time). That is valid only if the guest keeps
+	// running meanwhile, so the RSX thread must not sit on anything the guest waits for.
+
+	if (m_queue_status & flush_queue_state::deadlock)
+	{
+		// Offloader fault (see do_local_task)
+		on_invalidate_memory_range(m_offloader_fault_range, m_offloader_fault_cause);
+		m_queue_status.clear(flush_queue_state::deadlock);
+	}
+
+	// PPU/SPU threads that fault on surfaces wait for the RSX thread to submit its work (on_access_violation). Same as
+	// do_local_task, whose base part must not run here: it may start an emulated flip, and this can be one.
+	if (!(m_queue_status & flush_queue_state::flushing) && m_flush_requests.pending() && m_flush_queue_mutex.try_lock())
+	{
+		flush_command_queue();
+
+		m_flush_requests.clear_pending_flag();
+		m_flush_requests.consumer_wait();
+		m_flush_queue_mutex.unlock();
+	}
+
+	// Labels held back for zcull reports: write the ones whose reports are done (CPU threads may be polling them)
+	if (zcull_ctrl && zcull_ctrl->has_deferred_labels())
+	{
+		zcull_ctrl->update(this);
+	}
+}
+
+void MTLGSRender::wait_for_frame_context(mtl::frame_context_t* ctx)
+{
+	// Waiting for an older frame to leave the present queue is back-pressure from the display (see update_present_pacing)
+	const u64 wait_start = get_system_time();
+
+	if (auto cmd = ctx->swap_command_buffer; cmd && !cmd->poke())
+	{
+		// Committed from here on (deferred submissions), so its fence can be waited on
+		cmd->flush();
+
+		while (true)
+		{
+			serve_guest_during_display_wait();
+
+			// Serving the guest may have retired the frame (flush_command_queue -> check_present_status)
+			if (ctx->swap_command_buffer != cmd || cmd->poke() || get_system_time() - wait_start >= FRAME_PRESENT_TIMEOUT)
+			{
+				break;
+			}
+
+			// Up to 1 ms (the finest timeout MTLSharedEvent offers), wakes up as soon as the list completes
+			cmd->get_fence().wait(1000);
+		}
+	}
+
+	if (ctx->swap_command_buffer)
+	{
+		// Retires the frame (reports a GPU hang if the list never completed)
+		frame_context_cleanup(ctx);
+	}
+
+	m_present_pacing.blocked_time += get_system_time() - wait_start;
 }
 
 mtl::viewable_image* MTLGSRender::get_present_source(/* inout */ mtl::present_surface_info* info, const rsx::avconf& avconfig)
@@ -742,9 +1156,35 @@ mtl::viewable_image* MTLGSRender::get_present_source(/* inout */ mtl::present_su
 void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 {
 	mtl::autorelease_scope pool;
+	mtl::pass_context_scope pass_context(mtl::pass_context::present);
+
+	// RSX thread time telemetry (present_drawable): the flipped frame's statistics and the time spent here
+	struct flip_timer_t
+	{
+		u64& total_us;
+		const u64 start_us = get_system_time();
+
+		~flip_timer_t()
+		{
+			total_us += get_system_time() - start_us;
+		}
+	} flip_timer{ m_rsx_time_stats.flip_us };
+
+	if (info.emu_flip)
+	{
+		mtl::graphics_log_next_frame();
+		m_rsx_time_stats.frames++;
+		m_rsx_time_stats.draw_calls += info.stats.draw_calls;
+		m_rsx_time_stats.setup_us += info.stats.setup_time;
+		m_rsx_time_stats.vertex_upload_us += info.stats.vertex_upload_time;
+		m_rsx_time_stats.texture_upload_us += info.stats.textures_upload_time;
+		m_rsx_time_stats.draw_exec_us += info.stats.draw_exec_time;
+	}
 
 	// New frame, new budget for waiting on pipelines that are still compiling (see load_program)
 	m_async_compile_wait_spent_us = 0;
+	m_unsupported_wait_spent_us = 0;
+	update_shader_preload_notification();
 
 	// Check surface condition/status. CAMetalLayer does not report resizes, poll the window size.
 	if (m_swapchain_dims.width != m_frame->client_width() + 0u ||
@@ -768,16 +1208,9 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 
 	// Screen properties and the guest frame interval (pacing inputs)
 	update_present_pacing(info.emu_flip);
+	m_present_pacing.flip_blocked_start = m_present_pacing.blocked_time;
 
 	ensure(m_current_frame, "Invalid frame context setup");
-
-	// Waiting for an older frame to leave the present queue is back-pressure from the display (see update_present_pacing)
-	const auto wait_for_frame_context = [&](mtl::frame_context_t* ctx)
-	{
-		const u64 wait_start = get_system_time();
-		frame_context_cleanup(ctx);
-		m_present_pacing.blocked_time += get_system_time() - wait_start;
-	};
 
 	if (m_current_frame == &m_aux_frame_context)
 	{
@@ -858,6 +1291,7 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	// Scan memory for required data. This is done early to optimize waiting for the drawable below.
 	mtl::viewable_image* image_to_flip = nullptr;
 	mtl::viewable_image* image_to_flip2 = nullptr;
+	u32 present_address = 0;
 
 	if (info.buffer < display_buffers_count && buffer_width && buffer_height)
 	{
@@ -870,6 +1304,7 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 			.pitch = buffer_pitch,
 			.eye = 0
 		};
+		present_address = present_info.address;
 		image_to_flip = get_present_source(&present_info, avconfig);
 
 		if (avconfig.stereo_enabled) [[unlikely]]
@@ -1035,9 +1470,52 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(!m_current_frame->drawable);
 	ensure(m_current_frame->swap_command_buffer == nullptr);
 
+	// Graphics self-check (MTLFrameInspector): read back the checks the GPU has finished, then record this frame's
+	// (a few small compute dispatches every 15th/30th frame, nothing waits for them)
+	if (!m_frame_inspector)
+	{
+		m_frame_inspector = std::make_unique<mtl::frame_inspector>();
+	}
+
+	m_frame_inspector->poll();
+
+	if (info.emu_flip && image_to_flip)
+	{
+		std::vector<mtl::frame_inspector::target_candidate> targets;
+
+		if (m_frame_inspector->wants_targets())
+		{
+			// Float render targets written since the previous check (where shader math lands unclamped)
+			const u64 since = m_frame_inspector_tag;
+			m_rtts.for_each_color_surface([&](mtl::render_target* rtt)
+			{
+				if (!rtt || !rtt->value || rtt->last_use_tag <= since || !mtl::frame_inspector::is_float_format(rtt->format()))
+				{
+					return;
+				}
+
+				// A transfer wrote the single-sample image last (pending unresolve): that one holds the current data
+				MTL::Texture* texture = rtt->value;
+				if (rtt->samples() > 1 && (rtt->msaa_flags & rsx::surface_state_flags::require_unresolve) && rtt->resolve_surface)
+				{
+					texture = rtt->resolve_surface->value;
+				}
+
+				targets.push_back({ .texture = texture, .address = rtt->base_addr });
+			});
+
+			m_frame_inspector_tag = rsx::get_shared_tag();
+		}
+
+		m_frame_inspector->on_flip(*m_current_command_buffer, image_to_flip->value, present_address, info.stats.draw_calls, targets);
+	}
+
 	// Submit the frame's work so far: the GPU works on it while nextDrawable may block. Nothing on the main queue waits
 	// for the drawable (see present()).
 	flush_command_queue();
+
+	// nextDrawable blocks without serving anything: hand out what the guest may be waiting for first
+	serve_guest_during_display_wait();
 
 	const u64 acquire_start = get_system_time();
 	auto drawable = m_metal_layer->nextDrawable();
@@ -1114,7 +1592,11 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (image_to_flip)
 	{
-		const areai src_area = { 0, 0, s32(buffer_width), s32(buffer_height) };
+		mtl::note_present(m_output_scaling == output_scaling_mode::fsr ? "metalfx" :
+			m_output_scaling == output_scaling_mode::bilinear ? "bilinear" : "nearest");
+
+		areai src_area = { 0, 0, s32(buffer_width), s32(buffer_height) };
+
 
 		if (use_calibration_pass) [[unlikely]]
 		{

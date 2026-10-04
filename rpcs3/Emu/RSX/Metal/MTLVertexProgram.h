@@ -8,9 +8,20 @@
 //  - Vertex texture 1D fetches are 2D fetches at t = 0.5 (1D textures are 2D textures of height 1 on Metal).
 //  - No fp64 in MSL: the z-clip emulation always uses the fallback path.
 //  - Clip-space Y is flipped by the MSL translator (SPIRV-Cross flip_vert_y), not by the GLSL.
+//  - The draw parameters are a uniform block (MSL constant address space), and no draw_params_payload varying is
+//    exported: the fragment stage gets its offsets as push constants.
+//  - DP4 and DPH are explicit fused chains that start with the w product (not dot()), so that DP4 of a position whose
+//    fetched w is 1 and DPH give the same bits in every program, as on the RSX (depth pre-pass vs colour passes).
+
+namespace mtl::interpreter
+{
+	struct source_builder;
+}
 
 struct MTLVertexDecompilerThread : public VertexProgramDecompiler
 {
+	friend struct mtl::interpreter::source_builder; // Builds the shader interpreter from the same header and bindings
+
 	std::string& m_shader;
 	std::vector<mtl::glsl::program_input> inputs;
 	class MTLVertexProgram* mtl_prog;
@@ -48,8 +59,6 @@ public:
 
 	void Task();
 	const std::vector<mtl::glsl::program_input>& get_inputs() { return inputs; }
-
-	void insertFSExport(std::stringstream& OS);
 };
 
 class MTLVertexProgram : public rsx::VertexProgramBase

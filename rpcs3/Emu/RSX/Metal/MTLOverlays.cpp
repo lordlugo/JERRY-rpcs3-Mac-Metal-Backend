@@ -671,8 +671,6 @@ namespace mtl
 			attachment->setStoreAction(MTL::StoreActionStore);
 		}
 
-		configure_attachments(desc.get(), target, covers_target);
-
 		cmd.begin_render_pass(desc.get());
 
 		// This call clobbers dynamic state
@@ -837,10 +835,10 @@ namespace mtl
 
 		upload_heap.unmap();
 
+		// One command: the layers are independent copies
+		auto encoder = cmd.blit({ read_buffer(upload_heap.heap.get(), offset, data_size), write_image(tex, 0, 1, 0, layers) });
 		for (u32 layer = 0; layer < layers; ++layer)
 		{
-			// Layers are independent: only the first copy needs ordering against earlier compute/blit work
-			auto encoder = (layer == 0) ? cmd.compute() : cmd.compute_unordered();
 			encoder->copyFromBuffer(upload_heap.value(), offset + (layer * layer_size), pitch, layer_size,
 				MTL::Size(w, h, 1), tex->value, layer, 0, MTL::Origin(0, 0, 0));
 		}
@@ -1296,223 +1294,6 @@ namespace mtl
 		m_vao_length = 0;
 
 		ui.update(get_system_time());
-	}
-
-	// ---- attachment_clear_pass --------------------------------------------------------------------------------------
-
-	attachment_clear_pass::attachment_clear_pass()
-	{
-		vs_src =
-			"#version 450\n"
-			"#extension GL_ARB_separate_shader_objects : enable\n"
-			"layout(push_constant) uniform static_data{ vec4 regs[2]; };\n"
-			"layout(location=0) out vec4 color;\n"
-			"\n"
-			"void main()\n"
-			"{\n"
-			"	vec2 positions[] = {vec2(-1., -1.), vec2(1., -1.), vec2(-1., 1.), vec2(1., 1.)};\n"
-			"	color = regs[0];\n"
-			"	gl_Position = vec4(positions[gl_VertexIndex % 4], 0., 1.);\n"
-			"}\n";
-
-		fs_src =
-			"#version 420\n"
-			"#extension GL_ARB_separate_shader_objects : enable\n"
-			"layout(location=0) in vec4 color;\n"
-			"layout(location=0) out vec4 out_color;\n"
-			"\n"
-			"void main()\n"
-			"{\n"
-			"	out_color = color;\n"
-			"}\n";
-
-		// Disable samplers
-		m_num_usable_samplers = 0;
-
-		// Disable UBOs
-		m_num_uniform_buffers = 0;
-
-		renderpass_config.set_depth_mask(false);
-		renderpass_config.set_color_mask(0, true, true, true, true);
-		renderpass_config.set_attachment_count(1);
-	}
-
-	std::vector<glsl::program_input> attachment_clear_pass::get_vertex_inputs()
-	{
-		return
-		{
-			glsl::program_input::make(
-				::glsl::glsl_vertex_program,
-				"push_constants",
-				glsl::input_type_push_constant,
-				glsl::binding_set_index_vertex,
-				umax,
-				glsl::push_constant_ref{ .offset = 0, .size = vertex_push_constants_size })
-		};
-	}
-
-	void attachment_clear_pass::update_uniforms(mtl::command_list& /*cmd*/, glsl::program* program)
-	{
-		f32 data[8];
-		data[0] = clear_color.r;
-		data[1] = clear_color.g;
-		data[2] = clear_color.b;
-		data[3] = clear_color.a;
-		data[4] = colormask.r;
-		data[5] = colormask.g;
-		data[6] = colormask.b;
-		data[7] = colormask.a;
-
-		static_assert(sizeof(data) == vertex_push_constants_size);
-		program->push_constants(glsl::binding_set_index_vertex, 0, vertex_push_constants_size, data);
-	}
-
-	void attachment_clear_pass::set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h)
-	{
-		auto encoder = cmd.render_encoder();
-
-		MTL::Viewport vp{};
-		vp.originX = static_cast<f64>(x);
-		vp.originY = static_cast<f64>(y);
-		vp.width = static_cast<f64>(w);
-		vp.height = static_cast<f64>(h);
-		vp.znear = 0.;
-		vp.zfar = 1.;
-		encoder->setViewport(vp);
-
-		encoder->setScissorRect(clamp_scissor(target, region.x, region.y, region.width, region.height));
-	}
-
-	void attachment_clear_pass::configure_attachments(MTL4::RenderPassDescriptor* desc, const overlay_target& target, bool /*covers_target*/)
-	{
-		const bool full_mask = colormask.r > 0.f && colormask.g > 0.f && colormask.b > 0.f && colormask.a > 0.f;
-		const bool full_region = region.x == 0 && region.y == 0 && region.width >= target.width() && region.height >= target.height();
-
-		if (target.color && full_mask && full_region)
-		{
-			// Whole attachment: use the hardware clear on load
-			auto attachment = desc->colorAttachments()->object(0);
-			attachment->setLoadAction(MTL::LoadActionClear);
-			attachment->setClearColor(MTL::ClearColor::Make(clear_color.r, clear_color.g, clear_color.b, clear_color.a));
-		}
-	}
-
-	void attachment_clear_pass::run(mtl::command_list& cmd, const overlay_target& target, const coordu& rect, u32 clearmask, color4f color)
-	{
-		region = rect;
-
-		color4f mask = { 0.f, 0.f, 0.f, 0.f };
-		if (clearmask & 0x10) mask.r = 1.f;
-		if (clearmask & 0x20) mask.g = 1.f;
-		if (clearmask & 0x40) mask.b = 1.f;
-		if (clearmask & 0x80) mask.a = 1.f;
-
-		if (mask != colormask || color != clear_color)
-		{
-			colormask = mask;
-			clear_color = color;
-
-			// Update color mask to match request
-			renderpass_config.set_color_mask(0, colormask.r > 0.f, colormask.g > 0.f, colormask.b > 0.f, colormask.a > 0.f);
-		}
-
-		// Color attachment only; ignore any depth-stencil part of the target
-		overlay_target color_target = target;
-		color_target.depth_stencil = nullptr;
-
-		const areau full_area = { 0, 0, color_target.width(), color_target.height() };
-
-		if (!rect.width || !rect.height || rect.x >= full_area.x2 || rect.y >= full_area.y2)
-		{
-			// Nothing to clear (Metal rejects empty scissor rectangles)
-			return;
-		}
-
-		const bool full_mask = colormask.r > 0.f && colormask.g > 0.f && colormask.b > 0.f && colormask.a > 0.f;
-		const bool full_region = region.x == 0 && region.y == 0 && region.width >= full_area.x2 && region.height >= full_area.y2;
-
-		if (!begin_pass(cmd, color_target, full_area))
-		{
-			return;
-		}
-
-		if (!(full_mask && full_region))
-		{
-			// Partial clear: render the quad through the scissor with the requested write mask
-			draw(cmd, full_area, color_target, {});
-		}
-
-		end_pass(cmd);
-	}
-
-	// ---- stencil_clear_pass -----------------------------------------------------------------------------------------
-
-	stencil_clear_pass::stencil_clear_pass()
-	{
-		vs_src =
-			"#version 450\n"
-			"#extension GL_ARB_separate_shader_objects : enable\n"
-			"\n"
-			"void main()\n"
-			"{\n"
-			"	vec2 positions[] = {vec2(-1., -1.), vec2(1., -1.), vec2(-1., 1.), vec2(1., 1.)};\n"
-			"	gl_Position = vec4(positions[gl_VertexIndex % 4], 0., 1.);\n"
-			"}\n";
-
-		// Depth-stencil only target: no color output (the stencil value comes from the reference value)
-		fs_src =
-			"#version 420\n"
-			"#extension GL_ARB_separate_shader_objects : enable\n"
-			"\n"
-			"void main()\n"
-			"{\n"
-			"}\n";
-
-		m_num_uniform_buffers = 0;
-		m_num_usable_samplers = 0;
-	}
-
-	void stencil_clear_pass::set_up_viewport(mtl::command_list& cmd, const overlay_target& target, u32 x, u32 y, u32 w, u32 h)
-	{
-		auto encoder = cmd.render_encoder();
-
-		MTL::Viewport vp{};
-		vp.originX = static_cast<f64>(x);
-		vp.originY = static_cast<f64>(y);
-		vp.width = static_cast<f64>(w);
-		vp.height = static_cast<f64>(h);
-		vp.znear = 0.;
-		vp.zfar = 1.;
-		encoder->setViewport(vp);
-
-		encoder->setScissorRect(clamp_scissor(target, region.x, region.y, region.width, region.height));
-	}
-
-	void stencil_clear_pass::run(mtl::command_list& cmd, const overlay_target& target, const coordu& rect, u32 stencil_clear, u32 stencil_write_mask)
-	{
-		ensure(target.has_stencil(), "Stencil clear on a target without stencil");
-		region = rect;
-
-		if (!rect.width || !rect.height || rect.x >= target.width() || rect.y >= target.height())
-		{
-			// Nothing to clear (Metal rejects empty scissor rectangles)
-			return;
-		}
-
-		// Stencil setup. Replace all pixels in the scissor region with stencil_clear with the correct write mask.
-		renderpass_config.enable_stencil_test(
-			MTL::StencilOperationReplace, MTL::StencilOperationReplace, MTL::StencilOperationReplace,  // Always replace
-			MTL::CompareFunctionAlways,                                                                 // Always pass
-			0xFF,                                                                                       // Full write-through
-			stencil_clear);                                                                             // Write active bit
-
-		renderpass_config.set_stencil_mask(stencil_write_mask);
-		renderpass_config.set_depth_mask(false);
-
-		overlay_target ds_target = target;
-		ds_target.color = nullptr;
-
-		overlay_pass::run(cmd, { 0, 0, ds_target.width(), ds_target.height() }, ds_target, std::vector<mtl::image_view*>{});
 	}
 
 	// ---- video_out_calibration_pass ---------------------------------------------------------------------------------

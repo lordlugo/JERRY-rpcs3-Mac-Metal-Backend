@@ -1437,8 +1437,9 @@ void cell_audio_thread::operator()()
 				// more than the device's next pull plus one period, for at most the desired buffer duration. A game that
 				// stopped feeding its ports (menus, loading) still gets its period skipped, and silence enqueued for the
 				// periods after it, before the queue runs dry.
-				const bool queue_covers_wait = enqueued_playtime > cfg.backend_buffer_duration + cfg.audio_block_period &&
-					time_since_last_period < cfg.desired_buffer_duration;
+				// Half the desired buffer stays queued (Bluetooth outputs pull in large bursts, see the silence path below)
+				const bool queue_covers_wait = enqueued_playtime > std::max<u64>(cfg.backend_buffer_duration + 2 * cfg.audio_block_period, cfg.desired_buffer_duration / 2) &&
+					time_since_last_period < cfg.desired_buffer_duration / 2;
 
 				if ((timed_out && !queue_covers_wait) || g_cfg.audio.disable_sampling_skip)
 				{
@@ -1461,6 +1462,28 @@ void cell_audio_thread::operator()()
 			// Fast-path for when there is no audio in the buffers
 			if (untouched == active_ports)
 			{
+				// RPCS3 Metal fork: after one skipped period every port is "expected" untouched, so each later period the
+				// game has not written yet came straight here and became silence, although the queue held tens of ms of
+				// audio and the game was only a few ms late (GTA IV: 47 skips -> ~680 silent periods per 30 s, heard as
+				// heavy audio stutter). Same rule as the skip above: wait for the game while the queue covers the wait,
+				// for at most the desired buffer duration. A game that really stopped feeding its ports drains the
+				// queue first and then gets silence at the normal rate.
+				// Keep at least half of the desired buffer queued while waiting: Bluetooth outputs (AirPods) pull audio
+				// in bursts much larger than their nominal buffer, so waiting down to one device buffer plus a period
+				// (the rule above) ran the output dry: 132 underruns, 4 s of silence in 30 s.
+				const u64 wait_floor = std::max<u64>(cfg.backend_buffer_duration + 2 * cfg.audio_block_period, cfg.desired_buffer_duration / 2);
+				const bool queue_covers_wait = cfg.buffering_enabled &&
+					enqueued_playtime > wait_floor &&
+					time_since_last_period < cfg.desired_buffer_duration / 2;
+
+				if (queue_covers_wait && !g_cfg.audio.disable_sampling_skip)
+				{
+					// Counted as a late period (covered by the queue) once upstream would have given it up
+					m_period_late |= time_since_last_period > cfg.fully_untouched_timeout;
+					thread_ctrl::wait_for(1000);
+					continue;
+				}
+
 				// There's no audio in the buffers, simply advance time
 				cellAudio.trace("enqueuing silence: untouched=%u/%u (expected=%u), enqueued_buffers=%llu", untouched, active_ports, untouched_expected, enqueued_buffers);
 				const period_work work(scheduling);

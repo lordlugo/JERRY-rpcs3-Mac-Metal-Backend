@@ -20,12 +20,14 @@ struct iso_metadata_cache_entry
 	std::vector<std::string> subdirs{};
 };
 
+// The entries of an ISO are validated with the file it is read from: the ISO file itself or, for a mounted disc image, its
+// image file (see fs::get_optical_disc_source()). Nothing is cached for a disc read through a raw device.
 namespace iso_cache
 {
 	// Returns false if no valid cache entry exists or mtime has changed.
 	bool load(const std::string& iso_path, std::string_view cache_key, iso_metadata_cache_entry& out_entry);
 
-	// Persists a populated cache entry to disk.
+	// Persists a populated cache entry to disk (with the current mtime of the source, "entry.mtime" is not used).
 	void save(std::string_view iso_path, std::string_view cache_key, const iso_metadata_cache_entry& entry);
 
 	bool load_index(const std::string& iso_path, std::vector<std::string>& out_subdirs);

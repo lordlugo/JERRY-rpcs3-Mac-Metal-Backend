@@ -5,7 +5,8 @@
 // Two block types, selected per block by create_dma_block():
 //  - dma_block_EXT (passthrough): a zero-copy MTL::Buffer wrapping the guest "super pointer" range
 //    (newBufferWithBytesNoCopy). GPU writes land directly in guest memory; load/flush are no-ops.
-//    Requires backend_config.supports_passthrough_dma (R sets it from mtl::is_passthrough_dma_supported()).
+//    Requires backend_config.supports_passthrough_dma, which the renderer only keeps when host GPU labels or async
+//    compute need it (VK rule; only host GPU labels exist on Metal so far, see MTLGSRender constructor).
 //  - dma_block: host_visible (shared) copy of the range; load()/flush() memcpy between guest memory and the copy.
 
 #include "mtlutils/buffer_object.h"

@@ -133,12 +133,16 @@ vec4 fetch_attribute(const in attribute_desc desc, const in int vertex_id, usamp
 		ret = sext(ivec4(result) << ivec4(5, 5, 6, 0));
 	}
 
+	ret /= scale;
+
 	if (desc.attribute_size < 4)
 	{
-		ret.w = scale.x;
+		// Exactly 1 like the RSX (a relaxed-math division may return scale / scale != 1). Programs rely on it: DP4 of the
+		// fetched position must give the bits DPH gives (e.g. a depth pre-pass tested for equality by the colour passes)
+		ret.w = 1.;
 	}
 
-	return ret / scale; 
+	return ret;
 }
 
 attribute_desc fetch_desc(const in int location)

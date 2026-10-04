@@ -144,13 +144,13 @@ namespace mtl
 		explicit operator bool() const { return m_ptr != nullptr; }
 	};
 
-	// Stage masks used by the conservative barrier model.
+	// Stage masks of the hazard tracker (see mtl::command_list)
 	constexpr MTL::Stages stages_render = MTL::StageVertex | MTL::StageFragment | MTL::StageTile;
 	constexpr MTL::Stages stages_compute = MTL::StageDispatch | MTL::StageBlit;
-	constexpr MTL::Stages stages_all_work = stages_render | stages_compute;
-	// "After" scope for queue barriers: everything that may have been encoded before, including work encoded by
-	// frameworks (MetalFX may use machine-learning / resource-state stages).
-	constexpr MTL::Stages stages_all_producers = stages_all_work | MTL::StageMachineLearning | MTL::StageResourceState;
-	// Fragment shading and attachment load/store of render passes
-	constexpr MTL::Stages stages_fragment_work = MTL::StageFragment | MTL::StageTile;
+	// Fragment shading and attachment load/store of render passes: what waits for earlier accesses to an attachment
+	constexpr MTL::Stages stages_attachment = MTL::StageFragment | MTL::StageTile;
+	// Every stage of every encoder type, including work encoded by frameworks into our command buffers (MetalFX may use
+	// machine-learning / resource-state stages): the stages of work whose stages are unknown
+	constexpr MTL::Stages stages_all = stages_render | stages_compute | MTL::StageObject | MTL::StageMesh |
+		MTL::StageResourceState | MTL::StageAccelerationStructure | MTL::StageMachineLearning;
 }

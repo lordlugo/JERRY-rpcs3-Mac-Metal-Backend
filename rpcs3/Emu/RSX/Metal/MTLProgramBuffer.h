@@ -5,10 +5,14 @@
 #include "../Program/ProgramStateCache.h"
 
 #include "Emu/system_config.h"
+#include "Emu/Cell/timers.hpp"
 #include "Utilities/mutex.h"
 #include "util/fnv_hash.hpp"
 
+#include <chrono>
+#include <mutex>
 #include <unordered_set>
+#include <vector>
 
 namespace mtl
 {
@@ -69,6 +73,23 @@ namespace mtl
 
 		mutable shared_mutex m_mutex;
 		std::unordered_set<key_type, key_hash> m_keys;
+	};
+
+	// Shader cache preload in the background (DESIGN.md §6): progress of the pipelines queued by
+	// program_cache::queue_preloaded_pipelines(), shared by their tasks
+	struct shader_preload_state
+	{
+		u64 queue_time = 0;              // get_system_time() when the tasks were queued
+		u32 total = 0;
+		atomic_t<u32> remaining = 0;
+		atomic_t<u32> built = 0;         // Built by their preload task
+		atomic_t<u32> present = 0;       // Already built, or being built, for a draw when their task ran
+		atomic_t<u32> failed = 0;
+		atomic_t<bool> finished = false; // The outcome was reported (the last task ran, or the renderer stopped first)
+
+		std::mutex timings_lock;
+		compile_timings timings;         // Where the tasks' time went
+		u64 task_us = 0;                 // Their time on the workers
 	};
 
 	struct MTLTraits
@@ -153,12 +174,13 @@ namespace mtl
 				vertexProgramData.uniforms,
 				fragmentProgramData.uniforms);
 
-			if (compile_async)
+			if (compile_async && !result)
 			{
 				// Queued: a worker hands the result to on_built (the null result here is not a failure)
 				return nullptr;
 			}
 
+			// Built on this thread: synchronous, or a deferred request that was a specialization (MTLPipelineCompiler.h)
 			return on_built(result);
 		}
 	};
@@ -224,19 +246,38 @@ namespace mtl
 			return program_hash_util::fragment_program_utils::get_fragment_program_ucode_hash(prog);
 		}
 
-		template <typename... Args>
-		void add_pipeline_entry(RSXVertexProgram& vp, RSXFragmentProgram& fp, mtl::pipeline_props& props, Args&& ...args)
+		// ---- Shader cache preload (DESIGN.md §6) ------------------------------------------------------------------
+		// rsx::shaders_cache::load() reads the cached pipelines on its worker threads while the RSX thread waits: first
+		// preload_programs() for each (decompiles its programs: CPU work only), then add_pipeline_entry() for each, which
+		// only records the pipeline. queue_preloaded_pipelines() (RSX thread, after load() has returned, so every program
+		// is complete before anything else can see it) queues one pipe compiler task per pipeline and returns: the
+		// pipelines are translated, compiled and looked up in the pipeline archive in the background, behind every
+		// pipeline a draw asks for (pipe_compiler::queue_preload_tasks).
+
+		void add_pipeline_entry(RSXVertexProgram& vp, RSXFragmentProgram& fp, mtl::pipeline_props& props)
 		{
 			normalize_cached_programs(vp, fp);
 			normalize_cached_pipeline(fp, props);
-			get_graphics_pipeline(nullptr, vp, fp, props, false, false, std::forward<Args>(args)...);
+
+			// The programs preload_programs() decompiled (the A2C flag set by normalize_cached_pipeline may make a new
+			// fragment program: decompiled here, before load() returns)
+			const auto vp_search = search_vertex_program(nullptr, vp);
+			const auto fp_search = search_fragment_program(nullptr, fp);
+
+			preload_entry entry{ &std::get<0>(vp_search), &std::get<0>(fp_search), props };
+			entry.props.state.depth_stencil_format = 0; // Not part of the key (get_graphics_pipeline)
+
+			std::lock_guard lock(m_preload_lock);
+			m_preload_entries.push_back(entry);
 		}
 
 		void preload_programs(rsx::program_cache_hint_t* cache_hint, const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
 		{
+			const auto start = std::chrono::steady_clock::now();
+
 			// Same programs as add_pipeline_entry() will look up, except for the A2C flag (it depends on the pipeline
 			// state, which is not passed here)
-			if (needs_msaa_normalization(vp, fp))
+			if (needs_program_normalization(vp, fp))
 			{
 				RSXVertexProgram vp_ = vp;
 				RSXFragmentProgram fp_ = fp;
@@ -244,11 +285,77 @@ namespace mtl
 
 				search_vertex_program(cache_hint, vp_);
 				search_fragment_program(cache_hint, fp_);
-				return;
+			}
+			else
+			{
+				search_vertex_program(cache_hint, vp);
+				search_fragment_program(cache_hint, fp);
 			}
 
-			search_vertex_program(cache_hint, vp);
-			search_fragment_program(cache_hint, fp);
+			m_preload_decompile_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+		}
+
+		// Decompiler time of preload_programs() so far (all its threads)
+		u64 get_preload_decompile_us() const
+		{
+			return m_preload_decompile_us;
+		}
+
+		// Queues the pipelines recorded by add_pipeline_entry() for the pipe compiler workers. RSX thread, after
+		// rsx::shaders_cache::load() returned. Returns how many were queued; when the last one has run, the outcome is
+		// logged and the pipeline archive is told (on_pipeline_cache_preloaded).
+		u32 queue_preloaded_pipelines()
+		{
+			std::vector<preload_entry> entries;
+			{
+				std::lock_guard lock(m_preload_lock);
+				entries.swap(m_preload_entries);
+			}
+
+			if (entries.empty())
+			{
+				return 0;
+			}
+
+			auto state = std::make_shared<shader_preload_state>();
+			state->queue_time = get_system_time();
+			state->total = ::size32(entries);
+			state->remaining = state->total;
+			m_preload = state;
+
+			std::vector<std::function<void()>> tasks;
+			tasks.reserve(entries.size());
+
+			for (const preload_entry& entry : entries)
+			{
+				// The program cache outlives the pipe compiler (destroy_pipe_compiler drops the tasks that did not run)
+				tasks.emplace_back([this, state, entry]()
+				{
+					run_preload_task(*state, entry);
+				});
+			}
+
+			pipe_compiler::queue_preload_tasks(std::move(tasks));
+			return state->total;
+		}
+
+		// The renderer stops: if the preload did not finish, logs how far it got and tells the pipeline archive that it
+		// is incomplete. Call after destroy_pipe_compiler() (no task runs any more).
+		void on_preload_interrupted()
+		{
+			if (const auto state = m_preload; state && !state->finished.exchange(true))
+			{
+				rsx_log.notice("Metal: the shader cache preload was interrupted: %u of %u pipeline(s) built, %u already built for draws, %u failed",
+					state->built.load(), state->total, state->present.load(), state->failed.load());
+				mtl::on_pipeline_cache_preloaded(false);
+			}
+		}
+
+		// Some cached pipelines have not been through their preload task yet
+		bool is_preload_running() const
+		{
+			const auto state = m_preload;
+			return state && state->remaining;
 		}
 
 		bool check_cache_missed() const
@@ -302,6 +409,120 @@ namespace mtl
 		pipeline_failure_registry m_failed_pipelines;
 		bool m_last_pipeline_failed = false; // Like m_cache_miss_flag: describes the last lookup
 
+		// A cached pipeline (add_pipeline_entry): programs of this cache, normalized properties as a draw looks them up
+		struct preload_entry
+		{
+			const MTLVertexProgram* vp = nullptr;
+			const MTLFragmentProgram* fp = nullptr;
+			mtl::pipeline_props props{};
+		};
+
+		std::mutex m_preload_lock;
+		std::vector<preload_entry> m_preload_entries;  // Recorded during rsx::shaders_cache::load()
+		atomic_t<u64> m_preload_decompile_us = 0;
+		std::shared_ptr<shader_preload_state> m_preload;
+
+		enum class preload_result
+		{
+			built,
+			present,
+			failed,
+		};
+
+		// Builds the pipeline of a cache entry on this (worker) thread, unless it exists or is being built for a draw.
+		// Same key and stored result as a draw's get_graphics_pipeline() of the same programs and state, without touching
+		// what describes the RSX thread's last lookup (m_cache_miss_flag, m_last_pipeline_failed).
+		preload_result build_preloaded_pipeline(const preload_entry& entry)
+		{
+			// The key a draw looks up (the properties before validation, see program_state_cache::get_graphics_pipeline)
+			mtl::pipeline_props props = entry.props;
+			const typename decltype(m_storage)::key_type key{ entry.vp->id, entry.fp->id, props };
+
+			{
+				std::lock_guard lock(m_pipeline_mutex);
+				if (m_storage.find(key) != m_storage.end())
+				{
+					return preload_result::present;
+				}
+
+				// Placeholder: a draw that needs this pipeline now finds it pending (skipped, interpreted, or waited for)
+				m_storage[key] = std::move(__null_pipeline_handle);
+			}
+
+			// Built with validated properties, as get_graphics_pipeline does for programs that exist
+			MTLTraits::validate_pipeline_properties(*entry.vp, *entry.fp, props);
+
+			auto store = [this, key](std::unique_ptr<mtl::glsl::program>& pipeline) -> mtl::glsl::program*
+			{
+				if (!pipeline)
+				{
+					// The placeholder stays; the failure is registered (MTLTraits::build_pipeline)
+					return nullptr;
+				}
+
+				std::lock_guard lock(m_pipeline_mutex);
+				auto& result = m_storage[key];
+				result = std::move(pipeline);
+				return result.get();
+			};
+
+			return MTLTraits::build_pipeline(*entry.vp, *entry.fp, props, false, store, m_failed_pipelines)
+				? preload_result::built
+				: preload_result::failed;
+		}
+
+		void run_preload_task(shader_preload_state& state, const preload_entry& entry)
+		{
+			const auto start = std::chrono::steady_clock::now();
+
+			switch (build_preloaded_pipeline(entry))
+			{
+			case preload_result::built: state.built++; break;
+			case preload_result::present: state.present++; break;
+			case preload_result::failed: state.failed++; break;
+			}
+
+			{
+				// The worker reset this thread's timings when the task started
+				std::lock_guard lock(state.timings_lock);
+				state.timings.add(this_thread_compile_timings());
+				state.task_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+			}
+
+			if (--state.remaining == 0 && !state.finished.exchange(true))
+			{
+				report_preload_finished(state);
+			}
+		}
+
+		static void report_preload_finished(shader_preload_state& state)
+		{
+			compile_timings t;
+			u64 task_us;
+			{
+				std::lock_guard lock(state.timings_lock);
+				t = state.timings;
+				task_us = state.task_us;
+			}
+
+			const auto ms = [](u64 us) { return us / 1000.; };
+			const auto avg_ms = [](u64 us, u32 count) { return count ? us / 1000. / count : 0.; };
+
+			rsx_log.notice("Metal: shader cache preload finished in the background %.0f ms after it was queued: %u pipeline(s) built, %u already "
+				"built for draws, %u failed; %.0f ms of worker time: GLSL->MSL %u shader(s) %.0f ms (%.1f ms each), MTLLibrary %u in %.0f ms "
+				"(%.1f ms each), pipelines with archive lookups %u in %.0f ms (%.1f ms each), compiled without %u in %.0f ms (%.1f ms each), "
+				"specialized %u in %.0f ms",
+				ms(get_system_time() - state.queue_time), state.built.load(), state.present.load(), state.failed.load(), ms(task_us),
+				t.translated, ms(t.translate_us), avg_ms(t.translate_us, t.translated),
+				t.libraries, ms(t.library_us), avg_ms(t.library_us, t.libraries),
+				t.archive_pipelines, ms(t.archive_pipeline_us), avg_ms(t.archive_pipeline_us, t.archive_pipelines),
+				t.compiled_pipelines, ms(t.compiled_pipeline_us), avg_ms(t.compiled_pipeline_us, t.compiled_pipelines),
+				t.specialized, ms(t.specialization_us));
+
+			// Every cached pipeline has been built (or found built): the archive's first serializer holds them all
+			mtl::on_pipeline_cache_preloaded(true);
+		}
+
 		// ---- Shader cache entries --------------------------------------------------------------------------------
 		// Entries keep the state they were recorded with. The parts that depend on renderer settings instead of the
 		// guest are brought to what this session produces for the same draw; otherwise the preload builds programs
@@ -314,14 +535,34 @@ namespace mtl
 			return g_cfg.video.antialiasing_level == msaa_level::none;
 		}
 
-		static bool needs_msaa_normalization(const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
+		static bool hardware_depth_bounds()
 		{
-			return msaa_disabled() &&
-				(vp.texture_state.multisampled_textures || fp.texture_state.multisampled_textures || (fp.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED));
+			// Same condition as MTLGSRender::get_backend_fragment_program_export_config (the renderer exists during the
+			// preload)
+			return g_render_device && g_render_device->caps().depth_bounds;
+		}
+
+		static bool needs_program_normalization(const RSXVertexProgram& vp, const RSXFragmentProgram& fp)
+		{
+			return (msaa_disabled() &&
+				(vp.texture_state.multisampled_textures || fp.texture_state.multisampled_textures || (fp.ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED))) ||
+				(hardware_depth_bounds() && (fp.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST));
 		}
 
 		static void normalize_cached_programs(RSXVertexProgram& vp, RSXFragmentProgram& fp)
 		{
+			if ((fp.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST) && hardware_depth_bounds())
+			{
+				// Recorded on a GPU without a hardware depth bounds test: this one tests in hardware and never flags programs
+				// for it. The multisampled flag only came with the test unless programmable blending or depth compare
+				// emulation asked for it too (get_fragment_program_export_config).
+				fp.ctrl &= ~static_cast<u32>(RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST);
+				if (!(fp.ctrl & (RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING | RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)))
+				{
+					fp.ctrl &= ~static_cast<u32>(RSX_SHADER_CONTROL_ROP_MULTISAMPLED);
+				}
+			}
+
 			if (!msaa_disabled())
 			{
 				return;

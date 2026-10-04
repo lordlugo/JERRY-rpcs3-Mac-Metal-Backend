@@ -188,7 +188,8 @@ error_code _sys_lwmutex_lock(ppu_thread& ppu, u32 lwmutex_id, u64 timeout)
 			return { CELL_ESRCH, lwmutex_id };
 		}
 
-		return { CELL_ESRCH, "Invalid ID" };
+		// Not an lwmutex ID at all: 0 means the control block's sleep_queue was never set (an lwmutex that was never created)
+		return { CELL_ESRCH, "CELL_ESRCH, invalid lwmutex ID 0x%x", lwmutex_id };
 	}
 
 	if (mutex.ret)
@@ -323,7 +324,7 @@ error_code _sys_lwmutex_trylock(ppu_thread& ppu, u32 lwmutex_id)
 			return { CELL_ESRCH, lwmutex_id };
 		}
 
-		return { CELL_ESRCH, "Invalid ID" };
+		return { CELL_ESRCH, "CELL_ESRCH, invalid lwmutex ID 0x%x", lwmutex_id };
 	}
 
 	if (!mutex.ret)

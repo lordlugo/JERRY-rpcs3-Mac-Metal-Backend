@@ -798,10 +798,17 @@ VKGSRender::~VKGSRender()
 		return;
 	}
 
-	// Flush DMA queue
+	// Flush DMA queue (bounded: a wedged offloader must not hang shutdown)
+	const u64 dma_drain_start = get_system_time();
 	while (!g_fxo->get<rsx::dma_manager>().sync())
 	{
 		do_local_task(rsx::FIFO::state::lock_wait);
+
+		if (get_system_time() - dma_drain_start > 5'000'000)
+		{
+			rsx_log.error("Vulkan: the RSX offloader did not drain during shutdown; continuing anyway");
+			break;
+		}
 	}
 
 	//Wait for device to finish up with resources

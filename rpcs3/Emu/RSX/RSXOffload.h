@@ -53,6 +53,11 @@ namespace rsx
 
 		atomic_t<bool> m_mem_fault_flag = false;
 
+	// High-water mark of queued jobs observed when sync() last timed out (0 = no wedge observed). While the
+	// offloader has not processed past this mark, sync() reports failure immediately instead of hitching the
+	// caller again; callers fall back (e.g. inline submit) until the offloader moves.
+	mutable atomic_t<u64> m_sync_wedge_target = 0;
+
 		struct offload_thread;
 		std::shared_ptr<named_thread<offload_thread>> m_thread;
 
@@ -90,6 +95,29 @@ namespace rsx
 		// Synchronization
 		bool is_current_thread() const;
 		bool sync() const;
+
+		// Outcome of one offloader-drain poll step (pure decision logic behind sync(), unit-tested).
+		enum class offload_drain_poll
+		{
+			drained,
+			keep_waiting,
+			timed_out
+		};
+
+		static offload_drain_poll poll_offload_drain(u64 enqueued, u64 processed, u64 start_us, u64 now_us, u64 timeout_us)
+		{
+			if (enqueued <= processed)
+			{
+				return offload_drain_poll::drained;
+			}
+
+			if (now_us - start_us > timeout_us)
+			{
+				return offload_drain_poll::timed_out;
+			}
+
+			return offload_drain_poll::keep_waiting;
+		}
 		void join();
 		void set_mem_fault_flag();
 		void clear_mem_fault_flag();

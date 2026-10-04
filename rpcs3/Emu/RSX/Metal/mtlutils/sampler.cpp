@@ -1,6 +1,10 @@
 #include "stdafx.h"
 #include "sampler.h"
+#include "sampler_liveness.h"
 #include "Emu/RSX/Utils/color_utils.hpp"
+#include "util/logs.hpp"
+
+#include <atomic>
 
 namespace mtl
 {
@@ -135,10 +139,45 @@ namespace mtl
 		value = dev.handle()->newSamplerState(desc.get());
 		ensure(value, "Metal: failed to create sampler state");
 		m_resource_id = value->gpuResourceID();
+		// Argument tables bind samplers by ID and the driver faults natively on an invalid one. A sampler without
+		// an ID must never reach program::bind(): fail here, naming the creation site, instead of segfaulting in
+		// setSamplerState with no context.
+		ensure(m_resource_id._impl, "Metal: sampler state has no GPU resource ID");
+
+		// program::bind() resolves every sampler slot through this registry, so a destroyed
+		// sampler's ID can never reach the driver (only the numeric ID outlives the object).
+		sampler_liveness::add(m_resource_id._impl);
+
+		// Creation lines are always on (bounded by the call below): creation is
+		// infrequent but the ID->config map is the only way to identify a faulting
+		// sampler after the fact, so it must not need a foresight-enabled env var.
+		// Verbose mode keeps its own (larger) cap.
+		static std::atomic<unsigned> s_traced_verbose = 0;
+		const bool log_creation = sampler_trace_enabled()
+			? s_traced_verbose.fetch_add(1, std::memory_order_relaxed) < 16384
+			: sampler_liveness::sampler_creation_trace_budget();
+
+		if (log_creation)
+		{
+			rsx_log.notice("Metal sampler trace: created id=0x%llx obj=%p u=%d v=%d w=%d unnorm=%d bias=%f aniso=%f lod=[%f,%f] min=%d mag=%d mip=%d border=%d depthcmp=%d cmpfn=%d",
+				static_cast<unsigned long long>(m_resource_id._impl),
+				static_cast<const void*>(this),
+				static_cast<int>(info.clamp_u), static_cast<int>(info.clamp_v), static_cast<int>(info.clamp_w),
+				info.unnormalized_coordinates ? 1 : 0,
+				static_cast<double>(info.mip_lod_bias), static_cast<double>(info.max_anisotropy),
+				static_cast<double>(info.min_lod), static_cast<double>(info.max_lod),
+				static_cast<int>(info.min_filter), static_cast<int>(info.mag_filter), static_cast<int>(info.mip_filter),
+				static_cast<int>(info.border_color.value),
+				info.depth_compare ? 1 : 0, static_cast<int>(info.compare_function));
+		}
 	}
 
 	sampler::~sampler()
 	{
+		// Withdraw the ID first: from here on no bind may resolve it (see sampler_liveness).
+		sampler_liveness::remove(m_resource_id._impl);
+		m_resource_id = {};
+
 		if (value)
 		{
 			value->release();

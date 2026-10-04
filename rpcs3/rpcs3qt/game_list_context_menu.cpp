@@ -625,8 +625,10 @@ void game_list_context_menu::show_single_selection_context_menu(const game_info&
 	// Check disc game integrity
 	if (QString::fromStdString(current_game.category) == cat::cat_disc_game)
 	{
-		const bool raw_archive = current_game.is_iso_file && is_iso_file(current_game.path);
-		const iso_type_status iso_type = iso_file_decryption::check_type(current_game.path);
+		// Both were determined by the game enumeration on its worker threads: checking them here would read the disc
+		// (through its raw device for a disc volume) on the UI thread
+		const bool raw_archive = current_game.is_iso_file;
+		const iso_type_status iso_type = current_game.iso_type;
 
 		// If it's an ISO file (e.g. even a decrypted ISO), always provide the entry on the context menu but disable
 		// it if the ISO does not support integrity check (e.g. non Redump ISO) or no integrity DB is found.

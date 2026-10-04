@@ -4,7 +4,22 @@ R"(
 #define _get_bits(x, off, count) bitfieldExtract(x, off, count)
 #define _set_bits(x, y, off, count) bitfieldInsert(x, y, off, count)
 #define _test_bit(x, y) (_get_bits(x, y, 1) != 0)
-#define _rand(seed) fract(sin(dot(seed.xy, vec2(12.9898f, 78.233f))) * 43758.5453f)
+#define _rand(seed) _hash_noise(seed.xy)
+
+// Per-pixel noise in [0, 1). Integer hash: exact on every backend. The classic fract(sin(dot(p, k)) * 43758.5)
+// needs sin() of arguments in the tens of thousands, which fast-math sin() (Metal) evaluates so coarsely that the
+// "noise" comes out in clumps and blocks (visible as blotchy alpha-to-coverage edges and particles).
+float _hash_noise(const in vec2 p)
+{
+	uvec2 q = uvec2(ivec2(floor(p)));
+	uint h = (q.x * 0x8da6b343u) ^ (q.y * 0xd8163841u);
+	h ^= h >> 16;
+	h *= 0x7feb352du;
+	h ^= h >> 15;
+	h *= 0x846ca68bu;
+	h ^= h >> 16;
+	return float(h >> 8) * (1.0 / 16777216.0);
+}
 
 #ifdef _GPU_LOW_PRECISION_COMPARE
 #define CMP_FIXUP(a) (sign(a) * 16. + a)

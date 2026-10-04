@@ -4,6 +4,7 @@
 #include "../rsx_methods.h"
 
 #include "MTLFormats.h"
+#include "MTLGraphicsLog.h"
 #include "MTLGSRender.h"
 #include "MTLRenderPass.h"
 #include "mtlutils/buffer_object.h"
@@ -402,18 +403,17 @@ void MTLGSRender::update_render_pass_descriptor()
 	m_draw_pass_desc = mtl::ref<MTL4::RenderPassDescriptor>(mtl::create_render_pass_descriptor(m_draw_fbo, m_draw_pass_visibility_buffer));
 }
 
-void MTLGSRender::begin_render_pass(const mtl::attachment_clear_info* clear)
+void MTLGSRender::begin_render_pass()
 {
-	const bool has_clear = clear && !clear->empty();
-	if (!has_clear && is_render_pass_open())
+	if (is_render_pass_open())
 	{
 		return;
 	}
 
 	ensure(m_draw_pass_desc, "Render pass requested without a valid surface configuration");
 
-	// End the current pass (ours or another component's) before starting a new one
-	close_render_pass();
+	// Another component's pass may still be open (cmd.begin_render_pass() would end it too)
+	close_render_pass(mtl::pass_end_reason::other_pass);
 
 	if (m_draw_fbo.get_textures() != m_draw_fbo_textures)
 	{
@@ -429,17 +429,35 @@ void MTLGSRender::begin_render_pass(const mtl::attachment_clear_info* clear)
 		m_draw_pass_visibility_buffer = visibility_buffer;
 	}
 
-	if (has_clear)
-	{
-		mtl::apply_clear_load_ops(m_draw_pass_desc.get(), m_draw_fbo, *clear);
-	}
-
+	// Deferred clears of the attachments (RSX clears, surface initialization) become their load actions
 	auto encoder = m_render_pass.begin(*m_current_command_buffer, m_draw_pass_desc.get());
-	mtl::count_draw_render_pass();
 
-	if (has_clear)
+	if (const u32 folded = m_current_command_buffer->folded_clears())
 	{
-		mtl::restore_load_ops(m_draw_pass_desc.get(), m_draw_fbo);
+		// The pass writes those attachments before any draw: a feedback read of one needs the pass split, like after
+		// a clear drawn in the pass (see mark_attachment_writes)
+		const u64 pass = m_current_command_buffer->open_pass_serial();
+		auto mark = [pass](mtl::image* image)
+		{
+			if (auto surface = mtl::try_as_rtt(image))
+			{
+				surface->written_in_pass = pass;
+				surface->feedback_streak_pass = 0;
+			}
+		};
+
+		for (u32 index = 0; index < m_draw_fbo.color_count; ++index)
+		{
+			if (folded & (1u << index))
+			{
+				mark(m_draw_fbo.color[index]);
+			}
+		}
+
+		if (folded & (3u << 8))
+		{
+			mark(m_draw_fbo.depth_stencil);
+		}
 	}
 
 	on_render_pass_begin(encoder);
@@ -455,16 +473,16 @@ void MTLGSRender::on_render_pass_begin(MTL4::RenderCommandEncoder* encoder)
 	if ((m_current_command_buffer->flags & mtl::command_list::cb_has_open_query) && m_active_query_info)
 	{
 		const auto open_query = m_occlusion_map[m_active_query_info->driver_handle].indices.back();
-		m_occlusion_query_manager->resume_query(encoder, open_query);
+		m_occlusion_query_manager->resume_query(*m_current_command_buffer, encoder, open_query);
 	}
 }
 
-void MTLGSRender::close_render_pass()
+void MTLGSRender::close_render_pass(mtl::pass_end_reason reason)
 {
 	// Ends the active render encoder whether it is our main pass or a pass opened by another component
 	if (m_current_command_buffer->is_render_pass_open())
 	{
-		m_current_command_buffer->end_render_pass();
+		m_current_command_buffer->end_render_pass(reason);
 	}
 
 	m_render_pass.reset();
@@ -473,7 +491,8 @@ void MTLGSRender::close_render_pass()
 void MTLGSRender::invalidate_render_pass()
 {
 	// Vulkan regenerates the render pass here (feedback loop layouts). Metal cannot make attachment writes visible to
-	// texture reads inside a pass, so the pass is ended; the next draw reopens it behind a queue barrier.
+	// texture reads inside a pass, so the pass is ended; the next draw reopens it, and the barriers the new pass begins
+	// with order its reads after the ended pass's writes (mtl::command_list).
 	split_render_pass(mtl::pass_split_reason::read_after_write);
 }
 
@@ -481,10 +500,154 @@ void MTLGSRender::split_render_pass(mtl::pass_split_reason reason)
 {
 	if (is_render_pass_open())
 	{
-		close_render_pass();
+		close_render_pass(mtl::pass_end_reason::feedback);
 		mtl::g_feedback_loop_pass_splits++;
 		mtl::count_feedback_split(reason);
 	}
+}
+
+std::pair<f32, f32> MTLGSRender::get_clamped_depth_bounds() const
+{
+	// As the hardware test takes them: no unrestricted depth range on Metal
+	const auto& regs = rsx::method_registers;
+	return { std::clamp(regs.depth_bounds_min(), 0.f, 1.f), std::clamp(regs.depth_bounds_max(), 0.f, 1.f) };
+}
+
+rsx::flags32_t MTLGSRender::get_backend_fragment_program_export_config() const
+{
+	// Called for every draw by analyse_current_rsx_pipeline() (the surfaces of the draw are bound): a change of the
+	// result invalidates the fragment program, so the program key always matches the draw's state. Apple10 GPUs test
+	// the bounds in hardware (update_draw_state) and never get the flag.
+	if (m_device->caps().depth_bounds || !rsx::method_registers.depth_bounds_test_enabled())
+	{
+		return 0;
+	}
+
+	// Without a depth buffer there is no sample count to key the multisampled variant on: the test does nothing
+	const auto ds = m_rtts.m_bound_depth_stencil.second;
+	if (!ds || !(ds->aspect() & mtl::aspect_depth))
+	{
+		return 0;
+	}
+
+	// Stored depth is always in [0, 1]: bounds covering it discard nothing
+	if (const auto [bounds_min, bounds_max] = get_clamped_depth_bounds(); bounds_min <= 0.f && bounds_max >= 1.f)
+	{
+		return 0;
+	}
+
+	// The test reads the depth buffer's copy: a multisample texture when the depth buffer is multisampled (the flag
+	// also marks multisampled ROP output, and the multisample depth-compare input type when that is emulated too).
+	return RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST | (ds->samples() > 1 ? RSX_SHADER_CONTROL_ROP_MULTISAMPLED : 0u);
+}
+
+bool MTLGSRender::draw_reads_depth_bounds() const
+{
+	// Decided by the program bound for the draw (recompiled programs only; the interpreter never runs these)
+	return m_fs_binding_table && m_fs_binding_table->depth_bounds_location != umax;
+}
+
+mtl::viewable_image* MTLGSRender::update_depth_copy(mtl::render_target* ds, bool stencil, bool exact)
+{
+	// What a shader read of the draw's depth buffer must see is its contents before the draw. Reading the buffer itself
+	// while it is the pass's depth attachment is undefined on Metal (Apple GPUs return wrong values for some pixels of
+	// every tile: lights drawn through the depth bounds test showed up as grids of squares), so the reads go to a copy
+	// made outside the pass. It stays in use until the depth plane changes (see depth_copy_t).
+	auto& copy = m_depth_copy;
+	const u64 tag = ds->content_tag;
+	const bool depth_current = copy.depth_tag == tag || (!exact && copy.streak_key && copy.streak_key == m_feedback_draw_key &&
+		copy.streak_tag == tag && !g_cfg.video.strict_rendering_mode);
+	const bool current = copy.image && copy.source == ds && depth_current && (!stencil || copy.stencil_tag == tag);
+
+	if (!current)
+	{
+		if (!copy.image || copy.image->format() != ds->format() || copy.image->type() != ds->type() ||
+			copy.image->width() != ds->width() || copy.image->height() != ds->height() ||
+			copy.image->samples() != ds->samples() || copy.image->info.usage != ds->info.usage)
+		{
+			// Same format, type, size, sample count and usage as the depth buffer: one whole-texture blit copies it, and
+			// every view a texture unit takes of the buffer (stencil and format views included) can be taken of the copy
+			mtl::image_create_info info{};
+			info.type = ds->type();
+			info.format = ds->format();
+			info.width = ds->width();
+			info.height = ds->height();
+			info.samples = ds->samples();
+			info.usage = ds->info.usage;
+			info.format_class = ds->format_class();
+
+			// Draws recorded earlier may still read the previous copy
+			for (auto& view : copy.views)
+			{
+				mtl::get_resource_manager()->dispose(view);
+			}
+			copy.views.clear();
+			mtl::get_resource_manager()->dispose(copy.image);
+
+			copy.image = std::make_unique<mtl::viewable_image>(*m_device, info);
+			copy.image->set_debug_name("copy of the depth buffer for shader reads");
+		}
+
+		// Views taken of the copy by remap (the stencil mirror) swizzle like the same views of the buffer (the views
+		// made from the buffer's views carry their own swizzle)
+		copy.image->set_native_component_layout(ds->native_component_map);
+
+		// The copy is recorded outside the draw pass, after everything recorded before it: the pass ends here (it
+		// resumes with the next draw and loads what it stored), pending clears are recorded first, and the blit is
+		// ordered after the writes to the depth buffer and after the draws that read the previous copy
+		split_render_pass(mtl::pass_split_reason::depth_copy);
+
+		const coord3i rect{ { 0, 0, 0 }, { static_cast<int>(ds->width()), static_cast<int>(ds->height()), 1 } };
+		mtl::copy_image(*m_current_command_buffer, ds, copy.image.get(), rect, rect);
+		mtl::note_depth_copy();
+
+		copy.source = ds;
+		copy.depth_tag = tag;
+		copy.stencil_tag = tag;
+		copy.streak_key = 0;
+		m_depth_copies++;
+	}
+
+	m_draw_reads_depth_copy = true;
+	return copy.image.get();
+}
+
+mtl::image_view* MTLGSRender::redirect_depth_attachment_read(mtl::image_view* view, bool stencil)
+{
+	// A texture unit sampling the depth buffer the draw pass attaches (a view of its texture: depth, stencil or another
+	// format) samples the same view of the copy instead
+	const auto attachment = m_draw_fbo.depth_stencil;
+	if (!view || !attachment || !attachment->value || view->parent_texture() != attachment->value)
+	{
+		return view;
+	}
+
+	const auto ds = mtl::try_as_rtt(attachment);
+	if (!ds)
+	{
+		return view;
+	}
+
+	const auto copy = update_depth_copy(ds, stencil || (view->info.aspect & mtl::aspect_stencil));
+
+	const auto same_view = [&](const mtl::image_view_info& a)
+	{
+		const auto& b = view->info;
+		return a.format == b.format && a.type == b.type && a.base_level == b.base_level && a.level_count == b.level_count &&
+			a.base_layer == b.base_layer && a.layer_count == b.layer_count && a.aspect == b.aspect &&
+			a.swizzle.red == b.swizzle.red && a.swizzle.green == b.swizzle.green && a.swizzle.blue == b.swizzle.blue &&
+			a.swizzle.alpha == b.swizzle.alpha;
+	};
+
+	for (const auto& copy_view : m_depth_copy.views)
+	{
+		if (same_view(copy_view->info))
+		{
+			return copy_view.get();
+		}
+	}
+
+	return m_depth_copy.views.emplace_back(std::make_unique<mtl::image_view>(copy, view->info)).get();
 }
 
 MTL::DepthStencilState* MTLGSRender::get_depth_stencil_state(u64 key)
@@ -699,25 +862,22 @@ void MTLGSRender::update_draw_state()
 		m_encoder_state.depth_bias_valid = true;
 	}
 
+	// Depth bounds test: in hardware on Apple10. Other GPUs run it in the fragment program of the draws that use it
+	// (RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST, see get_backend_fragment_program_export_config): no encoder state.
 	if (m_device->caps().depth_bounds)
 	{
 		f32 bounds_min, bounds_max;
 		if (regs.depth_bounds_test_enabled())
 		{
-			// Update depth bounds min/max
-			bounds_min = regs.depth_bounds_min();
-			bounds_max = regs.depth_bounds_max();
+			// Update depth bounds min/max (no unrestricted depth range on Metal)
+			std::tie(bounds_min, bounds_max) = get_clamped_depth_bounds();
 		}
 		else
 		{
 			// Avoid special case where min=max and depth bounds (incorrectly) fails
-			bounds_min = std::min(0.f, regs.clip_min());
-			bounds_max = std::max(1.f, regs.clip_max());
+			bounds_min = std::clamp(std::min(0.f, regs.clip_min()), 0.f, 1.f);
+			bounds_max = std::clamp(std::max(1.f, regs.clip_max()), 0.f, 1.f);
 		}
-
-		// No unrestricted depth range on Metal
-		bounds_min = std::clamp(bounds_min, 0.f, 1.f);
-		bounds_max = std::clamp(bounds_max, 0.f, 1.f);
 
 		if (!m_encoder_state.depth_bounds_valid || m_encoder_state.depth_bounds_min != bounds_min || m_encoder_state.depth_bounds_max != bounds_max)
 		{
@@ -725,19 +885,6 @@ void MTLGSRender::update_draw_state()
 			m_encoder_state.depth_bounds_min = bounds_min;
 			m_encoder_state.depth_bounds_max = bounds_max;
 			m_encoder_state.depth_bounds_valid = true;
-		}
-	}
-	else if (regs.depth_bounds_test_enabled())
-	{
-		// Same throttling rationale as wide lines above: one boot-time line leaves later
-		// occurrences unexplained.
-		const u64 now = get_system_time();
-		if (!m_depth_bounds_warning_logged || now - m_depth_bounds_warning_time >= 30'000'000)
-		{
-			m_depth_bounds_warning_logged = true;
-			m_depth_bounds_warning_time = now;
-			rsx_log.warning("Metal: depth bounds test requested but not supported by this GPU (Apple10+ only). Ignored (bounds %.3f-%.3f).",
-				regs.depth_bounds_min(), regs.depth_bounds_max());
 		}
 	}
 
@@ -863,7 +1010,10 @@ void MTLGSRender::load_texture_env()
 				host_flags_to_set = rsx::RSX_HOST_FORMAT_FEATURE_SRGB;
 			}
 
-			if (format_override != MTL::PixelFormatInvalid && format_override != mtl_format)
+			// An snorm view changes the component layout: images without MTLTextureUsagePixelFormatView (not a
+			// shader_read section of the texture cache, see get_texture_cache_usage) keep the shader-side conversion
+			if (format_override != MTL::PixelFormatInvalid && format_override != mtl_format &&
+				sampler_state->image_handle->image()->supports_view_format(format_override))
 			{
 				sampler_state->image_handle = sampler_state->image_handle->as(format_override);
 				sampler_state->format_ex.texel_remap_control &= (~flags_to_erase);
@@ -995,12 +1145,13 @@ void MTLGSRender::load_texture_env()
 				min_lod = std::min(min_lod, actual_mipmaps - 1.f);
 				max_lod = std::min(max_lod, actual_mipmaps - 1.f);
 
-				if (min_filter.mipmap_mode == MTL::SamplerMipFilterNearest)
-				{
-					// Round to nearest 0.5 to work around some broken games
-					// Unlike openGL, sampler parameters cannot be dynamically changed on Metal, leading to many permutations
-					lod_bias = std::floor(lod_bias * 2.f + 0.5f) * 0.5f;
-				}
+				// Snap all three LOD params to 0.5 steps on every mip path (not just bias on Nearest):
+				// unlike OpenGL, sampler parameters cannot be changed dynamically on Metal, so every
+				// distinct float mints its own sampler state — per-frame jitter grows the pool past the
+				// driver's ~1024-live-sampler table and segfaults setSamplerState (RSX 0x448/0x449).
+				min_lod = mtl::quantize_sampler_lod(min_lod);
+				max_lod = mtl::quantize_sampler_lod(max_lod);
+				lod_bias = mtl::quantize_sampler_lod(lod_bias);
 			}
 			else
 			{
@@ -1102,8 +1253,10 @@ void MTLGSRender::load_texture_env()
 		}
 
 		const bool unnormalized_coords = !!(tex.format() & CELL_GCM_TEXTURE_UN);
-		const auto min_lod = tex.min_lod();
-		const auto max_lod = tex.max_lod();
+		// Same 0.5 snap as the fragment path: raw per-frame LOD jitter would mint
+		// unbounded sampler states and cross the driver's ~1024-live-sampler table.
+		const auto min_lod = mtl::quantize_sampler_lod(tex.min_lod());
+		const auto max_lod = mtl::quantize_sampler_lod(tex.max_lod());
 		const auto wrap_s = mtl::mtl_wrap_mode(tex.wrap_s());
 		const auto wrap_t = mtl::mtl_wrap_mode(tex.wrap_t());
 
@@ -1135,46 +1288,31 @@ void MTLGSRender::load_texture_env()
 
 	m_samplers_dirty.store(false);
 
-	// Render passes let their vertex work overlap the fragment work of earlier passes (mtl::command_list). Any vertex
-	// texture (a render target, a blit or copy result, even the placeholder image, can be written by fragment work)
-	// needs the pass of this draw ordered after that work: emit_geometry() requests it right before opening the pass.
-	// Vertex texture fetch is rare on the RSX.
-	m_draw_reads_images_in_vertex_stage = current_vp_metadata.referenced_textures_mask != 0;
-
-	bool depth_feedback = false;
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
-		// No depth framebuffer fetch on Metal: the depth buffer is sampled as a texture. The pass must end if depth
-		// was written in it, so that the sampling pass is ordered after every previous depth write.
+		// No depth framebuffer fetch on Metal: the depth buffer is sampled as a texture, through its copy while the draw
+		// pass attaches it (bind_texture_env), which is made outside the pass after every earlier depth write
 		auto ds = ensure(m_rtts.m_bound_depth_stencil.second, "Invalid FS export configuration.");
 		ds->texture_barrier(*m_current_command_buffer);
-
-		depth_feedback = is_written_in_open_pass(ds);
 	}
 
 	// Feedback loop: end the render pass (counted as a pass split) only when a sampled attachment holds writes of the
 	// open pass that do not come from the feedback streak this draw belongs to. Reads of a surface that the pass does
-	// not write (soft particles, fog sampling depth) and runs of draws of one material that sample and write the same
-	// surface (water, refraction, distortion) used to split on every draw, storing and reloading every attachment.
-	if (is_render_pass_open())
+	// not write and runs of draws of one material that sample and write the same surface (water, refraction,
+	// distortion) used to split on every draw, storing and reloading every attachment. The depth attachment is read
+	// through its copy (m_depth_copy) and never needs this split.
+	if (is_render_pass_open() && check_for_cyclic_refs)
 	{
-		if (depth_feedback)
+		if (const auto reason = feedback_read_needs_split(); reason != mtl::pass_split_reason::count)
 		{
-			split_render_pass(mtl::pass_split_reason::depth_compare);
-		}
-		else if (check_for_cyclic_refs)
-		{
-			if (const auto reason = feedback_read_needs_split(); reason != mtl::pass_split_reason::count)
-			{
-				split_render_pass(reason);
-			}
+			split_render_pass(reason);
 		}
 	}
 
 	mtl::g_feedback_draw_key = 0;
 }
 
-void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, bool from_draw)
+void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, u32 ds_planes, bool from_draw)
 {
 	// Copies of the attachments (reusable mip-chain gathers) must see these writes, whether or not the pass is still
 	// open (a flush between subdraws ends it). Every bound attachment counts, whatever the write masks say: a gathered
@@ -1189,7 +1327,39 @@ void MTLGSRender::mark_attachment_writes(const std::array<bool, 4>& color, bool 
 
 	if (auto surface = m_rtts.m_bound_depth_stencil.second)
 	{
+		// The copy shader reads of the depth buffer use (m_depth_copy) stays current for each plane across the writes that
+		// leave that plane alone: depth reads across colour and stencil writes (which the lights of a frame interleave
+		// with their draws testing the depth bounds), stencil reads across colour and depth writes.
+		auto& copy = m_depth_copy;
+		const u64 old_tag = surface->content_tag;
+		const bool source = copy.source == surface;
+		const bool depth_written = !!(ds_planes & mtl::aspect_depth);
+		const bool keep_depth = !depth_written && source && copy.depth_tag == old_tag;
+		const bool keep_stencil = !(ds_planes & mtl::aspect_stencil) && source && copy.stencil_tag == old_tag;
+		const bool keep_streak = !depth_written && source && copy.streak_key && copy.streak_tag == old_tag;
+
+		// A draw of a feedback streak that read the copy and writes depth: the streak's next draws keep reading it
+		const bool start_streak = depth_written && from_draw && source && m_draw_reads_depth_copy && m_feedback_draw_key &&
+			(copy.depth_tag == old_tag || (copy.streak_key == m_feedback_draw_key && copy.streak_tag == old_tag));
+
 		surface->on_contents_changed();
+
+		copy.depth_tag = keep_depth ? surface->content_tag : copy.depth_tag;
+		copy.stencil_tag = keep_stencil ? surface->content_tag : copy.stencil_tag;
+
+		if (start_streak)
+		{
+			copy.streak_key = m_feedback_draw_key;
+			copy.streak_tag = surface->content_tag;
+		}
+		else if (keep_streak)
+		{
+			copy.streak_tag = surface->content_tag;
+		}
+		else if (source)
+		{
+			copy.streak_key = 0;
+		}
 	}
 
 	if (!is_render_pass_open())
@@ -1374,6 +1544,39 @@ bool MTLGSRender::draw_samples_attachment(const mtl::render_target* surface) con
 		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
 }
 
+bool MTLGSRender::draw_reads_deferred_clear() const
+{
+	const auto& cmd = *m_current_command_buffer;
+
+	// The depth attachment is read through its copy, made after the pending clears (update_depth_copy)
+	const MTL::Texture* depth_attachment = m_draw_fbo.depth_stencil ? m_draw_fbo.depth_stencil->value : nullptr;
+
+	auto check = [&cmd, depth_attachment](const auto& states, u32 mask)
+	{
+		for (u32 i = 0; mask; mask >>= 1, ++i)
+		{
+			if (!(mask & 1) || !states[i])
+			{
+				continue;
+			}
+
+			// Copies made for the draw (no image_handle) were recorded after the clears (compute records them first)
+			const auto desc = static_cast<const mtl::texture_cache::sampled_image_descriptor*>(states[i].get());
+			if (desc->image_handle && desc->image_handle->image() && desc->image_handle->parent_texture() != depth_attachment &&
+				cmd.has_deferred_clear(desc->image_handle->image()->value))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	// Reads of the pass's own depth buffer (texture units, the depth bounds test, depth compare emulation) go to its copy
+	return check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
+		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
+}
+
 mtl::render_target* MTLGSRender::find_bound_attachment(const mtl::image* image) const
 {
 	if (!image)
@@ -1399,18 +1602,6 @@ mtl::render_target* MTLGSRender::find_bound_attachment(const mtl::image* image) 
 	return nullptr;
 }
 
-bool MTLGSRender::is_written_in_open_pass(const mtl::image* image) const
-{
-	if (!is_render_pass_open())
-	{
-		return false;
-	}
-
-	// Not an attachment of the open pass: its memory is current
-	const auto surface = find_bound_attachment(image);
-	return surface && surface->written_in_pass == m_current_command_buffer->open_pass_serial();
-}
-
 mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 {
 	if (!is_render_pass_open())
@@ -1422,7 +1613,7 @@ mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 	bool read_in_pass = false;
 	bool through_copy = false;
 
-	auto check = [&](const auto& states, u32 mask)
+	auto check = [&](const auto& states, u32 mask, bool vertex_stage)
 	{
 		for (u32 i = 0; mask; mask >>= 1, ++i)
 		{
@@ -1454,12 +1645,16 @@ mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 			}
 
 			const auto surface = find_bound_attachment(desc->image_handle->image());
-			if (!surface)
+			if (!surface || surface == m_draw_fbo.depth_stencil)
 			{
+				// Not an attachment, or the depth attachment: its readers read a copy made outside the pass when the
+				// copy is stale (redirect_depth_attachment_read), which ends the pass itself
 				continue;
 			}
 
-			if (!surface->feedback_read_in_pass_allowed(pass, m_feedback_draw_key))
+			// The vertex work of a pass runs before its fragment work (tile-based GPU): a vertex texture never sees
+			// writes of the open pass, whatever the feedback streak
+			if (vertex_stage ? (surface->written_in_pass == pass) : !surface->feedback_read_in_pass_allowed(pass, m_feedback_draw_key))
 			{
 				return true;
 			}
@@ -1470,8 +1665,8 @@ mtl::pass_split_reason MTLGSRender::feedback_read_needs_split() const
 		return false;
 	};
 
-	if (check(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
-		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask))
+	if (check(fs_sampler_state, current_fp_metadata.referenced_textures_mask, false) ||
+		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask, true))
 	{
 		return through_copy ? mtl::pass_split_reason::read_through_copy : mtl::pass_split_reason::read_after_write;
 	}
@@ -1552,11 +1747,15 @@ bool MTLGSRender::bind_texture_env()
 
 		if (view) [[likely]]
 		{
+			// The depth buffer the draw pass attaches is read through its copy (m_depth_copy), stencil mirror included
+			const bool stencil_mirror = !!(current_fragment_program.texture_state.redirected_textures & (1 << i));
+			view = redirect_depth_attachment_read(view, stencil_mirror);
+
 			m_program->bind_uniform({ view, fs_sampler_handles[i] },
 				mtl::glsl::binding_set_index_fragment,
 				m_fs_binding_table->ftex_location[i]);
 
-			if (current_fragment_program.texture_state.redirected_textures & (1 << i))
+			if (stencil_mirror)
 			{
 				// Stencil mirror required
 				auto root_image = static_cast<mtl::viewable_image*>(view->image());
@@ -1649,16 +1848,35 @@ bool MTLGSRender::bind_texture_env()
 			continue;
 		}
 
-		m_program->bind_uniform({ image_ptr, vs_sampler_handles[i] },
+		m_program->bind_uniform({ redirect_depth_attachment_read(image_ptr), vs_sampler_handles[i] },
 			mtl::glsl::binding_set_index_vertex,
 			m_vs_binding_table->vtex_location[i]);
 	}
 
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
 	{
+		// The bound depth buffer, through its copy while the draw pass attaches it
 		auto ds = ensure(m_rtts.m_bound_depth_stencil.second);
-		auto view = ds->get_view(rsx::default_remap_vector, mtl::aspect_depth);
+		auto view = redirect_depth_attachment_read(ds->get_view(rsx::default_remap_vector, mtl::aspect_depth));
 		m_program->bind_uniform({ view, mtl::null_sampler() }, mtl::glsl::binding_set_index_fragment, m_fs_binding_table->frag_depth_input_location);
+	}
+
+	if (draw_reads_depth_bounds())
+	{
+		// The depth bounds test reads the depth stored in the bound depth buffer (MTLDepthBounds.h), through its copy
+		// while the draw pass attaches it (reading the attachment itself inside the pass is undefined on Apple GPUs).
+		// The bounds are pushed with the rest of the program environment (MTLGSRender.cpp).
+		if (auto ds = m_rtts.m_bound_depth_stencil.second; ds && (ds->aspect() & mtl::aspect_depth))
+		{
+			auto view = redirect_depth_attachment_read(ds->get_view(rsx::default_remap_vector, mtl::aspect_depth));
+			m_program->bind_uniform({ view, mtl::null_sampler() }, mtl::glsl::binding_set_index_fragment, m_fs_binding_table->depth_bounds_location);
+		}
+		else
+		{
+			// The draw is skipped (end()): keep the binding valid for the argument table
+			m_program->bind_uniform({ get_null_texture_view(rsx::texture_dimension_extended::texture_dimension_2d, true), mtl::null_sampler() },
+				mtl::glsl::binding_set_index_fragment, m_fs_binding_table->depth_bounds_location);
+		}
 	}
 
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
@@ -1667,6 +1885,75 @@ bool MTLGSRender::bind_texture_env()
 		ensure(current_fragment_program.mrt_buffers_count == m_draw_buffers.size());
 	}
 
+	return out_of_memory;
+}
+
+bool MTLGSRender::bind_interpreter_texture_env()
+{
+	// The images, samplers and placeholders bind_texture_env() binds, in the interpreter's texture arrays. Programs with
+	// vertex textures, depth compare emulation or programmable blending are not interpreted.
+	using enum rsx::texture_dimension_extended;
+	mtl::shader_interpreter::texture_environment env{};
+	env.null_views = { get_null_texture_view(texture_dimension_2d, false), get_null_texture_view(texture_dimension_3d, false),
+		get_null_texture_view(texture_dimension_cubemap, false), get_null_texture_view(texture_dimension_2d, true),
+		get_null_texture_view(texture_dimension_cubemap, true) };
+
+	for (auto& unit : env.units)
+	{
+		unit.sampler = mtl::null_sampler();
+	}
+
+	bool out_of_memory = false;
+
+	for (u32 textures_ref = current_fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
+	{
+		if (!(textures_ref & 1))
+		{
+			// Unused TIU
+			continue;
+		}
+
+		mtl::image_view* view = nullptr;
+		auto sampler_state = static_cast<mtl::texture_cache::sampled_image_descriptor*>(fs_sampler_state[i].get());
+
+		if (rsx::method_registers.fragment_textures[i].enabled() &&
+			sampler_state->validate())
+		{
+			if (view = sampler_state->image_handle; !view)
+			{
+				//Requires update, copy subresource
+				if (!(view = m_texture_cache.create_temporary_subresource(*m_current_command_buffer, sampler_state->external_subresource_desc)))
+				{
+					out_of_memory = true;
+				}
+			}
+		}
+
+		auto& unit = env.units[i];
+		if (view) [[likely]]
+		{
+			// The depth buffer the draw pass attaches is read through its copy (m_depth_copy), stencil mirror included
+			const bool stencil_mirror = !!(current_fragment_program.texture_state.redirected_textures & (1 << i));
+			view = redirect_depth_attachment_read(view, stencil_mirror);
+
+			unit.view = view;
+			unit.sampler = fs_sampler_handles[i];
+
+			if (stencil_mirror)
+			{
+				// Stencil mirror (read with texelFetch and an explicit border test: no sampler)
+				auto root_image = static_cast<mtl::viewable_image*>(view->image());
+				unit.stencil_view = root_image->get_view(rsx::default_remap_vector, mtl::aspect_stencil);
+			}
+		}
+		else
+		{
+			const bool is_shadow = !!(current_fragment_program.texture_state.shadow_textures & (1u << i));
+			unit.view = get_null_texture_view(current_fragment_program.get_texture_dimension(i), is_shadow);
+		}
+	}
+
+	m_shader_interpreter.update_fragment_textures(*m_current_command_buffer, *m_program, current_fragment_program, env);
 	return out_of_memory;
 }
 
@@ -1728,6 +2015,7 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 	// Faults are allowed during vertex upload. Ensure consistent CB state after uploads.
 	if (m_current_command_buffer->flags & mtl::command_list::cb_load_occluson_task)
 	{
+		mtl::pass_context_scope context(mtl::pass_context::query);
 		u32 occlusion_id = m_occlusion_query_manager->allocate_query(*m_current_command_buffer);
 		if (occlusion_id == umax)
 		{
@@ -1773,11 +2061,15 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 	// Update vertex fetch parameters
 	update_vertex_env(sub_index, upload_info);
 
+	// The vertex stream views, for every sub-draw: upload_vertex_data() replaces a view whose window does not hold the
+	// sub-draw's data (the attribute ring wrapped or grew), and the stream offsets in the layout entry are relative to the
+	// new view. Binding only for the first sub-draw left later ones reading the replaced view at those offsets (garbage
+	// vertices). Unchanged views cost nothing (bind_uniform compares, the table shadow skips the write).
+	m_program->bind_uniform(persistent_buffer, mtl::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location);
+	m_program->bind_uniform(volatile_buffer, mtl::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 1);
+
 	if (update_descriptors)
 	{
-		m_program->bind_uniform(persistent_buffer, mtl::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location);
-		m_program->bind_uniform(volatile_buffer, mtl::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 1);
-
 		// The layout ring may have been swapped (grown) by the allocation above
 		m_program->bind_uniform(mtl::glsl::buffer_binding_info(m_vertex_layout_ring_info.heap.get(), 0, m_vertex_layout_ring_info.size()),
 			mtl::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 2);
@@ -1792,28 +2084,53 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 
 	bool reload_state = (!m_current_draw.subdraw_id++);
 
-	// Vertex textures: the pass must order vertex work after earlier fragment work (see load_texture_env). Requested
-	// here so that nothing (copies, helper passes, a flush) can open a pass in between.
-	if (m_draw_reads_images_in_vertex_stage && m_current_command_buffer->require_vertex_after_fragment())
-	{
-		mtl::g_feedback_loop_pass_splits++;
-		mtl::count_feedback_split(mtl::pass_split_reason::vertex_read);
-	}
-
 	// (Re)open the main pass. It may have been ended by a copy/compute operation, a pass of another component, a
 	// feedback-loop split or a submit.
 	if (!is_render_pass_open())
 	{
+		// The pass folds pending clears of its attachments into their load actions. A draw sampling one of them must
+		// see the cleared memory: record the clears on their own first (the pass then loads the attachment).
+		if (m_current_command_buffer->has_deferred_clears() && draw_reads_deferred_clear())
+		{
+			m_current_command_buffer->flush_deferred_clears();
+		}
+
 		begin_render_pass();
 		reload_state = true;
 	}
 
 	// Programmable blending uses framebuffer fetch: no input attachments and no barriers inside the pass.
 
-	// Bind pipeline and resources. MTL4 argument tables are captured at draw time, so bind before every draw.
+	// Bind pipeline and resources. MTL4 argument tables are captured at draw time, so bind before every draw. Everything
+	// the draw reads is declared first (the index ring here, whose sub-range copies below are allocated from it too;
+	// textures, vertex streams and constants in bind(), before it sets the pipeline state): the pass barriers order the
+	// draw after earlier work, except for its vertex stage reading what fragment work of an earlier pass wrote, which
+	// gets a barrier before the pass's first draw.
+	const auto bind_draw = [&]()
+	{
+		if (upload_info.index_info)
+		{
+			m_current_command_buffer->draw_access(mtl::read_buffer(m_index_buffer_ring_info.heap.get()), MTL::StageVertex);
+		}
+
+		m_program->bind(*m_current_command_buffer, mtl::get_scratch_heap());
+	};
+
+	bind_draw();
+
+	if (m_current_command_buffer->pass_split_required())
+	{
+		// The pass already has draws, and on a tile-based GPU a barrier recorded after them does not order the pass: draw
+		// in a new pass (no deferred clear can be pending while a pass is open), whose first bind gets the barrier
+		split_render_pass(mtl::pass_split_reason::vertex_read);
+		begin_render_pass();
+		reload_state = true;
+
+		bind_draw();
+		ensure(!m_current_command_buffer->pass_split_required()); // Declared before the new pass had a pipeline state
+	}
+
 	auto encoder = ensure(get_render_encoder());
-	m_program->bind(*m_current_command_buffer, mtl::get_scratch_heap());
-	m_encoder_state.pipeline = m_program->render_pipeline();
 
 	if (reload_state)
 	{
@@ -1883,6 +2200,7 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 			// NOTE: Read the source through the mapping taken before any allocation; a ring grow swaps the backing store
 			// (the old buffer stays alive through the GC until this submission completes, so index_base remains valid).
 			const u8* index_data = m_index_buffer_ring_info.map<u8>(offset, 0);
+			bool index_data_synced = false;
 
 			u32 vertex_offset = 0;
 			const auto subranges = draw_call.get_subranges();
@@ -1901,9 +2219,22 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 				MTL::GPUAddress range_address = index_base + range_offset;
 				if (range_address & 3)
 				{
+					if (!index_data_synced)
+					{
+						// The CPU reads the index data here. Indices generated for emulated primitives may still be
+						// written by the DMA offloader (Multithreaded RSX: dma_manager::emulate_as_indexed queues large
+						// ones); submission syncs it, but this copy is made now.
+						g_fxo->get<rsx::dma_manager>().sync();
+						index_data_synced = true;
+					}
+
 					const usz aligned_offset = m_index_buffer_ring_info.alloc<64>(range_length);
 					std::memcpy(m_index_buffer_ring_info.map<u8>(aligned_offset, range_length), index_data + range_offset, range_length);
 					range_address = m_index_buffer_ring_info.gpu_address(aligned_offset);
+
+					// The allocation may have grown the ring into a new buffer. Declared between draws: only the CPU writes
+					// the ring, so this never needs a barrier (a split it asked for would apply to the next draw).
+					m_current_command_buffer->draw_access(mtl::read_buffer(m_index_buffer_ring_info.heap.get(), aligned_offset, range_length), MTL::StageVertex);
 				}
 
 				encoder->drawIndexedPrimitives(upload_info.primitive, count, index_type, range_address, range_length);
@@ -1911,6 +2242,7 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 		}
 	}
 
+	m_draws_since_submit++;
 	m_frame_stats.draw_exec_time += m_profiler.duration();
 }
 
@@ -1926,11 +2258,30 @@ void MTLGSRender::begin()
 	}
 
 	mtl::autorelease_scope pool;
+
+	// The RSX layout leaves the depth buffer out for draws that neither test nor write depth or stencil, but keeps it for
+	// an active depth bounds test (get_framebuffer_layout). The layout is only re-evaluated for such draws when depth or
+	// stencil state changes (on_framebuffer_options_changed), not when the bounds test becomes active: evaluate it again
+	// then (once while the depth buffer stays out, e.g. a misconfigured one the layout drops), so the test has its buffer.
+	const auto& regs = rsx::method_registers;
+	if (!regs.depth_bounds_test_enabled() || !(regs.depth_bounds_min() > 0.f || regs.depth_bounds_max() < 1.f) ||
+		m_framebuffer_layout.zeta_address)
+	{
+		m_depth_bounds_relayout_done = false;
+	}
+	else if (m_graphics_state.test(rsx::rtt_config_contested) && !m_depth_bounds_relayout_done)
+	{
+		m_graphics_state.set(rsx::rtt_config_dirty);
+		m_depth_bounds_relayout_done = true;
+	}
+
 	init_buffers(rsx::framebuffer_creation_context::context_draw);
 
 	if (m_graphics_state & rsx::pipeline_state::invalidate_pipeline_bits)
 	{
-		// Shaders need to be reloaded.
+		// Shaders need to be reloaded. Recorded before the RSX consumes the flags (analyse_current_rsx_pipeline): the
+		// interpreter's instruction blocks follow the programs and their state (load_program_env).
+		m_interpreter_state |= (m_graphics_state.load() & rsx::pipeline_state::invalidate_pipeline_bits);
 		m_prev_program = m_program;
 		m_program = nullptr;
 	}
@@ -1985,7 +2336,10 @@ void MTLGSRender::end()
 
 	m_frame_stats.setup_time += m_profiler.duration();
 
-	load_texture_env();
+	{
+		mtl::pass_context_scope context(mtl::pass_context::texture_setup);
+		load_texture_env();
+	}
 	m_frame_stats.textures_upload_time += m_profiler.duration();
 
 	if (!load_program())
@@ -1996,6 +2350,40 @@ void MTLGSRender::end()
 		// m_rtts.on_write(); - breaks games for obvious reasons
 		rsx::thread::end();
 		return;
+	}
+
+	if (draw_reads_depth_bounds())
+	{
+		// The program reads the depth buffer's copy as a 2D or multisample texture, keyed on the draw's depth buffer
+		// (get_backend_fragment_program_export_config): a mismatch would bind the wrong texture type.
+		const auto ds = m_rtts.m_bound_depth_stencil.second;
+		const u32 ctrl = current_fragment_program.ctrl;
+		if (!ds || !(ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST) ||
+			(ds->samples() > 1) != !!(ctrl & RSX_SHADER_CONTROL_ROP_MULTISAMPLED)) [[unlikely]]
+		{
+			static atomic_t<bool> s_reported = false;
+			if (!s_reported.exchange(true))
+			{
+				rsx_log.error("Metal: a draw's program performs the depth bounds test for a depth buffer it was not built for (%s). Draw skipped.",
+					!ds ? "none bound" : !(ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST) ? "stale program" : "other sample count");
+			}
+
+			execute_nop_draw();
+			rsx::thread::end();
+			return;
+		}
+
+		if (!m_depth_bounds_notice_logged)
+		{
+			m_depth_bounds_notice_logged = true;
+			const auto [bounds_min, bounds_max] = get_clamped_depth_bounds();
+			rsx_log.notice("Metal: the depth bounds test is emulated in the fragment shader (no hardware depth bounds test before Apple10): "
+				"draws that use it discard the pixels whose stored depth is outside the bounds "
+				"(first bounds %.3f-%.3f, %u sample(s)).",
+				bounds_min, bounds_max, ds->samples());
+		}
+
+		m_depth_bounds_draws++;
 	}
 
 	// Load program execution environment
@@ -2009,7 +2397,8 @@ void MTLGSRender::end()
 		split_render_pass(mtl::pass_split_reason::write_after_read);
 	}
 
-	// Apply write memory barriers
+	// Apply write memory barriers (surface initialization and inheritance)
+	mtl::pass_context_scope surface_context(mtl::pass_context::surface_setup);
 	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil))
 	{
 		ds->write_barrier(*m_current_command_buffer);
@@ -2042,6 +2431,8 @@ void MTLGSRender::end()
 	m_frame_stats.setup_time += m_profiler.duration();
 
 	// Now bind the shader resources. It is important that this takes place after the barriers so that we don't end up with stale descriptors
+	mtl::pass_context_scope texture_context(mtl::pass_context::texture_setup);
+	m_draw_reads_depth_copy = false;
 	for (int retry = 0; retry < 3; ++retry)
 	{
 		if (retry > 0 && m_samplers_dirty) [[ unlikely ]]
@@ -2057,7 +2448,10 @@ void MTLGSRender::end()
 			m_graphics_state.clear(rsx::pipeline_state::invalidate_pipeline_bits);
 		}
 
-		const bool out_of_memory = bind_texture_env();
+		const bool out_of_memory = m_shader_interpreter.is_interpreter(m_program)
+			? bind_interpreter_texture_env()
+			: bind_texture_env();
+
 		if (!out_of_memory)
 		{
 			break;
@@ -2073,6 +2467,9 @@ void MTLGSRender::end()
 
 	m_texture_cache.release_uncached_temporary_subresources();
 	m_frame_stats.textures_upload_time += m_profiler.duration();
+
+	// Draws: anything that ends the pass from here on is not texture or surface setup
+	mtl::pass_context_scope draw_context(mtl::pass_context::other);
 
 	u32 sub_index = 0;               // RSX subdraw ID
 	m_current_draw.subdraw_id = 0;   // Host subdraw ID. Invalid RSX subdraws do not increment this value
@@ -2103,9 +2500,22 @@ void MTLGSRender::end()
 	const auto& regs = rsx::method_registers;
 	const bool depth_stencil_written = m_framebuffer_layout.zeta_write_enabled ||
 		(regs.depth_test_enabled() && regs.depth_write_enabled()) ||
-		(regs.stencil_test_enabled() && regs.stencil_mask() != 0);
+		(regs.stencil_test_enabled() && (regs.stencil_mask() != 0 ||
+			(regs.two_sided_stencil_test_enabled() && regs.back_stencil_mask() != 0)));
+	// Planes whose contents the draw may change (the depth buffer's copy, m_depth_copy). Depth: the depth-stencil state
+	// writes it exactly when the depth test and depth writes are on and a depth buffer is attached (update_draw_state),
+	// and a write changes it unless the test only passes fragments whose depth equals the stored depth (equal, never).
+	// Stencil: the stencil state writes it only with the stencil test on, through the front mask, and the back mask
+	// with two-sided stencil (update_draw_state).
+	const auto depth_func = regs.depth_func();
+	const bool depth_changed = m_draw_fbo.depth_stencil && regs.depth_test_enabled() && regs.depth_write_enabled() &&
+		depth_func != rsx::comparison_function::equal && depth_func != rsx::comparison_function::never;
+	const bool stencil_changed = m_draw_fbo.has_stencil() && regs.stencil_test_enabled() &&
+		(regs.stencil_mask() != 0 || (regs.two_sided_stencil_test_enabled() && regs.back_stencil_mask() != 0));
+	const u32 ds_planes_changed = (depth_changed ? mtl::aspect_depth : 0u) | (stencil_changed ? mtl::aspect_stencil : 0u);
+
 	update_feedback_streaks(live_color_writes, depth_stencil_written);
-	mark_attachment_writes(live_color_writes, depth_stencil_written, true);
+	mark_attachment_writes(live_color_writes, depth_stencil_written, ds_planes_changed, true);
 
 	rsx::thread::end();
 }
@@ -2121,6 +2531,7 @@ void MTLGSRender::clear_surface(u32 mask)
 	if (!(mask & RSX_GCM_CLEAR_ANY_MASK)) return;
 
 	mtl::autorelease_scope pool;
+	mtl::pass_context_scope pass_context(mtl::pass_context::clear);
 
 	u8 ctx = rsx::framebuffer_creation_context::context_draw;
 	if (mask & RSX_GCM_CLEAR_COLOR_RGBA_MASK) ctx |= rsx::framebuffer_creation_context::context_clear_color;
@@ -2151,8 +2562,17 @@ void MTLGSRender::clear_surface(u32 mask)
 	bool update_color = false, update_z = false;
 	auto surface_depth_format = rsx::method_registers.surface_depth_fmt();
 
-	// Clears are either folded into the load action of a new pass (full frame, all channels) or drawn inside the pass
-	mtl::attachment_clear_info load_clear{};
+	// Clears are either load actions of a new pass (full frame, all channels: an open draw pass ends, and the clears are
+	// deferred into the next pass that attaches the surfaces, see mtl::command_list::defer_clear) or drawn as a quad
+	// inside the draw pass (scissored or channel-masked)
+	struct
+	{
+		bool color = false;
+		MTL::ClearColor color_value{};
+		u32 depth_stencil_planes = 0;
+		f64 depth = 1.;
+		u32 stencil = 0;
+	} full;
 	mtl::inpass_clear::request inpass{};
 
 	if (auto ds = std::get<1>(m_rtts.m_bound_depth_stencil); mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK)
@@ -2300,9 +2720,9 @@ void MTLGSRender::clear_surface(u32 mask)
 
 				if (use_fast_clear && full_frame)
 				{
-					// Full-surface clear of every colour attachment: fold into the load action of a new pass
-					load_clear.color_mask = (1u << m_draw_fbo.color_count) - 1;
-					load_clear.color = MTL::ClearColor::Make(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
+					// Full-surface clear of every colour attachment
+					full.color = true;
+					full.color_value = MTL::ClearColor::Make(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
 				}
 				else
 				{
@@ -2336,14 +2756,14 @@ void MTLGSRender::clear_surface(u32 mask)
 		{
 			if (depth_stencil_mask & mtl::aspect_depth)
 			{
-				load_clear.clear_depth = true;
-				load_clear.depth = depth_clear;
+				full.depth_stencil_planes |= mtl::aspect_depth;
+				full.depth = depth_clear;
 			}
 
 			if ((depth_stencil_mask & mtl::aspect_stencil) && !partial_stencil)
 			{
-				load_clear.clear_stencil = true;
-				load_clear.stencil = stencil_clear;
+				full.depth_stencil_planes |= mtl::aspect_stencil;
+				full.stencil = stencil_clear;
 			}
 		}
 		else
@@ -2378,11 +2798,30 @@ void MTLGSRender::clear_surface(u32 mask)
 		m_rtts.on_write({ update_color, update_color, update_color, update_color }, update_z);
 	}
 
-	if (!load_clear.empty())
+	// Planes of the draw pass attachments the full-frame parts clear
+	const u32 full_ds_planes = m_draw_fbo.depth_stencil ? (full.depth_stencil_planes & m_draw_fbo.depth_stencil->aspect()) : 0;
+	const bool full_color = full.color && m_draw_fbo.color_count;
+
+	if (full_color || full_ds_planes)
 	{
-		// Ends the current pass and reopens it with loadAction=Clear on the requested attachments
-		begin_render_pass(&load_clear);
-		mark_attachment_writes({ update_color, update_color, update_color, update_color }, update_z);
+		// The draw pass ends and the clears are deferred: the next pass that attaches the surfaces begins with
+		// loadAction=Clear for them (the pass of the quad below, if there is one), otherwise a clear-only pass records
+		// them. A full-frame clear is never drawn over earlier draws of an open pass.
+		close_render_pass(mtl::pass_end_reason::clear);
+
+		auto& cmd = *m_current_command_buffer;
+		for (u32 index = 0; full_color && index < m_draw_fbo.color_count; ++index)
+		{
+			cmd.defer_clear(m_draw_fbo.color[index]->value, mtl::aspect_color, m_draw_fbo.width, m_draw_fbo.height, { .color = full.color_value });
+		}
+
+		if (full_ds_planes)
+		{
+			cmd.defer_clear(m_draw_fbo.depth_stencil->value, full_ds_planes, m_draw_fbo.width, m_draw_fbo.height, { .depth = full.depth, .stencil = full.stencil });
+		}
+
+		// Contents tags now; the attachments count as written by the pass that folds the clears (begin_render_pass)
+		mark_attachment_writes({ full_color, full_color, full_color, full_color }, full_ds_planes != 0, full_ds_planes);
 	}
 
 	if (!inpass.color_write_mask && !inpass.depth && !inpass.stencil)
@@ -2395,7 +2834,7 @@ void MTLGSRender::clear_surface(u32 mask)
 		return;
 	}
 
-	// Scissored / masked clear: draw a quad inside the main pass. A colour clear after feedback reads of the target in
+	// Scissored / masked clear: draw a quad inside the draw pass. A colour clear after feedback reads of the target in
 	// the open pass is a write-after-read like a draw's (see colour_write_after_read())
 	if (inpass.color_write_mask && colour_write_after_read({ true, true, true, true }, false))
 	{
@@ -2410,6 +2849,8 @@ void MTLGSRender::clear_surface(u32 mask)
 	{
 		return;
 	}
+
+	mtl::count_pass_event(mtl::pass_event::clear_in_pass);
 
 	mtl::inpass_clear::push_constants_t push{};
 	push.color[0] = inpass.color.r;
@@ -2470,18 +2911,24 @@ void MTLGSRender::clear_surface(u32 mask)
 	encoder->drawPrimitives(MTL::PrimitiveTypeTriangleStrip, NS::UInteger(0), NS::UInteger(4));
 
 	const bool clear_color = inpass.color_write_mask != 0;
-	mark_attachment_writes({ clear_color, clear_color, clear_color, clear_color }, clear_depth || clear_stencil);
+	mark_attachment_writes({ clear_color, clear_color, clear_color, clear_color }, clear_depth || clear_stencil,
+		(clear_depth ? mtl::aspect_depth : 0u) | (clear_stencil ? mtl::aspect_stencil : 0u));
 
 	if (query_open)
 	{
 		const auto open_query = m_occlusion_map[m_active_query_info->driver_handle].indices.back();
-		m_occlusion_query_manager->resume_query(encoder, open_query);
+		m_occlusion_query_manager->resume_query(*m_current_command_buffer, encoder, open_query);
 	}
 
-	// The next draw must restore the full encoder state (viewport, scissor, depth bias, depth bounds, ...)
-	m_encoder_state.pipeline = nullptr;
+	// The next draw must restore the full encoder state (viewport, scissor, depth bias, depth bounds, ...).
+	// update_draw_state()/bind_viewport() only send values that differ from m_encoder_state, so every cache this
+	// quad overwrote must be invalidated: otherwise a draw whose scissor/viewport/bias equals the one cached before
+	// the clear keeps the clear's (e.g. clipped to a small scissored-clear rectangle, or losing its polygon offset).
 	m_encoder_state.depth_stencil = ds_state;
 	m_encoder_state.rasterizer_valid = false;
 	m_encoder_state.stencil_reference_valid = false;
+	m_encoder_state.viewport_valid = false;
+	m_encoder_state.depth_bias_valid = false;
+	m_encoder_state.depth_bounds_valid = false;
 	m_current_command_buffer->flags |= mtl::command_list::cb_reload_dynamic_state;
 }

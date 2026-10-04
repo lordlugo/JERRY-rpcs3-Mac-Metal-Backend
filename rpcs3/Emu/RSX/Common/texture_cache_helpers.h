@@ -746,6 +746,13 @@ namespace rsx
 					}
 				}
 
+				if (texptr->samples() > 1 && texptr->is_forced_msaa() && !requires_processing)
+				{
+					// Forced host MSAA: the game sees a single-sample surface. Sample the averaged resolve image (a
+					// normal 2D texture), never the multisample image with PS3 sample-expanded addressing.
+					access_type = rsx::surface_access::transfer_read;
+				}
+
 				if (surface_is_rop_target && texture_cache_helpers::force_strict_fbo_sampling(texptr->samples()))
 				{
 					// Framebuffer feedback avoidance. For MSAA, we do not need to make copies; just use the resolve target

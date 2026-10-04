@@ -57,6 +57,16 @@ namespace mtl
 		void push_down_current_scope();
 		void eid_completed(u64 eid);
 		void trim();
+
+		// Telemetry: objects waiting for their event id, the number of event id scopes they are in, cached samplers
+		struct usage_stats
+		{
+			usz pending_objects = 0;
+			usz pending_scopes = 0;
+			usz samplers = 0;
+		};
+
+		usage_stats get_usage_stats() const;
 	};
 
 	resource_manager* get_resource_manager();

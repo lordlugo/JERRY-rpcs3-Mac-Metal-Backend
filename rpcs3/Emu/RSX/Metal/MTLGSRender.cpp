@@ -1,13 +1,18 @@
 #include "stdafx.h"
 #include "../Overlays/overlay_compile_notification.h"
-#include "../Overlays/Shaders/shader_loading_dialog_native.h"
+#include "../Overlays/Shaders/shader_loading_dialog.h"
 
 #include "MTLCommandStream.h"
 #include "MTLCompute.h"
 #include "MTLDMA.h"
 #include "MTLFormats.h"
 #include "MTLGSRender.h"
+#include "mtlutils/iokit_gpu_stats.h"
+
+#include <cmath>
+#include "MTLGraphicsLog.h"
 #include "MTLHelpers.h"
+#include "MTLProgramPipeline.h"
 #include "MTLRenderPass.h"
 #include "MTLResolveHelper.h"
 #include "MTLResourceManager.h"
@@ -16,6 +21,7 @@
 
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/Host/MM.h"
+#include "Emu/RSX/Host/RSXDMAWriter.h"
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
 #include "Emu/Memory/vm_locking.h"
 
@@ -81,6 +87,7 @@ namespace mtl
 	public:
 		void recycle(mtl::command_buffer_chunk& cmd)
 		{
+			mtl::wait_site_scope wait_site("thread scratch ring recycle");
 			if (m_pending_cmd)
 			{
 				if (m_pending_cmd->is_recording())
@@ -186,6 +193,13 @@ namespace mtl
 		}
 
 		g_thread_scratch_heaps.clear();
+	}
+
+	// Telemetry: private scratch rings created so far (entries live until the renderer is destroyed)
+	static usz get_thread_scratch_heap_count()
+	{
+		reader_lock lock(g_thread_scratch_heaps_lock);
+		return g_thread_scratch_heaps.size();
 	}
 
 	// ---- Global resources (VKHelpers.cpp) ---------------------------------------------------------------------------
@@ -419,7 +433,9 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	mtl::g_render_device = m_device.get();
 	mtl::reset_runtime_state();
 
-	m_timeline.create(*m_device, "RSX timeline");
+	// CPU waits for this timeline are GPU -> CPU synchronization (reported with the presentation statistics); present
+	// list waits (m_present_timeline) are display back-pressure and are accounted separately
+	m_timeline.create(*m_device, "RSX timeline", true);
 
 	// Presentation surface. The game window is a QWindow created with QSurface::MetalSurface.
 #if defined(__APPLE__)
@@ -481,6 +497,10 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	// Secondary command lists for parallel operations (access violation handlers, ...)
 	m_secondary_cb_list.create(*m_device, m_device->queue(), m_timeline, "RSX secondary", mtl::command_list::access_type_hint::all);
 
+	rsx_log.notice("Metal: GPU work is ordered by hazard-tracked barriers: commands declare their accesses, only conflicting "
+		"work waits (stage-precise queue barriers, barriers before draws for what they read, submissions checked against "
+		"the ones still running)");
+
 	// Occlusion
 	m_occlusion_query_manager = std::make_unique<mtl::query_pool_manager>(*m_device, MTL_OCCLUSION_MAX_POOL_SIZE);
 	m_occlusion_map.resize(rsx::reports::occlusion_query_count);
@@ -531,7 +551,7 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	m_transform_constants_allocator = std::make_unique<rsx::data_heap::bulk_allocator<256, 16>>(m_transform_constants_ring_info, 8192u);
 	m_fragment_constants_allocator = std::make_unique<rsx::data_heap::bulk_allocator<256, 16>>(m_fragment_constants_ring_info, 8192u);
 
-	m_max_async_frames = MTL_MAX_DRAWABLE_COUNT;
+	m_max_async_frames = MTL_MAX_FRAMES_IN_FLIGHT;
 	m_frame_context_storage.resize(m_max_async_frames);
 	m_current_frame = &m_frame_context_storage[0];
 
@@ -570,6 +590,10 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 	m_texture_cache.initialize(*m_device, m_texture_upload_buffer_ring_info);
 
+	// Granular graphics-flow logging: issue census + per-kernel trace/counters, config snapshot below.
+	mtl::graphics_log_install();
+	mtl::graphics_log_boot_snapshot();
+
 	mtl::get_overlay_pass<mtl::ui_overlay_renderer>()->init(*m_current_command_buffer, m_texture_upload_buffer_ring_info);
 
 	// Backend capabilities
@@ -592,12 +616,45 @@ MTLGSRender::MTLGSRender(utils::serial* ar) noexcept : GSRender(ar)
 	backend_config.supports_hw_renormalization = false;      // Only NVIDIA hardware matches RSX renormalization
 	backend_config.supports_hw_conditional_render = false;   // Shader predicate path (emulate_conditional_rendering)
 	backend_config.supports_passthrough_dma = mtl::is_passthrough_dma_supported();
-	backend_config.supports_host_gpu_labels = false;
+	backend_config.supports_host_gpu_labels = !!g_cfg.video.host_label_synchronization;
 	backend_config.supports_asynchronous_compute = false;
+
+	if (!backend_config.supports_host_gpu_labels &&
+		!backend_config.supports_asynchronous_compute)
+	{
+		// Same rule as VK: passthrough DMA only when a feature that needs it is enabled. A passthrough block aliases
+		// guest memory, so a surface readback (Write Color/Depth Buffers) lands in guest memory whenever the GPU runs
+		// it, not when the guest reads the range. Speculative readbacks are recorded before the CPU/SPU accesses the
+		// memory; if the guest writes the range first (the section is discarded, dma_abort() cannot cancel the GPU
+		// copy) the late copy overwrites the new data with stale render target contents. With staging blocks the copy
+		// only reaches guest memory through flush_dma() when the guest actually reads the range.
+		backend_config.supports_passthrough_dma = false;
+	}
+
+	if (backend_config.supports_host_gpu_labels)
+	{
+		if (!backend_config.supports_passthrough_dma)
+		{
+			rsx_log.error("Allow Host GPU Labels needs passthrough DMA, which is unavailable. Host GPU labels will be disabled.");
+			backend_config.supports_host_gpu_labels = false;
+		}
+		else
+		{
+			// 64 KiB host block holding the label context the GPU updates from its timeline (port of VK's
+			// m_host_object_data). Shared storage: CPU writes are immediately visible to the GPU and vice versa.
+			m_host_object_data = std::make_unique<mtl::buffer>(*m_device, 0x10000, mtl::memory_location::host_visible, "host GPU labels");
+			m_host_dma_ctrl = std::make_unique<rsx::RSXDMAWriter>(m_host_object_data->map());
+		}
+	}
 
 	if (g_cfg.video.shadermode == shader_mode::async_with_interpreter || g_cfg.video.shadermode == shader_mode::interpreter_only)
 	{
-		rsx_log.warning("Metal: the shader interpreter is not available. Draws are skipped until their shaders are compiled (async recompiler behaviour).");
+		// Instruction blocks of the interpreted programs (header + microcode, see load_program_env)
+		m_vertex_instructions_buffer.create(MTL_UBO_RING_BUFFER_SIZE_M * 0x100000, "vertex instructions buffer");
+		m_fragment_instructions_buffer.create(MTL_UBO_RING_BUFFER_SIZE_M * 0x100000, "fragment instructions buffer");
+		mtl::data_heap_manager::register_ring_buffers({ std::ref(m_vertex_instructions_buffer), std::ref(m_fragment_instructions_buffer) });
+
+		m_shader_interpreter.init(m_device->caps().apple10);
 	}
 }
 
@@ -614,10 +671,17 @@ MTLGSRender::~MTLGSRender()
 
 	mtl::autorelease_scope pool;
 
-	// Flush DMA queue
+	// Flush DMA queue (bounded like every other teardown wait: a wedged offloader must not hang shutdown)
+	const u64 dma_drain_start = get_system_time();
 	while (!g_fxo->get<rsx::dma_manager>().sync())
 	{
 		do_local_task(rsx::FIFO::state::lock_wait);
+
+		if (get_system_time() - dma_drain_start > TEARDOWN_WAIT_TIMEOUT)
+		{
+			rsx_log.error("Metal: the RSX offloader did not drain during shutdown; continuing anyway");
+			break;
+		}
 	}
 
 	// Wait for the device to finish up with resources. Pending recordings are discarded like Vulkan does.
@@ -639,6 +703,28 @@ MTLGSRender::~MTLGSRender()
 		rsx_log.error("Metal: the GPU did not finish outstanding work during shutdown; continuing anyway");
 	}
 
+	// Release the sampler references held by the texture-era handles first: flush()
+	// destroys every pooled sampler immediately, so a handle released after it would
+	// touch freed memory (and a program binding one would keep a dead ID that the next
+	// bind substitutes). The GPU is idle past the waits above, so nothing is in flight.
+	for (auto*& handle : fs_sampler_handles)
+	{
+		if (handle)
+		{
+			static_cast<mtl::cached_sampler_object_t*>(handle)->release();
+			handle = nullptr;
+		}
+	}
+
+	for (auto*& handle : vs_sampler_handles)
+	{
+		if (handle)
+		{
+			static_cast<mtl::cached_sampler_object_t*>(handle)->release();
+			handle = nullptr;
+		}
+	}
+
 	// GC cleanup
 	mtl::get_resource_manager()->flush();
 
@@ -649,6 +735,7 @@ MTLGSRender::~MTLGSRender()
 	mtl::destroy_pipe_compiler();       // Ensure no pending shaders being compiled
 	spirv::finalize_compiler_context(); // Shut down the glslang compiler
 	m_prog_buffer->clear();             // Delete shader objects
+	m_shader_interpreter.destroy();
 	mtl::destroy_inpass_clear_programs();
 	m_program = nullptr;
 	m_prev_program = nullptr;
@@ -718,6 +805,8 @@ MTLGSRender::~MTLGSRender()
 	{
 		null_texture.reset();
 	}
+	m_depth_copy.views.clear();
+	m_depth_copy.image.reset();
 	fs_sampler_handles.fill(nullptr);
 	vs_sampler_handles.fill(nullptr);
 
@@ -730,6 +819,8 @@ MTLGSRender::~MTLGSRender()
 	// Queries
 	m_occlusion_query_manager.reset();
 	m_cond_render_buffer.reset();
+	m_host_dma_ctrl.reset();
+	m_host_object_data.reset();
 
 	// Fallback bindables
 	null_buffer_view.reset();
@@ -739,13 +830,17 @@ MTLGSRender::~MTLGSRender()
 	mtl::data_heap_manager::reset();
 	mtl::destroy_thread_scratch_heaps();
 
-	// Command lists
+	// Command lists, then the command memory of their completed (or abandoned) submissions
 	m_primary_cb_list.destroy();
 	m_secondary_cb_list.destroy();
 	m_current_command_buffer = nullptr;
+	mtl::command_allocators::release_all();
 
 	// Global resources (scratch, DMA, resolve helpers, upload heap) and the final GC flush
 	mtl::destroy_global_resources();
+
+	// Transient views were destroyed by the GC flush above
+	mtl::destroy_transient_view_pools();
 
 	// Device handles/contexts
 	m_timeline.destroy();
@@ -767,6 +862,7 @@ bool MTLGSRender::on_access_violation(u32 address, bool is_writing)
 {
 	// Runs on PPU/SPU threads, which have no autorelease pool of their own
 	mtl::autorelease_scope pool;
+	mtl::pass_context_scope pass_context(mtl::pass_context::readback);
 
 	rsx::mm_flush(address);
 
@@ -912,6 +1008,28 @@ void MTLGSRender::on_semaphore_acquire_wait()
 f32 MTLGSRender::get_gpu_utilization_pct()
 {
 	const u64 now_us = get_system_time();
+
+	// RPCS3 Metal fork: the whole-GPU load the driver reports (IOAccelerator PerformanceStatistics, as Activity Monitor
+	// and Redline read it). The busy time of this renderer's own command buffers below (union of their GPU intervals)
+	// missed the compositor and other GPU users and over-counted queued-but-waiting time; it stays as the fallback.
+	// Smoothed with a time-scaled EMA (gain 0.4 per second, like Redline), so any overlay refresh rate reads the same.
+	if (const f32 driver_pct = mtl::read_iokit_gpu_utilization(); driver_pct >= 0.f)
+	{
+		if (m_gpu_util_ema < 0.f || !m_gpu_util_ema_time_us || now_us <= m_gpu_util_ema_time_us)
+		{
+			m_gpu_util_ema = driver_pct;
+		}
+		else
+		{
+			const f64 elapsed_s = static_cast<f64>(now_us - m_gpu_util_ema_time_us) / 1e6;
+			const f64 alpha = -std::expm1(std::log(0.6) * elapsed_s);
+			m_gpu_util_ema += static_cast<f32>(alpha * (driver_pct - m_gpu_util_ema));
+		}
+
+		m_gpu_util_ema_time_us = now_us;
+		return std::clamp(m_gpu_util_ema, 0.f, 100.f);
+	}
+
 	const u64 busy_ns = mtl::peek_gpu_busy_ns();
 
 	if (!m_gpu_util_last_time_us || now_us <= m_gpu_util_last_time_us)
@@ -1092,6 +1210,47 @@ void MTLGSRender::check_heap_status()
 	mtl::clear_status_interrupt(mtl::heap_changed);
 }
 
+void MTLGSRender::report_resource_usage()
+{
+	// Everything counted here is bounded by design: caches are trimmed at frame end, pools are recycled through the GC,
+	// rings are reused. A value that keeps rising during a long session (while the scene does not change) is a leak.
+	// Sampled at the rate of the presentation statistics (MTLPresent.cpp) so that both can be read side by side.
+	constexpr u64 report_interval_us = 30'000'000;
+	const u64 now = get_system_time();
+
+	if (!m_resource_report_time)
+	{
+		m_resource_report_time = now;
+		return;
+	}
+
+	if (now - m_resource_report_time < report_interval_us)
+	{
+		return;
+	}
+
+	m_resource_report_time = now;
+
+	constexpr u64 mib = 0x100000;
+	const auto gc = mtl::get_resource_manager()->get_usage_stats();
+	const auto [retired_query_pools, cached_query_pools] = m_occlusion_query_manager->get_pool_counts();
+	// Every command list (primary, secondary, prologues, present lists) takes its allocator from the shared pool
+	const auto allocators = mtl::command_allocators::get_stats_and_reset();
+
+	rsx_log.notice("Metal: resources: %llu MiB in %llu resident allocations; surface cache %llu MiB, texture cache %llu MiB "
+		"(%u unreleased textures, %llu MiB temporary); rings %llu MiB, command allocators %llu MiB in %u (at most %u in use, %u created, %u released); "
+		"%u samplers; %u objects awaiting GPU completion in %u scopes; query pools %u retired, %u cached; %u thread scratch rings",
+		m_device->allocated_bytes() / mib, m_device->resident_allocation_count(),
+		mtl::vmm_get_application_pool_usage(mtl::VMM_ALLOCATION_POOL_SURFACE_CACHE) / mib,
+		mtl::vmm_get_application_pool_usage(mtl::VMM_ALLOCATION_POOL_TEXTURE_CACHE) / mib,
+		m_texture_cache.get_unreleased_textures_count(), m_texture_cache.get_temporary_memory_in_use() / mib,
+		mtl::data_heap_manager::get_total_heap_size() / mib, allocators.allocated_bytes / mib, allocators.allocators,
+		allocators.peak_in_use, allocators.created, allocators.released,
+		static_cast<u32>(gc.samplers), static_cast<u32>(gc.pending_objects), static_cast<u32>(gc.pending_scopes),
+		static_cast<u32>(retired_query_pools), static_cast<u32>(cached_query_pools),
+		static_cast<u32>(mtl::get_thread_scratch_heap_count()));
+}
+
 void MTLGSRender::set_viewport()
 {
 	const auto [clip_width, clip_height] = rsx::apply_resolution_scale<true>(
@@ -1138,8 +1297,11 @@ void MTLGSRender::bind_viewport()
 
 	// Same change-gating as the other dynamic state above: a new encoder per pass split starts blank,
 	// but identical registers re-emit nothing (m_encoder_state resets in on_render_pass_begin).
+	// viewport_valid covers both the viewport and the scissor: sample it once, the viewport branch below sets it
+	// again, and an invalidated cache (in-pass clears) must re-emit the scissor even when it equals the cached one.
+	const bool cache_valid = m_encoder_state.viewport_valid;
 	const auto& cached_vp = m_encoder_state.viewport;
-	if (!m_encoder_state.viewport_valid ||
+	if (!cache_valid ||
 		cached_vp.originX != m_viewport.originX || cached_vp.originY != m_viewport.originY ||
 		cached_vp.width != m_viewport.width || cached_vp.height != m_viewport.height ||
 		cached_vp.znear != m_viewport.znear || cached_vp.zfar != m_viewport.zfar)
@@ -1157,7 +1319,7 @@ void MTLGSRender::bind_viewport()
 	}
 
 	const auto& cached_sc = m_encoder_state.scissor;
-	if (!m_encoder_state.viewport_valid ||
+	if (!cache_valid ||
 		cached_sc.x != scissor.x || cached_sc.y != scissor.y ||
 		cached_sc.width != scissor.width || cached_sc.height != scissor.height)
 	{
@@ -1180,6 +1342,79 @@ MTL::ScissorRect MTLGSRender::get_clamped_scissor() const
 	return scissor;
 }
 
+namespace
+{
+	// rsx::shaders_cache::load() reports its progress to a dialog. Its blocking part only reads and decompiles (a fraction
+	// of a second, see preload_shader_cache): no dialog, and no flips on the RSX thread to draw one.
+	struct no_shader_loading_dialog final : rsx::shader_loading_dialog
+	{
+		void create(const std::string&, const std::string&) override {}
+		void update_msg(u32, std::string) override {}
+		void inc_value(u32, u32) override {}
+		void set_value(u32, u32) override {}
+		void set_limit(u32, u32) override {}
+		void refresh() override {}
+		void close() override {}
+	};
+}
+
+void MTLGSRender::preload_shader_cache()
+{
+	// Shader cache preload (DESIGN.md §6). Blocking, on rsx::shaders_cache::load()'s worker threads: read the cached
+	// pipelines and decompile their programs (CPU only; every program must be complete before a draw can look it up).
+	// Stoppable between two entries. Everything else happens in the background: one pipe compiler task per pipeline
+	// (GLSL -> MSL, MTLLibrary, pipeline from the archive, specialization), behind every pipeline a draw asks for, once
+	// the pipeline archive is ready for lookups. Draws whose pipeline is not built yet are handled like any other
+	// pipeline that is compiling (the shader interpreter, skipped, or waited for by "Recompiler").
+	const u64 start = get_system_time();
+	{
+		mtl::autorelease_scope pool;
+		no_shader_loading_dialog dlg;
+		m_shaders_cache->load(&dlg);
+	}
+
+	const u64 load_us = get_system_time() - start;
+
+	if (Emu.IsStopped())
+	{
+		// Interrupted between two entries
+		rsx_log.notice("Metal: shader cache preload interrupted after %.1f ms", load_us / 1000.);
+		mtl::on_pipeline_cache_preloaded(false);
+		return;
+	}
+
+	const auto programs = m_prog_buffer->get_cache_sizes();
+	const u32 queued = m_prog_buffer->queue_preloaded_pipelines();
+
+	rsx_log.notice("Metal: shader cache: %u pipeline(s) read and %llu vertex / %llu fragment program(s) decompiled in %.1f ms (%.1f ms of decompiler "
+		"time on %u threads); their pipelines are built in the background at default QoS, behind every pipeline a draw asks for%s",
+		queued, static_cast<unsigned long long>(programs.vertex_programs), static_cast<unsigned long long>(programs.fragment_programs),
+		load_us / 1000., m_prog_buffer->get_preload_decompile_us() / 1000., utils::get_thread_count(),
+		mtl::pipeline_archive_ready() ? "" : " (they start when the pipeline archive is ready for lookups)");
+
+	if (!queued)
+	{
+		// Nothing to preload: the archive's first serializer is complete now
+		mtl::on_pipeline_cache_preloaded(true);
+	}
+}
+
+void MTLGSRender::update_shader_preload_notification()
+{
+	// The shader compilation hint stays up while cached pipelines are built in the background (refreshed at most every
+	// half second: it lasts 5 s)
+	if (!g_cfg.misc.show_shader_compilation_hint || !m_overlay_manager || !m_prog_buffer->is_preload_running())
+	{
+		return;
+	}
+
+	if (const u64 now = get_system_time(); now - m_preload_notification_time >= 500'000)
+	{
+		m_preload_notification_time = now;
+		rsx::overlays::show_shader_compile_notification();
+	}
+}
+
 void MTLGSRender::on_init_thread()
 {
 	if (!m_device)
@@ -1190,38 +1425,50 @@ void MTLGSRender::on_init_thread()
 	GSRender::on_init_thread();
 	zcull_ctrl.reset(static_cast<::rsx::reports::ZCULL_control*>(this));
 
-	// There is no shader interpreter on Metal, so the pipeline cache is always preloaded (every shader mode behaves
-	// like the async recompiler).
-	const u64 preload_start_us = get_system_time();
+	// Sampler fallbacks for program::bind(): created once here (render device is up) so no
+	// draw ever creates them lazily on the RSX thread and a dead sampler ID can always be
+	// substituted with a live one instead of faulting the driver in setSamplerState.
+	mtl::glsl::precache_fallback_samplers();
+
+	// The always-on sampler-write ring feeds the crash report: a driver fault in
+	// setSamplerState then names the exact pre-crash writes with no env var set.
+	thread_ctrl::add_fatal_context_provider(&mtl::glsl::sampler_write_section);
+
+	rsx_log.notice("Metal: render pass policy: the draw pass ends at every RSX surface change and at full-frame clears, which "
+		"become load actions of the next pass attaching the surfaces (or clear-only passes); scissored and masked clears are "
+		"drawn in the draw pass");
+
+	rsx_log.notice("Metal: depth bounds test: %s", m_device->caps().depth_bounds ? "in hardware (setDepthTestBounds)" :
+		"no hardware support (before Apple10), the fragment programs of the draws that use it perform it on their own fragment depth");
+
+	const auto shadermode = g_cfg.video.shadermode.get();
+	if (shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only)
 	{
-		mtl::autorelease_scope pool;
-
-		if (!m_overlay_manager)
-		{
-			m_frame->hide();
-			m_shaders_cache->load(nullptr);
-			m_frame->show();
-		}
-		else
-		{
-			rsx::shader_loading_dialog_native dlg(this);
-
-			// TODO: Handle window resize messages during loading
-			m_shaders_cache->load(&dlg);
-		}
+		// First: its uber pipeline is queued ahead of every background job and built at emulation priority, never
+		// waited for (talk 4: the uber shader first)
+		m_shader_interpreter.preload();
+	}
+	else
+	{
+		rsx_log.notice("Metal: shader mode \"%s\": the shader interpreter is not used.", shadermode);
 	}
 
-	const u64 preload_us = get_system_time() - preload_start_us;
-	rsx_log.notice("Metal: shader cache preload took %.1f ms", preload_us / 1000.);
-
-	// Saves every pipeline built so far to the pipeline archive (background thread)
-	mtl::on_pipeline_cache_preloaded();
+	if (shadermode == shader_mode::interpreter_only)
+	{
+		// "Interpreter only" compiles nothing up front, as on Vulkan
+		mtl::on_pipeline_cache_preloaded(true);
+	}
+	else
+	{
+		preload_shader_cache();
+	}
 }
 
 void MTLGSRender::on_exit()
 {
 	GSRender::on_exit();
-	mtl::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
+	mtl::destroy_pipe_compiler(); // Ensure no pending shaders being compiled; drops the preload tasks that did not run
+	m_prog_buffer->on_preload_interrupted(); // Unless it finished: the archive's first serializer is incomplete
 	mtl::flush_pipeline_archive_async(); // Start saving pending pipelines; render_device::destroy() waits (bounded)
 	zcull_ctrl.release();
 }
@@ -1232,6 +1479,8 @@ void MTLGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 
 	if (hard_sync)
 	{
+		mtl::wait_site_scope wait_site("hard sync (flush_command_queue)");
+
 		// wait for the latest instruction to execute
 		m_current_command_buffer->reset();
 
@@ -1277,20 +1526,95 @@ void MTLGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
 	m_current_command_buffer->begin();
 }
 
-bool MTLGSRender::release_GCM_label(u32 /*type*/, u32 /*address*/, u32 /*args*/)
+bool MTLGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 {
-	// Host GPU labels require writing guest memory from the GPU timeline (VK: vkCmdUpdateBuffer into a DMA block).
-	// Not supported by the Metal backend (backend_config.supports_host_gpu_labels = false).
-	ensure(!backend_config.supports_host_gpu_labels);
-	return false;
+	if (!backend_config.supports_host_gpu_labels)
+	{
+		return false;
+	}
+
+	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
+
+	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed())
+	{
+		// All texture loads already seen by the host GPU
+		// Wait for all previously submitted labels to be flushed
+		m_host_dma_ctrl->drain_label_queue();
+		return false;
+	}
+
+	const auto mapping = mtl::map_dma(address, 4);
+	const auto write_data = std::bit_cast<u32, be_t<u32>>(args);
+
+	if (!mapping.second || !mapping.second->is_host_import())
+	{
+		// Not a zero-copy block: a GPU write would land in a staging copy instead of guest memory.
+		// Take the L and try the fallback.
+		rsx_log.warning("Host label update at 0x%x was not possible.", address);
+		m_host_dma_ctrl->drain_label_queue();
+		return false;
+	}
+
+	if (!m_current_command_buffer)
+	{
+		// No recording list to order the GPU write against; fall back to the CPU path.
+		m_host_dma_ctrl->drain_label_queue();
+		return false;
+	}
+
+	const auto release_event_id = host_ctx->on_label_acquire();
+
+	// Stage the two GPU writes in the upload heap (fresh range per call: values must stay stable until the blit
+	// executes, so a reused slot would race; scratch buffers are device-private and cannot be CPU-mapped).
+	auto upload_heap = mtl::get_upload_heap();
+	const auto staging_off = upload_heap->alloc<16>(16);
+	auto staging_ptr = static_cast<u8*>(upload_heap->map(staging_off, 16));
+	std::memcpy(staging_ptr, &write_data, 4);
+	const u64 complete_event = release_event_id;
+	std::memcpy(staging_ptr + 8, &complete_event, 8);
+	upload_heap->unmap();
+
+	const auto complete_off = ::offset32(&rsx::host_gpu_context_t::commands_complete_event);
+	auto encoder = m_current_command_buffer->blit({
+		mtl::read_buffer(upload_heap->heap.get(), staging_off, 16),
+		mtl::write_buffer(mapping.second, mapping.first, 4),
+		mtl::write_buffer(m_host_object_data.get(), complete_off, 8),
+	});
+	encoder->copyFromBuffer(upload_heap->value(), staging_off, mapping.second->value(), mapping.first, 4);
+	encoder->copyFromBuffer(upload_heap->value(), staging_off + 8, m_host_object_data->value(), complete_off, 8);
+
+	host_ctx->on_label_release();
+
+	// Submit so the label (and its completion event) actually advances on the GPU timeline; the hazard tracker
+	// above ordered the blits after all earlier GPU work, including texture loads.
+	flush_command_queue();
+	return true;
 }
 
-void MTLGSRender::on_guest_texture_read(mtl::command_list& /*cmd*/)
+void MTLGSRender::on_guest_texture_read(mtl::command_list& cmd)
 {
 	if (!backend_config.supports_host_gpu_labels)
 	{
 		return;
 	}
+
+	// Queue a sync update on the CB doing the load
+	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
+	const auto event_id = host_ctx->on_texture_load_acquire();
+
+	// Fresh upload-heap range per call (same stability reason as release_GCM_label above)
+	auto upload_heap = mtl::get_upload_heap();
+	const auto staging_off = upload_heap->alloc<8>(8);
+	const u64 storage = event_id;
+	std::memcpy(upload_heap->map(staging_off, 8), &storage, 8);
+	upload_heap->unmap();
+
+	const auto complete_off = ::offset32(&rsx::host_gpu_context_t::texture_load_complete_event);
+	auto encoder = cmd.blit({
+		mtl::read_buffer(upload_heap->heap.get(), staging_off, 8),
+		mtl::write_buffer(m_host_object_data.get(), complete_off, 8),
+	});
+	encoder->copyFromBuffer(upload_heap->value(), staging_off, m_host_object_data->value(), complete_off, 8);
 }
 
 void MTLGSRender::write_barrier(u32 address, u32 range)
@@ -1357,6 +1681,7 @@ void MTLGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_h
 		// Unavoidable hard sync coming up, flush immediately
 		// This heavyweight hint should be used with caution
 		std::lock_guard lock(m_flush_queue_mutex);
+		mtl::pass_context_scope context(mtl::pass_context::query);
 		flush_command_queue();
 
 		if (m_flush_requests.pending())
@@ -1394,6 +1719,7 @@ void MTLGSRender::do_local_task(rsx::FIFO::state state)
 		{
 			// TODO: Determine if a hard sync is necessary
 			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
+			mtl::pass_context_scope context(mtl::pass_context::readback);
 			flush_command_queue();
 
 			m_flush_requests.clear_pending_flag();
@@ -1459,7 +1785,12 @@ bool MTLGSRender::load_program()
 		m_pipeline_properties.state.topology_class == topology_class &&
 		m_pipeline_renderpass_key == m_current_renderpass_key)
 	{
-		return true;
+		if (!m_shader_interpreter.is_interpreter(m_program)) [[likely]]
+		{
+			return true;
+		}
+
+		// Interpreted: the recompiled pipeline (or the interpreter pipeline specialized for the program) may be ready
 	}
 
 	auto &vertex_program = current_vertex_program;
@@ -1482,7 +1813,7 @@ bool MTLGSRender::load_program()
 		m_graphics_state.clear(rsx::pipeline_state::pipeline_config_dirty);
 		m_pipeline_renderpass_key = m_current_renderpass_key;
 
-		if (m_program && m_pipeline_properties == properties)
+		if (m_program && !m_shader_interpreter.is_interpreter(m_program) && m_pipeline_properties == properties)
 		{
 			// Nothing changed
 			return true;
@@ -1500,9 +1831,22 @@ bool MTLGSRender::load_program()
 	m_vertex_prog = nullptr;
 	m_fragment_prog = nullptr;
 
+	const bool use_interpreter = (shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only);
+	const auto get_interpreter_program = [&]()
+	{
+		return m_shader_interpreter.get(m_pipeline_properties, fragment_program, current_fp_metadata, m_fp_ucode_hash,
+			vertex_program, current_vp_metadata, m_vp_ucode_hash);
+	};
+
+	// "Interpreter only": the interpreter draws what it can render exactly. Programs it cannot (see
+	// shader_interpreter::get) and render states whose interpreter pipeline failed are compiled asynchronously.
+	m_program = (shadermode == shader_mode::interpreter_only) ? get_interpreter_program() : nullptr;
+	const bool use_recompiler = !m_program &&
+		!(shadermode == shader_mode::interpreter_only && m_shader_interpreter.get_skip_reason() == mtl::shader_interpreter::skip_reason::not_ready);
+
 	mtl::enter_uninterruptible();
 
-	if (g_cfg.video.debug_overlay)
+	if (g_cfg.video.debug_overlay && use_recompiler)
 	{
 		m_frame_stats.program_cache_lookups_total += 2;
 		if (m_program_cache_hint.has_fragment_program())
@@ -1518,20 +1862,36 @@ bool MTLGSRender::load_program()
 	// Sampled before the lookup: a compile finishing after the lookup changes it (see the wait below)
 	u32 completed_compiles = mtl::pipe_compiler::get_completed_job_count();
 
-	// Load current program from cache. The shader interpreter is not ported: every non-recompiler mode compiles
-	// asynchronously and skips draws until the pipeline is ready.
-	std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
-		&m_program_cache_hint,
-		vertex_program,
-		fragment_program,
-		m_pipeline_properties,
-		shadermode != shader_mode::recompiler, true);
+	// Load current program from cache. Every mode but the recompiler compiles asynchronously.
+	if (use_recompiler)
+	{
+		std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
+			&m_program_cache_hint,
+			vertex_program,
+			fragment_program,
+			m_pipeline_properties,
+			shadermode != shader_mode::recompiler, true);
+	}
 
-	// The pipeline is being compiled on a worker. Without an interpreter the draw would be skipped: wait a little for
-	// it (compiles typically take a few ms on Apple silicon), within a per-frame budget so a burst of new shaders costs
-	// at most a short hitch. A pipeline that failed to build is never waited for.
-	if (!m_program && shadermode != shader_mode::recompiler && !m_prog_buffer->check_pipeline_failed() &&
-		m_async_compile_wait_spent_us < async_compile_wait_budget_us)
+	// The pipeline is being compiled on a worker: wait a little for it, within a per-frame budget so a burst of new
+	// shaders costs at most a short hitch. A pipeline that failed to build is never waited for, and neither is one whose
+	// shaders have no MTLLibrary yet: a shader that is new to this session was not in the shader cache either, so its
+	// MSL is compiled from scratch, which takes far longer than the budget (the pipelines of a burst arrive 90-700 ms
+	// after their first draws). Those draws are drawn by the shader interpreter, or skipped. A pipeline of already
+	// compiled shaders is the case that can finish within the budget: a full-state pipeline the pipeline archive holds,
+	// or the unspecialized pipeline of a new fixed state (built from the existing libraries, often found in the archive)
+	// plus its specialization. A new colour attachment configuration of shaders whose unspecialized pipeline exists
+	// never gets here: get_graphics_pipeline creates it by specialization right away (MTLPipelineCompiler.h). The
+	// libraries are read without the shaders' compile lock: a stale answer only moves the wait to the next draw that
+	// needs it.
+	const auto shaders_compiled = [&]()
+	{
+		return m_vertex_prog->handle->is_compiled() &&
+			(!m_pipeline_properties.state.rasterization_enabled || m_fragment_prog->handle->is_compiled());
+	};
+
+	if (use_recompiler && !m_program && shadermode != shader_mode::recompiler && !m_prog_buffer->check_pipeline_failed() &&
+		m_async_compile_wait_spent_us < async_compile_wait_budget_us && shaders_compiled())
 	{
 		const u64 wait_start = get_system_time();
 
@@ -1572,6 +1932,33 @@ bool MTLGSRender::load_program()
 		m_pipeline_wait_us += waited_us;
 		mtl::enter_uninterruptible();
 	}
+	else if (use_recompiler && !m_program && shadermode == shader_mode::recompiler && !m_prog_buffer->check_pipeline_failed())
+	{
+		// "Recompiler" never skips a draw for a compile. A synchronous lookup only finds a pipeline pending when a shader
+		// cache preload task is building it on a worker (MTLProgramBuffer.h): wait for that build like for any synchronous
+		// compile, but stay stoppable.
+		const u64 wait_start = get_system_time();
+		mtl::leave_uninterruptible();
+
+		while (!m_program && !m_prog_buffer->check_pipeline_failed() && !is_stopped())
+		{
+			// Woken by every finished compile; the timeout only bounds the stop check
+			mtl::pipe_compiler::wait_for_completed_job(completed_compiles, 50'000);
+			completed_compiles = mtl::pipe_compiler::get_completed_job_count();
+
+			mtl::enter_uninterruptible();
+			std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
+				&m_program_cache_hint,
+				vertex_program,
+				fragment_program,
+				m_pipeline_properties,
+				false, true);
+			mtl::leave_uninterruptible();
+		}
+
+		m_pipeline_wait_us += get_system_time() - wait_start;
+		mtl::enter_uninterruptible();
+	}
 
 	mtl::leave_uninterruptible();
 
@@ -1587,22 +1974,68 @@ bool MTLGSRender::load_program()
 		}
 	}
 
-	if (!m_program &&
-		(shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only))
+	if (!m_program && shadermode == shader_mode::async_with_interpreter)
 	{
-		// Streaming games hit uncompiled pipelines in bursts long after boot; a single boot-time
-		// warning leaves later flicker unexplained. Explain again at most once per 30 s.
-		const u64 now = get_system_time();
-		if (!m_interpreter_warning_logged || now - m_interpreter_warning_time >= 30'000'000)
+		// The pipeline is compiling (or failed): the interpreter draws meanwhile. Hand-over is the next draw that finds
+		// the recompiled pipeline ready.
+		m_program = get_interpreter_program();
+
+		// Programs the interpreter cannot run (or not exactly): the depth bounds test, registers read at another
+		// precision than written, some texture setups. Skipping them dropped whole passes until their pipeline was
+		// built: in God of War Ascension the lights (depth bounds) left characters black, and geometry popped in.
+		// Wait for the recompiled pipeline instead, at the front of the compile queue, bounded per draw and per frame
+		// so a burst of new shaders costs a hitch, never a freeze. The pipeline archive keeps them for later sessions.
+		if (!m_program && use_recompiler && m_vertex_prog && m_fragment_prog && !m_prog_buffer->check_pipeline_failed())
 		{
-			m_interpreter_warning_logged = true;
-			m_interpreter_warning_time = now;
-			rsx_log.warning("Metal: shader interpreter unavailable, skipping draws until pipelines finish compiling.");
+			const auto reason = m_shader_interpreter.get_skip_reason();
+			if ((reason == mtl::shader_interpreter::skip_reason::unsupported || reason == mtl::shader_interpreter::skip_reason::inexact) &&
+				m_unsupported_wait_spent_us < unsupported_wait_frame_budget_us)
+			{
+				const u64 wait_start = get_system_time();
+				mtl::pipe_compiler::prioritize_jobs(m_vertex_prog->handle, m_fragment_prog->handle);
+
+				while (!m_program && !m_prog_buffer->check_pipeline_failed() && !is_stopped())
+				{
+					const u64 spent = get_system_time() - wait_start;
+					if (spent >= unsupported_wait_draw_budget_us || m_unsupported_wait_spent_us + spent >= unsupported_wait_frame_budget_us)
+					{
+						break;
+					}
+
+					mtl::pipe_compiler::wait_for_completed_job(completed_compiles,
+						std::min(unsupported_wait_draw_budget_us - spent, unsupported_wait_frame_budget_us - m_unsupported_wait_spent_us - spent));
+					completed_compiles = mtl::pipe_compiler::get_completed_job_count();
+
+					mtl::enter_uninterruptible();
+					std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
+						&m_program_cache_hint,
+						vertex_program,
+						fragment_program,
+						m_pipeline_properties,
+						true, true);
+					mtl::leave_uninterruptible();
+				}
+
+				const u64 waited_us = get_system_time() - wait_start;
+				m_unsupported_wait_spent_us += waited_us;
+				m_pipeline_wait_us += waited_us;
+			}
 		}
 	}
 
 	if (m_program)
 	{
+		const bool interpreted = m_shader_interpreter.is_interpreter(m_program);
+		if (interpreted != m_interpreter_bound)
+		{
+			// Switching between the interpreter and recompiled programs: the interpreter reads all transform constants
+			// (recompiled programs a packed subset) and has the fragment constants in its instruction block
+			m_graphics_state |= interpreted ? rsx::pipeline_state::transform_constants_dirty :
+				(rsx::pipeline_state::transform_constants_dirty | rsx::pipeline_state::fragment_constants_dirty);
+			m_interpreter_state = interpreted ? static_cast<u32>(rsx::pipeline_state::invalidate_pipeline_bits) : 0u;
+			m_interpreter_bound = interpreted;
+		}
+
 		std::tie(m_vs_binding_table, m_fs_binding_table) = get_binding_table();
 	}
 	else
@@ -1612,6 +2045,10 @@ bool MTLGSRender::load_program()
 
 		// The draw is skipped (telemetry, MTLPresent.cpp)
 		m_skipped_draws++;
+		if (use_interpreter)
+		{
+			m_interpreter_skips[static_cast<u32>(m_shader_interpreter.get_skip_reason())]++;
+		}
 	}
 
 	return m_program != nullptr;
@@ -1627,6 +2064,7 @@ void MTLGSRender::load_program_env()
 	const auto& ctx = REGS(m_ctx);
 
 	const u32 fragment_constants_size = current_fp_metadata.program_constants_buffer_length;
+	const bool is_interpreter = m_shader_interpreter.is_interpreter(m_program);
 
 	const bool update_transform_constants = !!(m_graphics_state & rsx::pipeline_state::transform_constants_dirty);
 	const bool update_fragment_constants = !!(m_graphics_state & rsx::pipeline_state::fragment_constants_dirty);
@@ -1673,7 +2111,8 @@ void MTLGSRender::load_program_env()
 			return std::make_pair(m_instancing_buffer_ring_info.map(constants_data_table_offset, size), size);
 		});
 
-		m_draw_processor.fill_constants_instancing_buffer(indirection_table_buf, constants_array_buf, m_vertex_prog);
+		// The interpreter reads every constant (no program: full upload)
+		m_draw_processor.fill_constants_instancing_buffer(indirection_table_buf, constants_array_buf, is_interpreter ? nullptr : m_vertex_prog);
 		m_instancing_buffer_ring_info.unmap();
 
 		m_instancing_indirection_buffer_info = { m_instancing_buffer_ring_info.heap.get(), indirection_table_offset, indirection_table_buf.size() };
@@ -1699,9 +2138,9 @@ void MTLGSRender::load_program_env()
 		}
 	}
 
-	if (update_fragment_constants)
+	if (update_fragment_constants && !is_interpreter)
 	{
-		// Fragment constants
+		// Fragment constants (the interpreter reads them from its instruction block)
 		if (fragment_constants_size)
 		{
 			m_fragment_constants_dynamic_offset = m_fragment_constants_allocator->alloc_bytes(fragment_constants_size);
@@ -1743,6 +2182,43 @@ void MTLGSRender::load_program_env()
 		m_graphics_state.clear(rsx::pipeline_state::polygon_stipple_pattern_dirty);
 	}
 
+	if (is_interpreter)
+	{
+		// Instruction blocks, uploaded when the program or its state changed (the fragment program also when its
+		// embedded constants may have been updated). Only the latest block of each ring is in use.
+		if ((m_interpreter_state & (rsx::pipeline_state::vertex_program_dirty | rsx::pipeline_state::fragment_program_state_dirty)) ||
+			!m_vertex_instructions_buffer_info.buffer)
+		{
+			// Header (the two-sided lighting flag follows the fragment program state) + microcode
+			const u32 vp_block_length = mtl::interpreter::vertex_header_size + current_vp_metadata.ucode_length;
+			const usz vp_offset = m_vertex_instructions_buffer.alloc<256>(vp_block_length);
+			auto vp_buf = m_vertex_instructions_buffer.map<u8>(vp_offset, vp_block_length);
+
+			m_shader_interpreter.write_vertex_header(vp_buf, current_vertex_program, ctx->two_side_light_en());
+			std::memcpy(vp_buf + mtl::interpreter::vertex_header_size, current_vertex_program.data.data(), current_vp_metadata.ucode_length);
+
+			m_vertex_instructions_buffer_info = { m_vertex_instructions_buffer.heap.get(), vp_offset, vp_block_length };
+		}
+
+		if ((m_interpreter_state & rsx::pipeline_state::fragment_program_dirty) || update_fragment_constants ||
+			!m_fragment_instructions_buffer_info.buffer)
+		{
+			const u32 fp_block_length = mtl::interpreter::fragment_header_size + current_fragment_program.ucode_length;
+			const usz fp_offset = m_fragment_instructions_buffer.alloc<256>(fp_block_length);
+			auto fp_buf = m_fragment_instructions_buffer.map<u8>(fp_offset, fp_block_length);
+
+			m_shader_interpreter.write_fragment_header(fp_buf, current_fragment_program, ctx->shader_control());
+			std::memcpy(fp_buf + mtl::interpreter::fragment_header_size, current_fragment_program.get_data(), current_fragment_program.ucode_length);
+
+			m_fragment_instructions_buffer_info = { m_fragment_instructions_buffer.heap.get(), fp_offset, fp_block_length };
+		}
+
+		m_interpreter_state = 0;
+
+		// Telemetry (MTLPresent.cpp)
+		m_interpreter_draws++;
+	}
+
 	// Rings are bound whole; the shaders index them with the dynamic offsets packed into the vertex layout entry.
 	// Bindings are rebuilt on every call since a ring may have swapped its backing buffer (growth).
 	const auto whole_heap = [](const mtl::data_heap& heap)
@@ -1761,7 +2237,12 @@ void MTLGSRender::load_program_env()
 		m_program->bind_uniform(whole_heap(m_transform_constants_ring_info), mtl::glsl::binding_set_index_vertex, m_vs_binding_table->cbuf_location);
 	}
 
-	if (m_fs_binding_table->cbuf_location != umax)
+	if (is_interpreter)
+	{
+		m_program->bind_uniform(m_vertex_instructions_buffer_info, mtl::glsl::binding_set_index_vertex, mtl::interpreter::vertex_instructions_location);
+		m_program->bind_uniform(m_fragment_instructions_buffer_info, mtl::glsl::binding_set_index_fragment, mtl::interpreter::fragment_instructions_location);
+	}
+	else if (m_fs_binding_table->cbuf_location != umax)
 	{
 		m_program->bind_uniform(whole_heap(m_fragment_constants_ring_info), mtl::glsl::binding_set_index_fragment, m_fs_binding_table->cbuf_location);
 	}
@@ -1792,6 +2273,7 @@ void MTLGSRender::load_program_env()
 
 	if (update_fragment_constants)
 	{
+		// Also for the interpreter: its instruction block was uploaded above
 		handled_flags |= rsx::pipeline_state::fragment_constants_dirty;
 	}
 
@@ -1800,18 +2282,32 @@ void MTLGSRender::load_program_env()
 
 std::pair<const MTLGSRender::vs_binding_table_t*, const MTLGSRender::fs_binding_table_t*> MTLGSRender::get_binding_table() const
 {
-	ensure(m_program && m_vertex_prog && m_fragment_prog);
+	ensure(m_program);
+
+	if (m_shader_interpreter.is_interpreter(m_program))
+	{
+		const auto [vs, fs] = m_shader_interpreter.get_shaders();
+		ensure(vs && fs, "Invalid interpreter configuration");
+		return { &vs->binding_table, &fs->binding_table };
+	}
+
+	ensure(m_vertex_prog && m_fragment_prog);
 	return { &m_vertex_prog->binding_table, &m_fragment_prog->binding_table };
 }
 
 bool MTLGSRender::is_current_program_interpreted() const
 {
-	// No shader interpreter on Metal
-	return false;
+	return m_program && m_shader_interpreter.is_interpreter(m_program);
 }
 
 std::pair<std::string, std::string> MTLGSRender::get_programs() const
 {
+	if (is_current_program_interpreted())
+	{
+		const auto [vs, fs] = m_shader_interpreter.get_shaders();
+		return { vs->shader.get_source(), fs->shader.get_source() };
+	}
+
 	return
 	{
 		m_vertex_prog ? m_vertex_prog->shader.get_source() : std::string{},
@@ -1821,7 +2317,9 @@ std::pair<std::string, std::string> MTLGSRender::get_programs() const
 
 void MTLGSRender::upload_transform_constants(const rsx::io_buffer& buffer)
 {
-	const usz transform_constants_size = m_vertex_prog->has_indexed_constants ? 8192 : m_vertex_prog->constant_ids.size() * 16;
+	// The interpreter reads every constant
+	const bool is_interpreter = m_shader_interpreter.is_interpreter(m_program);
+	const usz transform_constants_size = (is_interpreter || m_vertex_prog->has_indexed_constants) ? 8192 : m_vertex_prog->constant_ids.size() * 16;
 
 	if (transform_constants_size)
 	{
@@ -1883,6 +2381,11 @@ void MTLGSRender::update_vertex_env(u32 id, const mtl::vertex_upload_info& verte
 	const u32 push_val = vertex_layout_offset + id;
 	m_program->push_constants(mtl::glsl::binding_set_index_vertex, 0, 4, &push_val);
 
+	// Fragment programs read their ring offsets from push constants (uniform), see MTLFragmentProgram::draw_offsets_push_offset
+	const u32 fs_draw_offsets[4] = { fs_constant_id_offset, fs_context_offset, fs_texture_base_index, fs_stipple_pattern_offset };
+	m_program->push_constants(mtl::glsl::binding_set_index_fragment,
+		MTLFragmentProgram::draw_offsets_push_offset, MTLFragmentProgram::draw_offsets_push_size, fs_draw_offsets);
+
 	if (current_fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING)
 	{
 		// TODO: This should be cached aggressively.
@@ -1900,11 +2403,20 @@ void MTLGSRender::update_vertex_env(u32 id, const mtl::vertex_upload_info& verte
 		m_program->push_constants(mtl::glsl::binding_set_index_fragment, 4, 28, blend_config);
 	}
 
-	if (m_fragment_prog && m_fragment_prog->requires_lod_bias)
+	if (m_shader_interpreter.is_interpreter(m_program) ? m_shader_interpreter.requires_lod_bias() : (m_fragment_prog && m_fragment_prog->requires_lod_bias))
 	{
 		// Shader-side sampler LOD bias (samplers can't apply it before Apple10), see MTLFragmentProgram::requires_lod_bias
 		m_program->push_constants(mtl::glsl::binding_set_index_fragment,
 			MTLFragmentProgram::lod_bias_push_offset, MTLFragmentProgram::lod_bias_push_size, m_fs_lod_bias.data());
+	}
+
+	if (draw_reads_depth_bounds())
+	{
+		// Depth bounds test in the fragment program (MTLFragmentProgram::depth_bounds_push_offset)
+		const auto [bounds_min, bounds_max] = get_clamped_depth_bounds();
+		const f32 depth_bounds[2] = { bounds_min, bounds_max };
+		m_program->push_constants(mtl::glsl::binding_set_index_fragment,
+			MTLFragmentProgram::depth_bounds_push_offset, MTLFragmentProgram::depth_bounds_push_size, depth_bounds);
 	}
 
 	// Now actually fill in the data
@@ -1922,14 +2434,17 @@ void MTLGSRender::update_vertex_env(u32 id, const mtl::vertex_upload_info& verte
 
 void MTLGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32 count)
 {
-	if (!m_program || !m_vertex_prog)
+	// The interpreter reads every constant ("Interpreter only" has no recompiled vertex program)
+	const bool is_interpreter = m_shader_interpreter.is_interpreter(m_program);
+
+	if (!m_program || (!is_interpreter && !m_vertex_prog))
 	{
 		// Shouldn't be reachable, but handle it correctly anyway
 		m_graphics_state |= rsx::pipeline_state::transform_constants_dirty;
 		return;
 	}
 
-	if (!m_vertex_prog->overlaps_constants_range(index, count))
+	if (!is_interpreter && !m_vertex_prog->overlaps_constants_range(index, count))
 	{
 		// Nothing meaningful to us
 		return;
@@ -1978,7 +2493,7 @@ void MTLGSRender::close_and_submit_command_buffer(const mtl::submit_info_t& subm
 	}
 
 	// End any active renderpasses; the caller should handle reopening
-	close_render_pass();
+	close_render_pass(mtl::pass_end_reason::submit);
 
 	// End open queries. Flags will be automatically reset by the submit routine
 	if (m_current_command_buffer->flags & mtl::command_list::cb_has_open_query)
@@ -1996,6 +2511,9 @@ void MTLGSRender::close_and_submit_command_buffer(const mtl::submit_info_t& subm
 	m_current_command_buffer->clear_flags();
 	m_render_pass.reset();
 
+	m_draws_since_submit = 0;
+	m_last_submit_us = get_system_time();
+
 	m_queue_status.clear(flush_queue_state::flushing);
 }
 
@@ -2009,6 +2527,8 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		set_scissor(clipped_scissor);
 		return;
 	}
+
+	mtl::pass_context_scope pass_context(mtl::pass_context::surface_setup);
 
 	m_graphics_state.clear(
 		rsx::rtt_config_dirty |
@@ -2042,6 +2562,39 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	const auto color_bpp = get_format_block_size_in_bytes(m_framebuffer_layout.color_format);
 	const auto samples = get_format_sample_count(m_framebuffer_layout.aa_mode);
 
+	// A surface the new layout binds again over the same memory gets its section locked again below
+	// (lock_memory_region), whose create() drops a synchronized readback of it (stale: the surface keeps being rendered
+	// to). Recording that readback now would only cost a copy and end the draw pass that keeps rendering into the
+	// surface. Without it the section stays unsynchronized: a guest access faults and flushes the current contents.
+	const auto rebound = [&](const utils::address_range32& range, bool depth)
+	{
+		rsx::gcm_framebuffer_info info{};
+		info.width = m_framebuffer_layout.width;
+		info.height = m_framebuffer_layout.height;
+
+		if (depth)
+		{
+			info.address = m_framebuffer_layout.zeta_address;
+			info.pitch = m_framebuffer_layout.actual_zeta_pitch;
+			info.bpp = get_format_block_size_in_bytes(m_framebuffer_layout.depth_format);
+			return info.address == range.start && info.pitch && info.get_memory_range(m_framebuffer_layout.aa_factors) == range;
+		}
+
+		for (const u8 index : rsx::utility::get_rtt_indexes(m_framebuffer_layout.target))
+		{
+			info.address = m_framebuffer_layout.color_addresses[index];
+			info.pitch = m_framebuffer_layout.actual_color_pitch[index];
+			info.bpp = color_bpp;
+
+			if (info.address == range.start && info.pitch && info.get_memory_range(m_framebuffer_layout.aa_factors) == range)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
+
 	for (u8 i = 0; i < rsx::limits::color_buffers_count; ++i)
 	{
 		// Flush old address if we keep missing it
@@ -2049,7 +2602,15 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		{
 			const utils::address_range32 rsx_range = m_surface_info[i].get_memory_range();
 			m_texture_cache.set_memory_read_flags(rsx_range, rsx::memory_read_flags::flush_once);
-			m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, rsx_range);
+
+			if (!rebound(rsx_range, false))
+			{
+				m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, rsx_range);
+			}
+			else
+			{
+				mtl::count_pass_event(mtl::pass_event::readback_not_speculated);
+			}
 		}
 
 		m_surface_info[i].address = m_surface_info[i].pitch = 0;
@@ -2066,7 +2627,15 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		{
 			const utils::address_range32 surface_range = m_depth_surface_info.get_memory_range();
 			m_texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
-			m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
+
+			if (!rebound(surface_range, true))
+			{
+				m_texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
+			}
+			else
+			{
+				mtl::count_pass_event(mtl::pass_event::readback_not_speculated);
+			}
 		}
 
 		m_depth_surface_info.address = m_depth_surface_info.pitch = 0;
@@ -2229,7 +2798,19 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	if (fbo_changed)
 	{
 		// The active pass renders into the previous surface set
-		close_render_pass();
+		close_render_pass(mtl::pass_end_reason::framebuffer_change);
+
+		// RPCS3 Metal fork: the pass ends here anyway, so submitting costs no extra attachment store/load. Hand the GPU
+		// what was recorded once it is worth it (>= 1.5 ms since the last submit, >= 64 draws): otherwise it idles until
+		// the next flush, and a readback (Write Color Buffers) or zcull read then waits for the whole batch at once.
+		// God of War: Ascension: GPU 74% busy while the RSX thread waited ~6 ms per frame for it in ~2 waits.
+		if (m_draws_since_submit >= 64 && get_system_time() - m_last_submit_us >= 1500 &&
+			!(m_queue_status & flush_queue_state::flushing) && m_flush_queue_mutex.try_lock())
+		{
+			flush_command_queue();
+			m_flush_queue_mutex.unlock();
+			m_early_submits++;
+		}
 
 		m_draw_fbo = fbo;
 		update_render_pass_descriptor();
@@ -2265,6 +2846,7 @@ bool MTLGSRender::scaled_image_from_memory(const rsx::blit_src_info& src, const 
 		return false;
 
 	mtl::autorelease_scope pool;
+	mtl::pass_context_scope context(mtl::pass_context::blit);
 
 	if (m_texture_cache.blit(src, dst, interpolate, m_rtts, *m_current_command_buffer))
 	{
@@ -2332,6 +2914,7 @@ bool MTLGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_inf
 
 void MTLGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* query)
 {
+	mtl::wait_site_scope wait_site("zcull report read");
 	auto &data = m_occlusion_map[query->driver_handle];
 	if (data.indices.empty())
 		return;
@@ -2341,6 +2924,7 @@ void MTLGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
 		if (data.is_current(m_current_command_buffer))
 		{
 			std::lock_guard lock(m_flush_queue_mutex);
+			mtl::pass_context_scope context(mtl::pass_context::query);
 			flush_command_queue();
 
 			if (m_flush_requests.pending())
@@ -2425,6 +3009,7 @@ void MTLGSRender::begin_conditional_rendering(const std::vector<rsx::reports::oc
 	}
 
 	mtl::autorelease_scope pool;
+	mtl::pass_context_scope context(mtl::pass_context::query);
 
 	u32 dst_offset = 0;
 	u32 num_hw_queries = 0;
@@ -2439,7 +3024,7 @@ void MTLGSRender::begin_conditional_rendering(const std::vector<rsx::reports::oc
 		num_hw_queries += ::size32(query_info.indices);
 	}
 
-	// NOTE: Every GPU read of visibility results goes through cmd.compute(), which ends the active render pass.
+	// NOTE: Every GPU read of visibility results is a compute encoder command, which ends the active render pass.
 	// Metal only writes visibility results when a pass completes, so this split is unavoidable.
 	if (num_hw_queries == 1 && !partial_eval) [[ likely ]]
 	{
@@ -2530,7 +3115,7 @@ void MTLGSRender::begin_conditional_rendering(const std::vector<rsx::reports::oc
 			ensure(dst_offset > mtl::query_pool::slot_size);
 
 			// Clear result to zero
-			m_current_command_buffer->compute()->fillBuffer(m_cond_render_buffer->value(), NS::Range::Make(0, 4), 0);
+			m_current_command_buffer->blit({ mtl::write_buffer(m_cond_render_buffer.get(), 0, 4) })->fillBuffer(m_cond_render_buffer->value(), NS::Range::Make(0, 4), 0);
 		}
 
 		mtl::get_compute_task<mtl::cs_aggregator>()->run(*m_current_command_buffer, m_cond_render_buffer.get(), scratch, dst_offset / 4);

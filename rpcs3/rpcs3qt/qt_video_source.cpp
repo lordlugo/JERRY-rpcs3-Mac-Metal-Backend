@@ -4,11 +4,12 @@
 #include "qt_video_source.h"
 #include "gui_settings.h"
 
-#include "Loader/ISO.h"
+#include "Emu/iso_media_cache.h"
 
 #include <QAudioOutput>
 #include <QPropertyAnimation>
 #include <QFile>
+#include <QtConcurrent>
 
 struct qt_audio_instance
 {
@@ -45,19 +46,88 @@ qt_video_source::~qt_video_source()
 
 void qt_video_source::set_video_path(const std::string& video_path, bool video_in_archive)
 {
+	drop_archive_media();
 	m_video_path = QString::fromStdString(video_path);
 	m_video_in_archive = video_in_archive;
 }
 
 void qt_video_source::set_audio_path(const std::string& audio_path, bool audio_in_archive)
 {
+	drop_archive_media();
 	m_audio_path = QString::fromStdString(audio_path);
 	m_audio_in_archive = audio_in_archive;
 }
 
 void qt_video_source::set_iso_path(const std::string& iso_path)
 {
+	drop_archive_media();
 	m_iso_path = iso_path;
+}
+
+bool qt_video_source::load_archive_media()
+{
+	const bool video = m_video_in_archive && !m_video_path.isEmpty() && !m_iso_path.empty();
+	const bool audio = m_audio_in_archive && !m_audio_path.isEmpty() && !m_iso_path.empty();
+
+	if ((!video && !audio) || m_archive_media_state == archive_media_state::loaded)
+	{
+		return false;
+	}
+
+	if (m_archive_media_state == archive_media_state::loading)
+	{
+		return true;
+	}
+
+	// Parsing the ISO and reading a video of several MiB (through the raw device for a disc volume) would freeze the UI
+	m_archive_media_state = archive_media_state::loading;
+	m_archive_media_watcher = std::make_unique<QFutureWatcher<archive_media>>();
+
+	QObject::connect(m_archive_media_watcher.get(), &QFutureWatcherBase::finished, m_archive_media_watcher.get(), [this]()
+	{
+		m_archive_media = m_archive_media_watcher->result();
+		m_archive_media_state = archive_media_state::loaded;
+
+		// Still hovered or selected: start the preview requested while the files were being read
+		if (m_active)
+		{
+			start_movie();
+		}
+	});
+
+	m_archive_media_watcher->setFuture(QtConcurrent::run([iso_path = m_iso_path,
+		video_path = video ? m_video_path.toStdString() : std::string(),
+		audio_path = audio ? m_audio_path.toStdString() : std::string()]()
+	{
+		archive_media media{};
+
+		if (!video_path.empty())
+		{
+			media.first = iso_media_cache::read_file(iso_path, video_path);
+		}
+
+		if (!audio_path.empty())
+		{
+			media.second = iso_media_cache::read_file(iso_path, audio_path);
+		}
+
+		return media;
+	}));
+
+	return true;
+}
+
+void qt_video_source::drop_archive_media()
+{
+	if (m_archive_media_watcher)
+	{
+		// A read still running on its worker thread is left to finish there: its result is dropped with the watcher
+		m_archive_media_watcher->disconnect();
+		m_archive_media_watcher.release()->deleteLater();
+	}
+
+	m_archive_media_state = archive_media_state::none;
+	m_archive_media = {};
 }
 
 void qt_video_source::set_active(bool active)
@@ -112,15 +182,11 @@ void qt_video_source::init_movie()
 		}
 		else if (m_video_in_archive)
 		{
-			iso_archive archive(m_iso_path);
-			auto movie_file = archive.open(m_video_path.toStdString());
-			if (!movie_file) return;
+			// Read by load_archive_media()
+			const auto& movie_data = m_archive_media.first;
+			if (!movie_data) return;
 
-			const auto movie_size = movie_file->size();
-			if (movie_size == 0) return;
-
-			m_video_data = QByteArray(movie_size, 0);
-			movie_file->read(m_video_data.data(), movie_size);
+			m_video_data = QByteArray(reinterpret_cast<const char*>(movie_data->data()), ::narrow<qsizetype>(movie_data->size()));
 
 			m_video_buffer = std::make_unique<QBuffer>(&m_video_data);
 			m_video_buffer->open(QIODevice::ReadOnly);
@@ -157,15 +223,11 @@ void qt_video_source::init_movie()
 		}
 		else if (m_video_in_archive)
 		{
-			iso_archive archive(m_iso_path);
-			auto movie_file = archive.open(m_video_path.toStdString());
-			if (!movie_file) return;
+			// Read by load_archive_media()
+			const auto& movie_data = m_archive_media.first;
+			if (!movie_data) return;
 
-			const auto movie_size = movie_file->size();
-			if (movie_size == 0) return;
-
-			m_video_data = QByteArray(movie_size, 0);
-			movie_file->read(m_video_data.data(), movie_size);
+			m_video_data = QByteArray(reinterpret_cast<const char*>(movie_data->data()), ::narrow<qsizetype>(movie_data->size()));
 		}
 
 		if (m_video_data.isEmpty())
@@ -222,6 +284,13 @@ void qt_video_source::start_movie_timer()
 
 void qt_video_source::start_movie()
 {
+	if (load_archive_media())
+	{
+		// Called again when the files stored in the ISO have been read
+		m_active = true;
+		return;
+	}
+
 	init_movie();
 
 	if (m_movie)
@@ -256,6 +325,8 @@ void qt_video_source::stop_movie()
 	m_video_buffer.reset();
 	m_video_data.clear();
 
+	drop_archive_media();
+
 	stop_audio();
 }
 
@@ -280,16 +351,12 @@ void qt_video_source::start_audio()
 	}
 	else if (m_audio_in_archive)
 	{
-		iso_archive archive(m_iso_path);
-		auto audio_file = archive.open(m_audio_path.toStdString());
-		if (!audio_file) return;
-
-		const auto audio_size = audio_file->size();
-		if (audio_size == 0) return;
+		// Read by load_archive_media()
+		const auto& audio_data = m_archive_media.second;
+		if (!audio_data) return;
 
 		std::unique_ptr<QByteArray> old_audio_data = std::move(audio.data);
-		audio.data = std::make_unique<QByteArray>(audio_size, 0);
-		audio_file->read(audio.data->data(), audio_size);
+		audio.data = std::make_unique<QByteArray>(reinterpret_cast<const char*>(audio_data->data()), ::narrow<qsizetype>(audio_data->size()));
 
 		if (!audio.buffer)
 		{
@@ -433,7 +500,13 @@ void qt_video_source_wrapper::init_video_source()
 
 void qt_video_source_wrapper::set_iso_path(const std::string& iso_path)
 {
-	m_qt_video_source->set_iso_path(iso_path);
+	// Like the paths: the source is created and used on the main thread
+	Emu.CallFromMainThread([this, path = iso_path]()
+	{
+		init_video_source();
+
+		m_qt_video_source->set_iso_path(path);
+	});
 }
 
 void qt_video_source_wrapper::set_video_path(const std::string& video_path, bool video_in_archive)

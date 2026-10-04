@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mtlutils/commands.h"
+#include "mtlutils/spam_meter.h"
 #include "mtlutils/data_heap.h"
 #include "mtlutils/image.h"
 #include "MTLResourceManager.h"
@@ -24,11 +25,18 @@
 #define MTL_INDEX_RING_BUFFER_SIZE_M 16
 #define MTL_SCRATCH_RING_BUFFER_SIZE_M 16
 
-// Number of command lists in each ring. Every command list owns an MTL4CommandAllocator + 3 argument tables.
+// Number of command lists in each ring. Every command list owns an MTL4CommandBuffer + 3 argument tables; command memory
+// comes from the shared allocator pool (mtlutils/command_allocators.h) and is only held by recordings in flight.
 #define MTL_MAX_ASYNC_CB_COUNT 128
 
-// Number of frames that can be queued for presentation (matches CAMetalLayer.maximumDrawableCount)
+// Drawables of the CAMetalLayer (CAMetalLayer.maximumDrawableCount)
 #define MTL_MAX_DRAWABLE_COUNT 3
+
+// Frames the renderer may have in flight (recorded, rendering or waiting to be presented). Every queued frame is one more
+// frame between the game reading the controller and the picture showing it: 2 keeps the CPU and GPU overlapped (the RSX
+// records frame N+1 while the GPU renders and presents frame N) without a second frame waiting in line. The layer keeps
+// one drawable more than this, so presentation never waits for the compositor to release one.
+#define MTL_MAX_FRAMES_IN_FLIGHT 2
 
 #ifndef TEARDOWN_WAIT_TIMEOUT
 #define TEARDOWN_WAIT_TIMEOUT 5000000ull // 5 seconds: renderer destruction never blocks the UI thread forever on a hung GPU
@@ -72,11 +80,11 @@ namespace mtl
 
 	// Encoder state last applied to the renderer's main pass (invalidated whenever a pass is opened). Encoder state
 	// lasts for the whole pass, so update_draw_state() only sends what changed; anything else that sets one of these on
-	// the main pass (in-pass clears) must update or invalidate it.
+	// the main pass (in-pass clears) must update or invalidate it. The pipeline state and argument tables are tracked by
+	// the command list (command_list::render_bindings(), set by glsl::program::bind() only).
 	struct encoder_state
 	{
 		u64 pass_id = umax;
-		const MTL::RenderPipelineState* pipeline = nullptr;
 		const MTL::DepthStencilState* depth_stencil = nullptr;
 
 		bool rasterizer_valid = false; // cull_mode .. fill_mode below are set on the encoder
@@ -385,6 +393,7 @@ namespace mtl
 	{
 		atomic_t<u32> m_current_index = 0;
 		std::array<mtl::command_buffer_chunk, Count> m_cb_list;
+		spam_meter m_exhaustion_meter;
 
 	public:
 		command_buffer_chain() = default;
@@ -447,9 +456,11 @@ namespace mtl
 			const auto result_id = ++m_current_index % Count;
 			auto result = &m_cb_list[result_id];
 
-			if (!result->poke())
+			// Rate-limited: an undersized chain (or a stalled GPU) fires this every
+			// submission — 1126 identical lines in 60 s bury every other signal.
+			if (!result->poke() && m_exhaustion_meter.allow())
 			{
-				rsx_log.error("CB chain has run out of free entries!");
+				rsx_log.error("CB chain has run out of free entries! (%u total misses)", m_exhaustion_meter.count());
 			}
 
 			return result;

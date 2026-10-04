@@ -11,6 +11,7 @@
 #include "mtlutils/sampler.h"
 #include "mtlutils/sync.h"
 
+#include "MTLFrameInspector.h"
 #include "MTLGSRenderTypes.hpp"
 #include "MTLTextureCache.h"
 #include "MTLRenderTargets.h"
@@ -18,8 +19,10 @@
 #include "MTLProgramBuffer.h"
 #include "MTLRenderPass.h"
 #include "MTLQueryPool.h"
+#include "MTLShaderInterpreter.h"
 
 #include "Emu/RSX/GSRender.h"
+#include "Emu/RSX/Common/sync_wait_stats.hpp"
 
 #include <deque>
 #include <functional>
@@ -78,10 +81,16 @@ private:
 	std::array<std::unique_ptr<mtl::viewable_image>, 2> m_null_depth_textures;
 
 	std::unique_ptr<mtl::upscaler> m_upscaler;
+
+	// Graphics self-check: inspects presented frames and float render targets on the GPU, logs what looks broken
+	std::unique_ptr<mtl::frame_inspector> m_frame_inspector;
+	u64 m_frame_inspector_tag = 0; // Surfaces written after this shared tag are checked next
 	output_scaling_mode m_output_scaling{output_scaling_mode::bilinear};
 
 	std::unique_ptr<mtl::buffer> m_cond_render_buffer;
 	u64 m_cond_render_sync_tag = 0;
+
+	std::unique_ptr<mtl::buffer> m_host_object_data; // Host GPU label context (64 KiB, host_visible)
 
 	shared_mutex m_sampler_mutex;
 	atomic_t<bool> m_samplers_dirty = { true };
@@ -91,6 +100,16 @@ private:
 
 	std::unique_ptr<mtl::buffer_view> m_persistent_attribute_storage;
 	std::unique_ptr<mtl::buffer_view> m_volatile_attribute_storage;
+
+	// Shader interpreter (DESIGN.md §8): draws whose pipeline is compiling ("Async Recompiler with Shader Interpreter"),
+	// every draw it can render exactly ("Interpreter only")
+	mtl::shader_interpreter m_shader_interpreter;
+	mtl::data_heap m_vertex_instructions_buffer;     // Instruction blocks: header + microcode
+	mtl::data_heap m_fragment_instructions_buffer;
+	mtl::glsl::buffer_binding_info m_vertex_instructions_buffer_info{};
+	mtl::glsl::buffer_binding_info m_fragment_instructions_buffer_info{};
+	u32 m_interpreter_state = 0;       // Program state changes (pipeline_state bits) the instruction blocks lack
+	bool m_interpreter_bound = false;  // The last program loaded was the interpreter
 
 	std::pair<const vs_binding_table_t*, const fs_binding_table_t*> get_binding_table() const;
 
@@ -137,13 +156,35 @@ private:
 
 		u64 last_emu_flip_time = 0;         // get_system_time() of the previous guest flip
 		u64 blocked_time = 0;               // Presentation back-pressure (us) since the previous guest flip
+		u64 flip_blocked_start = 0;         // blocked_time when the current flip started
+		u32 catch_up_frames = 0;            // Telemetry: frames shown one refresh shorter to drain queued frames
 		std::array<f64, 16> guest_intervals{}; // Recent guest frame intervals without back-pressure (s), ring buffer
 		u32 guest_interval_count = 0;       // Valid entries in guest_intervals
 		u32 guest_interval_next = 0;        // Next write position in guest_intervals
+
+		// Downward probe (update_pacing_probe): while the measured interval paces the game slower than its frame limit,
+		// frames are paced at the frame limit for a moment now and then, to see whether the game keeps up
+		u64 probe_start_time = 0;           // get_system_time() when the running probe started (0: no probe running)
+		u32 probe_samples = 0;              // Guest frame intervals measured since the probe started
+		f64 probe_from_slot = 0.;           // Presentation slot (s) before the probe
+		u64 next_probe_time = 0;            // get_system_time() of the next probe (0: none scheduled)
+		u64 probe_backoff = 0;              // Delay between probes (us), doubled by every probe that finds no faster pace
+
 		f64 last_present_time = 0.;         // Media time of the previous present request
 		f64 min_duration = 0.;              // Last presentAfterMinimumDuration argument (0: unpaced present)
 		u32 slot_refreshes = 0;             // Last pacing slot in refreshes (0: unpaced or variable refresh)
 		u64 stats_time = 0;                 // Telemetry rate limit (get_system_time())
+
+		// Forgets the measured guest frame intervals and the probe state: pacing starts over at the frame limit
+		void reset_guest_intervals()
+		{
+			guest_interval_count = 0;
+			guest_interval_next = 0;
+			probe_start_time = 0;
+			probe_samples = 0;
+			next_probe_time = 0;
+			probe_backoff = 0;
+		}
 	} m_present_pacing;
 
 	// Occlusion queries (visibility result buffers)
@@ -228,6 +269,12 @@ private:
 
 	ullong m_last_cond_render_eval_hint = 0;
 
+	// Early submission at render pass boundaries (prepare_rtts): recorded work goes to the GPU every ~1.5 ms instead of
+	// waiting for the next flush, so the GPU starts sooner and a later readback/report waits for less
+	u32 m_draws_since_submit = 0;
+	u64 m_last_submit_us = 0;
+	u64 m_early_submits = 0;
+
 	// Offloader thread deadlock recovery
 	rsx::atomic_bitmask_t<flush_queue_state> m_queue_status;
 	utils::address_range32 m_offloader_fault_range;
@@ -240,29 +287,78 @@ private:
 	//Vertex layout
 	rsx::vertex_input_layout m_vertex_layout;
 
-	// Diagnostics (throttled, see load_program)
-	bool m_interpreter_warning_logged = false;
-	u64 m_interpreter_warning_time = 0;
-
-	// No shader interpreter on Metal: a draw whose pipeline is still compiling may wait for it, within a per-frame
-	// budget, instead of being skipped (missing geometry / flicker the first time an effect appears)
+	// A draw whose pipeline is still compiling may wait for it, within a per-frame budget, when its shaders are
+	// already compiled (see load_program)
 	static constexpr u64 async_compile_wait_budget_us = 8'000;
 	u64 m_async_compile_wait_spent_us = 0;
+	// Draws the shader interpreter cannot run wait for their recompiled pipeline (load_program), within these budgets
+	static constexpr u64 unsupported_wait_draw_budget_us = 40'000;  // Was 250 ms: up to 600 ms per frame showed as hitches (GTA IV)
+	static constexpr u64 unsupported_wait_frame_budget_us = 60'000;
+	u64 m_unsupported_wait_spent_us = 0;
 
 	// Pipeline telemetry, reported and reset with the presentation statistics (MTLPresent.cpp)
 	u32 m_skipped_draws = 0;      // Draws skipped because their pipeline was still compiling or could not be built
 	u64 m_pipeline_wait_us = 0;   // Time load_program() waited for pipelines that were being compiled
+	u32 m_interpreter_draws = 0;  // Draws drawn by the shader interpreter
+	std::array<u32, static_cast<u32>(mtl::shader_interpreter::skip_reason::count)> m_interpreter_skips{}; // Skipped draws by reason
+	u32 m_depth_bounds_draws = 0; // Draws whose fragment program performed the depth bounds test
+	u32 m_depth_copies = 0;       // Copies of the depth buffer made for shader reads during its pass (update_depth_copy)
+	u64 m_preload_notification_time = 0; // update_shader_preload_notification
+
+	// Shader reads of the draw's depth buffer read a copy of it, never the depth attachment of the pass they run in:
+	// texture units sampling the depth buffer the draw pass attaches (soft particles, fog, lights reconstructing
+	// positions) and depth compare emulation. (The depth bounds test without hardware support used to read it too;
+	// it now tests the fragment's own depth, so it makes no copy.) Metal does not define shader reads of a texture
+	// that is an attachment of the running render pass, and Apple GPUs do return wrong depth for some pixels of every
+	// tile then, even when the pass never changed depth. The copy is made outside the pass (update_depth_copy) and used for as long as the depth plane of its source
+	// is unchanged: `depth_tag` is the source's render_target::content_tag when the copy was made, carried along across
+	// the writes that leave depth alone (mark_attachment_writes); `stencil_tag` likewise for reads of the stencil plane.
+	// Anything else that changes the tag (depth writes, depth clears, transfers, memory initialization, recycling) makes
+	// the next such read copy again.
+	struct depth_copy_t
+	{
+		std::unique_ptr<mtl::viewable_image> image;
+		std::vector<std::unique_ptr<mtl::image_view>> views; // Views of `image` like the source's views texture units sample
+		const mtl::render_target* source = nullptr;          // Compared, never dereferenced (content tags are never reused)
+		u64 depth_tag = 0;   // source->content_tag for which the copy's depth plane is current
+		u64 stencil_tag = 0; // source->content_tag for which its stencil plane is current (stencil views, stencil mirrors)
+
+		// Feedback streak (MTLRenderTargets.h) of draws that read the copy and write depth: the next draws of the streak
+		// (same material key) keep reading it while only they wrote depth since, as their reads of the attachment
+		// memory did before: they see the depth from before the streak, the others see the streak's writes.
+		u64 streak_key = 0;
+		u64 streak_tag = 0;
+	};
+	depth_copy_t m_depth_copy;
+	bool m_draw_reads_depth_copy = false; // The current draw binds a view of m_depth_copy (bind_texture_env)
+	bool m_depth_bounds_notice_logged = false;
+	bool m_depth_bounds_relayout_done = false; // The layout was evaluated again for an active depth bounds test (begin)
+
+	// RSX thread time telemetry, reported and reset with the presentation statistics (MTLPresent.cpp): the flipped guest
+	// frames' rsx::frame_statistics_t, the time spent in flip() and the RSX/guest sync waits (rsx::g_sync_wait_stats)
+	struct rsx_time_stats_t
+	{
+		u32 frames = 0;                // Guest flips
+		u64 draw_calls = 0;
+		s64 setup_us = 0;
+		s64 vertex_upload_us = 0;
+		s64 texture_upload_us = 0;
+		s64 draw_exec_us = 0;
+		u64 flip_us = 0;               // flip()
+		u64 display_wait_us = 0;       // Waits for drawables and frame contexts (present_pacing_t::blocked_time)
+		rsx::sync_wait_snapshot waits; // rsx::g_sync_wait_stats when the window started
+	} m_rsx_time_stats;
+
+	// Resource usage telemetry (report_resource_usage)
+	u64 m_resource_report_time = 0;
 
 	bool m_wide_lines_warning_logged = false;
 	u64 m_wide_lines_warning_time = 0;
-	bool m_depth_bounds_warning_logged = false;
-	u64 m_depth_bounds_warning_time = 0;
 	bool m_logic_op_warning_logged = false;
 	bool m_flat_shading_warning_logged = false;
 	u64 m_feedback_draw_key = 0; // Material key of the current draw (feedback streaks, see MTLRenderTargets.h)
 	u64 m_fp_ucode_hash = 0;     // Instruction hashes (embedded constants excluded) of the current programs,
 	u64 m_vp_ucode_hash = 0;     // updated when the RSX reloads them
-	bool m_draw_reads_images_in_vertex_stage = false; // Current draw: its pass must order vertex after fragment work
 
 public:
 	u64 get_cycles() final;
@@ -287,15 +383,24 @@ private:
 
 	// Presentation pacing (MTLPresent.cpp)
 	void update_present_pacing(bool emu_flip);
+	void update_pacing_probe(u64 now);
+	f64 get_frame_limit_interval() const;
+	f64 get_measured_frame_interval() const;
 	f64 get_guest_frame_interval() const;
+	f64 get_pacing_slot(f64 guest_interval, u32* refreshes = nullptr) const;
 	void present_drawable(mtl::frame_context_t* ctx);
+
+	// Waits for a frame context to leave the present queue (display back-pressure) while serving the guest
+	void wait_for_frame_context(mtl::frame_context_t* ctx);
+	void serve_guest_during_display_wait();
 
 	mtl::viewable_image* get_present_source(mtl::present_surface_info* info, const rsx::avconf& avconfig);
 
 	// Render pass management
 	void update_render_pass_descriptor();
-	void begin_render_pass(const mtl::attachment_clear_info* clear = nullptr);
-	void close_render_pass();
+	void begin_render_pass();
+	bool draw_reads_deferred_clear() const;
+	void close_render_pass(mtl::pass_end_reason reason);
 	void invalidate_render_pass();
 	void split_render_pass(mtl::pass_split_reason reason);
 	bool is_render_pass_open() const;
@@ -303,13 +408,14 @@ private:
 	// Feedback loops (a draw samples a bound attachment). Tile-based GPUs write attachments to memory when the pass
 	// ends, so a read only needs a pass split when the sampled surface was written by the pass that is still open,
 	// and not only by earlier draws of the feedback streak the current draw belongs to.
-	void mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, bool from_draw = false);
+	// `depth_stencil`: the depth buffer counts as written (feedback bookkeeping). `ds_planes`: mtl::aspect_depth and/or
+	// aspect_stencil, the planes whose contents may have changed (m_depth_copy; exact for depth, a superset for stencil)
+	void mark_attachment_writes(const std::array<bool, 4>& color, bool depth_stencil, u32 ds_planes, bool from_draw = false);
 	void update_feedback_streaks(const std::array<bool, 4>& color, bool depth_stencil);
 	bool draw_samples_attachment(const mtl::render_target* surface) const;
 	std::array<bool, 4> get_live_color_writes() const;
 	bool colour_write_after_read(const std::array<bool, 4>& color, bool writer_samples_as_streak) const;
 	mtl::render_target* find_bound_attachment(const mtl::image* image) const;
-	bool is_written_in_open_pass(const mtl::image* image) const;
 	mtl::pass_split_reason feedback_read_needs_split() const; // count: no split needed
 	u64 get_feedback_draw_key() const;
 	MTL4::RenderCommandEncoder* get_render_encoder() const;
@@ -321,16 +427,32 @@ private:
 	void check_present_status();
 	void check_heap_status();
 
+	// Rate-limited log line with the sizes of everything that can grow during a session (caches, pools, heaps, GC)
+	void report_resource_usage();
+
 	mtl::vertex_upload_info upload_vertex_data();
 	rsx::simple_array<u8> m_scratch_mem;
 
 	bool load_program();
 	void load_program_env();
+
+	// Depth bounds test (DESIGN.md §4): the bounds as the hardware test takes them and whether the bound program performs
+	// the test in its fragment shader
+	std::pair<f32, f32> get_clamped_depth_bounds() const;
+	bool draw_reads_depth_bounds() const;
+
+	// Shader reads of the draw's depth buffer (DESIGN.md §4, m_depth_copy): the copy, made first when the planes read
+	// (depth, and stencil if `stencil`) are stale (`exact`: the depth plane as it is now, even for a feedback streak),
+	// and the view of the copy to bind instead of `view` when `view` reads the depth attachment of the draw pass
+	// (`stencil`: the draw also reads its stencil through the view's image)
+	mtl::viewable_image* update_depth_copy(mtl::render_target* ds, bool stencil, bool exact = false);
+	mtl::image_view* redirect_depth_attachment_read(mtl::image_view* view, bool stencil = false);
 	void update_vertex_env(u32 id, const mtl::vertex_upload_info& vertex_info);
 	void upload_transform_constants(const rsx::io_buffer& buffer);
 
 	void load_texture_env();
 	bool bind_texture_env();
+	bool bind_interpreter_texture_env();
 
 	mtl::image_view* get_null_texture_view(rsx::texture_dimension_extended type, bool is_depth);
 
@@ -380,8 +502,17 @@ protected:
 	void end() override;
 	void emit_geometry(u32 sub_index) override;
 
+	// RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST (+ ROP_MULTISAMPLED for a multisampled depth buffer) for draws with an active
+	// depth bounds test, a bound depth buffer and no hardware depth bounds test
+	rsx::flags32_t get_backend_fragment_program_export_config() const override;
+
 	void on_init_thread() override;
 	void on_exit() override;
+
+	// Shader cache preload (DESIGN.md §6): reads and decompiles, then queues the pipelines for background builds
+	void preload_shader_cache();
+	void update_shader_preload_notification(); // Flip: shader compilation hint while the preload runs
+
 	void flip(const rsx::display_flip_info_t& info) override;
 
 	void renderctl(u32 request_code, void* args) override;
@@ -399,4 +530,6 @@ protected:
 	u64 m_gpu_util_last_busy_ns = 0;
 	u64 m_gpu_util_last_time_us = 0;
 	f32 m_gpu_util_cached_pct = -1.f;
+	f32 m_gpu_util_ema = -1.f;       // Driver-reported GPU load, smoothed (get_gpu_utilization_pct)
+	u64 m_gpu_util_ema_time_us = 0;
 };

@@ -136,10 +136,31 @@ namespace mtl
 		// Destruction (and residency eviction) happens here, outside the lock.
 	}
 
+	resource_manager::usage_stats resource_manager::get_usage_stats() const
+	{
+		usage_stats stats{};
+		{
+			reader_lock lock(m_eid_map_lock);
+			for (const auto& scope : m_eid_map)
+			{
+				stats.pending_objects += scope.m_disposables.size();
+			}
+
+			stats.pending_scopes = m_eid_map.size();
+		}
+
+		// RSX thread only, like get_sampler() and trim()
+		stats.samplers = m_sampler_pool.size();
+		return stats;
+	}
+
 	void resource_manager::trim()
 	{
-		// Keep the number of idle samplers bounded
-		constexpr usz max_idle_samplers = 1024;
+		// Keep the number of idle samplers bounded. The ceiling is 512, not 1024: the driver
+		// segfaults in setSamplerState once ~1024 argument-buffer samplers are simultaneously live
+		// (RSX 0x448/0x449 class, killer ID 0x400/0x401), and disposed states stay live until the GPU
+		// drains the eid queue — so the pool must sit well below the cliff, not right at it.
+		constexpr usz max_idle_samplers = 512;
 		if (m_sampler_pool.size() > max_idle_samplers)
 		{
 			auto unused = m_sampler_pool.collect([](const cached_sampler_object_t& sampler)

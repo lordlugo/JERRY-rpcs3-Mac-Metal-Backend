@@ -13,6 +13,7 @@
 #include "util/fnv_hash.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <unordered_set>
 
@@ -81,6 +82,8 @@ namespace mtl::glsl
 			case input_type_storage_texture: return "storage texture";
 			case input_type_push_constant: return "push constant";
 			case input_type_attachment: return "input attachment";
+			case input_type_separate_image: return "separate image";
+			case input_type_sampler: return "sampler";
 			default: return "undefined";
 			}
 		}
@@ -225,10 +228,12 @@ namespace mtl::glsl
 					case metal_resource_class::buffer:
 						return slot.type == input_type_uniform_buffer || slot.type == input_type_storage_buffer;
 					case metal_resource_class::sampled_texture:
-					case metal_resource_class::sampler:
 						return slot.type == input_type_texture;
+					case metal_resource_class::sampler:
+						return slot.type == input_type_texture || slot.type == input_type_sampler;
 					case metal_resource_class::texture:
-						return slot.type == input_type_texture || slot.type == input_type_texel_buffer || slot.type == input_type_storage_texture;
+						return slot.type == input_type_texture || slot.type == input_type_texel_buffer || slot.type == input_type_storage_texture ||
+							slot.type == input_type_separate_image;
 					}
 					return false;
 				};
@@ -447,6 +452,21 @@ namespace mtl::glsl
 				result.entry_point = compiler.get_cleansed_entry_point_name(entry_point, model);
 				result.needs_buffer_size_buffer = compiler.needs_buffer_size_buffer();
 
+				// Hazard tracking declares the storage bindings of a stage as writes unless all of them are read-only
+				{
+					const auto active = compiler.get_active_interface_variables();
+					const spirv_cross::ShaderResources resources = compiler.get_shader_resources(active);
+					for (const auto& res : resources.storage_buffers)
+					{
+						result.writes_storage |= !compiler.get_buffer_block_flags(res.id).get(spv::DecorationNonWritable);
+					}
+
+					for (const auto& res : resources.storage_images)
+					{
+						result.writes_storage |= !compiler.has_decoration(res.id, spv::DecorationNonWritable);
+					}
+				}
+
 				if (domain == ::glsl::glsl_compute_program)
 				{
 					for (u32 i = 0; i < 3; ++i)
@@ -475,6 +495,37 @@ namespace mtl::glsl
 
 					std::sort(result.vertex_attributes.begin(), result.vertex_attributes.end(), FN(x.first < y.first));
 				}
+
+				// SPIRV-Cross declares every specialization constant as a function constant (constant T name_tmp
+				// [[function_constant(N)]]; name = is_function_constant_defined(name_tmp) ? name_tmp : GLSL default).
+				// Pipelines of a specialized shader (shader::create_specialization) set them with this type.
+				for (const auto& constant : compiler.get_specialization_constants())
+				{
+					if (!error.empty())
+					{
+						break;
+					}
+
+					const spirv_cross::SPIRType& type = compiler.get_type(compiler.get_constant(constant.id).constant_type);
+					if (type.vecsize != 1 || type.columns != 1)
+					{
+						error = fmt::format("specialization constant %u is not a scalar", constant.constant_id);
+						break;
+					}
+
+					switch (type.basetype)
+					{
+					case spirv_cross::SPIRType::Boolean: result.function_constants.emplace_back(constant.constant_id, MTL::DataTypeBool); break;
+					case spirv_cross::SPIRType::UInt: result.function_constants.emplace_back(constant.constant_id, MTL::DataTypeUInt); break;
+					case spirv_cross::SPIRType::Int: result.function_constants.emplace_back(constant.constant_id, MTL::DataTypeInt); break;
+					case spirv_cross::SPIRType::Float: result.function_constants.emplace_back(constant.constant_id, MTL::DataTypeFloat); break;
+					default:
+						error = fmt::format("specialization constant %u has an unsupported type", constant.constant_id);
+						break;
+					}
+				}
+
+				std::sort(result.function_constants.begin(), result.function_constants.end(), FN(x.first < y.first));
 
 				if (!error.empty())
 				{
@@ -518,7 +569,11 @@ namespace mtl::glsl
 
 		auto options = mtl::ref(MTL::CompileOptions::alloc()->init());
 		options->setLanguageVersion(MTL::LanguageVersion3_2);
-		options->setMathMode(fast_math ? MTL::MathModeFast : MTL::MathModeSafe);
+		// Fast math = MTL::MathModeRelaxed, not MathModeFast: both allow reassociation, contraction and reciprocal
+		// approximations, but Fast also lets the compiler assume that no value is ever Inf or NaN. RSX programs produce
+		// both (RCP/RSQ/DIV by zero, 1/w, the z-clip transform relies on w = 0 giving Inf) and the results must follow
+		// IEEE rules as on the PS3 and the Vulkan backend. "Disable MSL fast math" selects MathModeSafe.
+		options->setMathMode(fast_math ? MTL::MathModeRelaxed : MTL::MathModeSafe);
 		options->setMathFloatingPointFunctions(fast_math ? MTL::MathFloatingPointFunctionsFast : MTL::MathFloatingPointFunctionsPrecise);
 		options->setPreserveInvariance(true); // Honors [[invariant]] vertex positions (RSX vertex programs)
 		options->setLibraryType(MTL::LibraryTypeExecutable);
@@ -549,6 +604,12 @@ namespace mtl::glsl
 
 	// ---- shader --------------------------------------------------------------------------------------------------
 
+	namespace
+	{
+		// shader::uid() source
+		atomic_t<u64> g_next_shader_uid = 0;
+	}
+
 	shader::~shader()
 	{
 		destroy();
@@ -565,16 +626,39 @@ namespace mtl::glsl
 		}
 
 		m_type = domain;
+		m_uid = ++g_next_shader_uid;
 		m_source = source;
 		m_msl.clear();
+		m_msl_hash = 0;
 		m_entry_point = std::string(get_entry_point_name(domain));
 		m_compile_failed = false;
 		m_needs_buffer_sizes = false;
+		m_writes_storage = true;
 		m_vertex_attributes.clear();
+		m_workgroup_size = { 1, 1, 1 };
+		m_declared_constants.clear();
+		m_base = nullptr;
+		m_function_constants.clear();
+	}
+
+	void shader::create_specialization(shader& base, std::vector<function_constant> constants)
+	{
+		ensure(!base.m_base, "A specialization cannot be the base of another one");
+		create(base.domain(), {});
+
+		std::sort(constants.begin(), constants.end(), FN(x.id < y.id));
+		m_base = &base;
+		m_function_constants = std::move(constants);
 	}
 
 	bool shader::compile(const binding_layout& layout, bool fast_math)
 	{
+		if (m_base)
+		{
+			// The library is the base's (one translation and MTLLibrary for all its specializations)
+			return m_base->compile(layout, fast_math);
+		}
+
 		std::lock_guard lock(m_compile_lock);
 
 		if (m_library)
@@ -590,12 +674,18 @@ namespace mtl::glsl
 
 		mtl::autorelease_scope autorelease;
 
+		const auto translate_start = std::chrono::steady_clock::now();
+
 		msl_translation_result translated;
 		if (!translate_glsl_to_msl(m_type, m_source, layout, translated))
 		{
 			m_compile_failed = true;
 			return false;
 		}
+
+		const auto library_start = std::chrono::steady_clock::now();
+		record_compile_time(compile_step::translate,
+			static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(library_start - translate_start).count()));
 
 		// Stable (FNV-1a) source hash: names the library and the shaderlog dump
 		usz source_hash = rpcs3::fnv_seed;
@@ -612,6 +702,9 @@ namespace mtl::glsl
 		}
 
 		m_library = compile_msl_library(translated.msl, label, fast_math);
+		record_compile_time(compile_step::library,
+			static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - library_start).count()));
+
 		if (!m_library)
 		{
 			rsx_log.error("[MSL] GLSL source of '%s':\n%s", label, m_source);
@@ -622,7 +715,25 @@ namespace mtl::glsl
 		m_msl = std::move(translated.msl);
 		m_entry_point = std::move(translated.entry_point);
 		m_needs_buffer_sizes = translated.needs_buffer_size_buffer;
+		m_writes_storage = translated.writes_storage;
 		m_vertex_attributes = std::move(translated.vertex_attributes);
+		m_workgroup_size = translated.workgroup_size;
+		m_declared_constants = std::move(translated.function_constants);
+
+		// FNV-1a over the MSL, 8 bytes at a time (pipeline archive keys: the pipelines are a function of the MSL)
+		u64 msl_hash = rpcs3::hash64(rpcs3::fnv_seed, u64{m_msl.size()});
+		usz pos = 0;
+		for (; pos + sizeof(u64) <= m_msl.size(); pos += sizeof(u64))
+		{
+			u64 word;
+			std::memcpy(&word, m_msl.data() + pos, sizeof(word));
+			msl_hash = rpcs3::hash64(msl_hash, word);
+		}
+		for (; pos < m_msl.size(); pos++)
+		{
+			msl_hash = rpcs3::hash64(msl_hash, static_cast<u8>(m_msl[pos]));
+		}
+		m_msl_hash = msl_hash ? msl_hash : 1;
 		return true;
 	}
 
@@ -638,8 +749,14 @@ namespace mtl::glsl
 
 		m_source.clear();
 		m_msl.clear();
+		m_msl_hash = 0;
 		m_compile_failed = false;
 		m_needs_buffer_sizes = false;
+		m_writes_storage = true;
 		m_vertex_attributes.clear();
+		m_workgroup_size = { 1, 1, 1 };
+		m_declared_constants.clear();
+		m_base = nullptr;
+		m_function_constants.clear();
 	}
 }

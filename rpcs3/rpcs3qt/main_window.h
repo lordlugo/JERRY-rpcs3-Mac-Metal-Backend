@@ -2,6 +2,7 @@
 
 #include <QActionGroup>
 #include <QMainWindow>
+#include <QFuture>
 #include <QIcon>
 #include <QList>
 #include <QUrl>
@@ -51,7 +52,7 @@ class main_window : public QMainWindow
 	bool m_requested_show_logs_on_exit = false;
 	int m_other_slider_pos = 0;
 
-	QIcon m_app_icon;
+	QFuture<QIcon> m_app_icon; // Loaded on a worker thread by Boot()
 	QIcon m_icon_play;
 	QIcon m_icon_pause;
 	QIcon m_icon_restart;

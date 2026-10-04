@@ -79,6 +79,7 @@ target_sources(rpcs3_emu PRIVATE
     ../../Utilities/cheat_info.cpp
     ../../Utilities/cond.cpp
     ../../Utilities/Config.cpp
+    ../../Utilities/crash_report.cpp
     ../../Utilities/date_time.cpp
     ../../Utilities/File.cpp
     ../../Utilities/JITASM.cpp
@@ -98,6 +99,8 @@ if(APPLE)
     target_sources(rpcs3_emu PRIVATE
         ../../darwin/util/sysinfo_darwin.mm
     )
+    # Utilities/File.cpp finds the image file of a mounted disc image in the I/O Registry
+    target_link_libraries(rpcs3_emu PRIVATE "-framework IOKit" "-framework CoreFoundation")
 endif()
 
 target_include_directories(rpcs3_emu PUBLIC "${CMAKE_SOURCE_DIR}")

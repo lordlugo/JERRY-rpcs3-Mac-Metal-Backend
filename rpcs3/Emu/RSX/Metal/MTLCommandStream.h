@@ -33,4 +33,9 @@ namespace mtl
 
 	// Immediately commit any command_list (auxiliary lists, e.g. secondary chain). Serialized with the global lock.
 	u64 queue_submit_now(mtl::command_list& commands, const submit_info_t& info = {});
+
+	// Waits until the offloader thread has committed every submission queued with queue_submit (MTRSX). A list committed
+	// with queue_submit_now afterwards runs after them on the GPU (a queue executes in commit order). Needed before
+	// committing work that reads what queued lists render, e.g. texture cache readbacks. No-op on the offloader thread.
+	void wait_for_queued_submits();
 }

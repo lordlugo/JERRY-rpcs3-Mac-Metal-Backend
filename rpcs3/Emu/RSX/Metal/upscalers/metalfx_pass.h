@@ -20,9 +20,13 @@
 // into a content-sized texture.
 //
 // Synchronization: the scaler encodes its own passes into the MTL4 command buffer (no encoder may be open). It waits
-// on m_fence before reading its input and updates it after writing its output. m_fence is updated by a compute
-// encoder that opens with the command list's queue barrier (i.e. after everything recorded before), and the encoder
-// opened after the scaler waits on it; RCAS dispatches in that encoder, every later encoder opens with a queue barrier.
+// on m_fence before reading its input and updates it after writing its output. m_fence is updated after a command that
+// is declared with the scaler's accesses (reads the input, writes the target and the scaler's internal resources), so
+// the command list orders it after the earlier work they conflict with (the producer of the input, readers of the
+// previous output, the previous run of the scaler). The scaler's passes are then recorded as external work with those
+// accesses in every stage (mtl::command_list::external_work), and a fresh compute encoder waits on m_fence before its
+// first command (wait_fence): RCAS, recorded into that encoder, and whatever reads the output later (the present
+// passes, whose pass barriers order them after all earlier work) run after the scaler has written its output.
 //
 // Texture usage:
 //  - input: scaler->colorTextureUsage() (MTL::TextureUsageShaderRead on current systems);
@@ -120,9 +124,10 @@ namespace mtl
 			MTL::TextureUsage usage, const char* debug_name);
 		void dispose_images();
 
-		// Makes the scaler (encoded as its own passes) wait for all previously recorded work. Closes the encoder.
-		void signal_fence(mtl::command_list& cmd);
-		// Opens a compute encoder whose commands wait for the scaler's output. Leaves it open for RCAS.
+		// Makes the scaler (encoded as its own passes) wait for the earlier work its accesses conflict with. Closes the
+		// encoder.
+		void signal_fence(mtl::command_list& cmd, std::span<const gpu_access> scaler_accesses);
+		// Opens a compute encoder whose commands wait for the scaler's fence update (its output is written)
 		void wait_fence(mtl::command_list& cmd);
 
 		// Returns the upscaled (and sharpened) content of src_area as an output_size image, or nullptr to fall back

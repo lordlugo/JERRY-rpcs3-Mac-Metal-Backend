@@ -3,6 +3,7 @@
 // Scaled image copies. Metal has no vkCmdBlitImage: every scaled/format-converting copy is a sampled draw through
 // mtl::blit_pass (color) or its depth/stencil variants, which write [[depth]] / [[stencil]] from the fragment shader.
 
+#include "MTLGraphicsLog.h"
 #include "MTLOverlays.h"
 #include "MTLRenderPass.h"
 #include "MTLFormats.h"
@@ -387,6 +388,9 @@ namespace mtl
 		std::span<mtl::image_view* const> src, const areai& src_area, bool linear_filter)
 	{
 		ensure(!src.empty() && src[0]);
+		note_blit(m_dst_aspect, static_cast<int>(m_output_type),
+			std::abs(src_area.x2 - src_area.x1), std::abs(src_area.y2 - src_area.y1),
+			std::abs(dst_area.x2 - dst_area.x1), std::abs(dst_area.y2 - dst_area.y1));
 
 		s32 dx1 = dst_area.x1, dx2 = dst_area.x2, dy1 = dst_area.y1, dy2 = dst_area.y2;
 		f32 sx1 = static_cast<f32>(src_area.x1), sx2 = static_cast<f32>(src_area.x2);
@@ -488,6 +492,7 @@ namespace mtl
 		if (compatible_formats && !src_rect.is_flipped() && !dst_rect.is_flipped() &&
 			src_rect.width == dst_rect.width && src_rect.height == dst_rect.height && src_rect.depth == dst_rect.depth)
 		{
+			note_plain_copy();
 			copy_image(cmd, src, dst, src_rect, dst_rect, mip_layers);
 			return;
 		}
@@ -536,6 +541,8 @@ namespace mtl
 				return;
 			}
 		}
+
+		note_scaled_copy(src_rect.width, src_rect.height, dst_rect.width, dst_rect.height);
 
 		auto pass = get_blit_pass_for(dst_aspect, src_aspect, dst->format());
 
@@ -587,7 +594,8 @@ namespace mtl
 						// Depth/stencil: whole-subresource copy (partial blit copies of depth/stencil textures are not
 						// allowed on every Metal GPU). Sampling coordinates stay the same.
 						auto scratch = get_blit_scratch(0, src, level_w, level_h, true);
-						cmd.compute()->copyFromTexture(src->value, src_layer, src_level, scratch->value, 0, 0, 1, 1);
+						cmd.blit({ read_image(src, src_level, 1, src_layer, 1), write_image(scratch, 0, 1, 0, 1) })
+							->copyFromTexture(src->value, src_layer, src_level, scratch->value, 0, 0, 1, 1);
 
 						sample_image = scratch;
 						sample_level = 0;
@@ -602,8 +610,9 @@ namespace mtl
 						}
 
 						auto scratch = get_blit_scratch(0, src, w, h);
-						cmd.compute()->copyFromTexture(src->value, src_layer, src_level, MTL::Origin(x, y, 0), MTL::Size(w, h, 1),
-							scratch->value, 0, 0, MTL::Origin(0, 0, 0));
+						cmd.blit({ read_image(src, src_level, 1, src_layer, 1), write_image(scratch, 0, 1, 0, 1) })
+							->copyFromTexture(src->value, src_layer, src_level, MTL::Origin(x, y, 0), MTL::Size(w, h, 1),
+								scratch->value, 0, 0, MTL::Origin(0, 0, 0));
 
 						sample_image = scratch;
 						sample_level = 0;
@@ -615,7 +624,8 @@ namespace mtl
 				}
 
 				// Source views (single level, single slice, 2D). Viewable images keep them (released with the image, or
-				// through the GC with its other views); views of other images (the blit scratch) are temporary.
+				// through the GC with its other views); views of other images (typeless helpers, the blit scratch) are
+				// only needed by this pass: entries of the texture view pool (image_view::make_transient).
 				auto viewable_sample_image = dynamic_cast<mtl::viewable_image*>(sample_image);
 				std::unique_ptr<mtl::image_view> view0, view1;
 				auto make_view = [&](u32 aspect, std::unique_ptr<mtl::image_view>& temporary) -> mtl::image_view*
@@ -632,7 +642,7 @@ namespace mtl
 					info.base_layer = sample_layer;
 					info.layer_count = 1;
 					info.aspect = aspect;
-					temporary = std::make_unique<mtl::image_view>(sample_image, info);
+					temporary = mtl::image_view::make_transient(sample_image, info);
 					return temporary.get();
 				};
 
@@ -671,11 +681,13 @@ namespace mtl
 						// Depth/stencil: only whole-subresource blit copies. Round-trip the full level through the
 						// stand-in so the pixels outside dst_area are preserved.
 						auto scratch = get_blit_scratch(1, dst, level_w, level_h, true);
-						cmd.compute()->copyFromTexture(dst->value, dst_layer, dst_level, scratch->value, 0, 0, 1, 1);
+						cmd.blit({ read_image(dst, dst_level, 1, dst_layer, 1), write_image(scratch, 0, 1, 0, 1) })
+							->copyFromTexture(dst->value, dst_layer, dst_level, scratch->value, 0, 0, 1, 1);
 
 						pass->run(cmd, overlay_target(scratch), dst_area, views, sample_area, linear_filter);
 
-						cmd.compute()->copyFromTexture(scratch->value, 0, 0, dst->value, dst_layer, dst_level, 1, 1);
+						cmd.blit({ read_image(scratch, 0, 1, 0, 1), write_image(dst, dst_level, 1, dst_layer, 1) })
+							->copyFromTexture(scratch->value, 0, 0, dst->value, dst_layer, dst_level, 1, 1);
 					}
 					else if (x < 0 || y < 0 || (static_cast<u32>(x) + w) > level_w || (static_cast<u32>(y) + h) > level_h)
 					{
@@ -691,8 +703,9 @@ namespace mtl
 
 						pass->run(cmd, overlay_target(scratch), scratch_area, views, sample_area, linear_filter);
 
-						cmd.compute()->copyFromTexture(scratch->value, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1),
-							dst->value, dst_layer, dst_level, MTL::Origin(x, y, 0));
+						cmd.blit({ read_image(scratch, 0, 1, 0, 1), write_image(dst, dst_level, 1, dst_layer, 1) })
+							->copyFromTexture(scratch->value, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1),
+								dst->value, dst_layer, dst_level, MTL::Origin(x, y, 0));
 					}
 				}
 

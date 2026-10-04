@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "MTLGraphicsLog.h"
 #include "MTLRenderTargets.h"
 #include "MTLResourceManager.h"
 #include "mtlutils/data_heap.h"
@@ -6,6 +7,7 @@
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Common/tiled_dma_copy.hpp"
+#include "Emu/RSX/Common/forced_msaa.hpp"
 #include "Emu/Memory/vm.h"
 
 #include <array>
@@ -150,6 +152,13 @@ namespace mtl
 		{
 			samples = get_format_sample_count(antialias);
 			sample_layout = rsx::surface_sample_layout::ps3;
+
+			if (samples == 1 && rsx::forced_msaa_samples() > 1)
+			{
+				// Forced host MSAA on a single-sample surface (forced_msaa.hpp)
+				samples = rsx::forced_msaa_samples();
+				sample_layout = rsx::surface_sample_layout::forced;
+			}
 		}
 		else
 		{
@@ -206,6 +215,13 @@ namespace mtl
 		{
 			samples = get_format_sample_count(antialias);
 			sample_layout = rsx::surface_sample_layout::ps3;
+
+			if (samples == 1 && rsx::forced_msaa_samples() > 1)
+			{
+				// Forced host MSAA on a single-sample surface (forced_msaa.hpp)
+				samples = rsx::forced_msaa_samples();
+				sample_layout = rsx::surface_sample_layout::forced;
+			}
 		}
 		else
 		{
@@ -328,7 +344,8 @@ namespace mtl
 		u64 src_offset_in_buffer,
 		u64 max_copy_length)
 	{
-		surface->read_barrier(cmd);
+		// transfer_read: resolves pending MSAA samples (PS3 or forced) into the resolve image read below
+		surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
 		mtl::image* source = surface->get_surface(rsx::surface_access::transfer_read);
 		const bool is_scaled = surface->width() != surface->surface_width;
 		if (is_scaled)
@@ -369,7 +386,8 @@ namespace mtl
 		region.image_offset = MTL::Origin::Make(0, 0, 0);
 		region.image_extent = MTL::Size::Make(source->width(), source->height(), 1);
 
-		// VK injected a post-transfer barrier here; Metal transfers are serialized by cmd.compute()
+		// VK injected a post-transfer barrier here; Metal transfers declare their accesses and are ordered by the command
+		// list (mtl::command_list)
 		image_readback_options_t options{};
 		options.sync_region =
 		{
@@ -396,7 +414,13 @@ namespace mtl
 		total_device_memory /= 0x100000;
 		u64 quota = 0;
 
-		if (total_device_memory >= 2048)
+		if (total_device_memory >= 24576)
+		{
+			// Large unified memory (e.g. 64 GB Apple silicon, ~53 GB working set): the discrete-GPU cap below would
+			// start spilling surfaces to system memory long before memory is actually scarce
+			quota = std::min<u64>(16384, (total_device_memory * 40) / 100);
+		}
+		else if (total_device_memory >= 2048)
 		{
 			quota = std::min<u64>(6144, (total_device_memory * 40) / 100);
 		}
@@ -542,7 +566,16 @@ namespace mtl
 
 	void surface_cache::trim(mtl::command_list& cmd, rsx::problem_severity memory_pressure)
 	{
-		run_cleanup_internal(cmd, rsx::problem_severity::moderate, 300, [](mtl::command_list& cmd)
+		// RPCS3 Metal fork: soft budget for the surface cache, above which every trim collapses dirty surfaces (forced
+		// memory barriers: inheritance copies, MSAA resolves, guest memory loads with Read Color Buffers) and drops the
+		// surfaces whose memory tag no longer matches, so they are recreated on the next bind. The upstream 300 MiB is a
+		// 100%-scale figure: at 200% with forced 2x MSAA a single frame's render targets take 450-650 MiB (Far Cry 3,
+		// God of War: Ascension), so the cache sat above it permanently and churned every frame (Far Cry 3: earlier
+		// frames showing through, "Surface cache is using too much memory" 3400 times). A quarter of the device quota
+		// (4 GiB on a 64 GB Mac); real memory pressure is still handled by the severity checks and spilling.
+		const u64 soft_budget_mb = std::max<u64>(300, get_surface_cache_memory_quota(get_current_renderer()->caps().recommended_working_set) / 0x100000 / 4);
+
+		run_cleanup_internal(cmd, rsx::problem_severity::moderate, static_cast<u32>(soft_budget_mb), [](mtl::command_list& cmd)
 		{
 			if (!cmd.is_recording())
 			{
@@ -573,8 +606,11 @@ namespace mtl
 				rtt->clear_rw_barrier();
 			}
 
-			if (rtt->resolve_surface && memory_pressure >= rsx::problem_severity::moderate)
+			if (rtt->resolve_surface && memory_pressure >= rsx::problem_severity::moderate &&
+				!(rtt->msaa_flags & rsx::surface_state_flags::require_unresolve))
 			{
+				// The multisampled image stays authoritative; the next transfer read rebuilds the resolve image
+				rtt->msaa_flags |= rsx::surface_state_flags::require_resolve;
 				// We do not need to keep resolve targets around.
 				// TODO: We should surrender this to an image cache immediately for reuse.
 				mtl::get_resource_manager()->dispose(rtt->resolve_surface);
@@ -584,7 +620,10 @@ namespace mtl
 			switch (memory_pressure)
 			{
 			case rsx::problem_severity::low:
-				threshold = 2;
+				// Replaced surfaces are recycled for new ones of the same shape (surface_store). With a large unified
+				// memory budget keep them for about half a second instead of two frames, so the recycling actually hits
+				// instead of freeing and allocating multi-megabyte (scaled, multisampled) surfaces every few frames.
+				threshold = (get_current_renderer()->caps().recommended_working_set >= (24ull << 30)) ? 30 : 2;
 				break;
 			case rsx::problem_severity::moderate:
 				threshold = 1;
@@ -707,6 +746,12 @@ namespace mtl
 	// Get the linear resolve target bound to this surface. Initialize if none exists
 	mtl::viewable_image* render_target::get_resolve_target_safe(mtl::command_list& /*cmd*/)
 	{
+		return ensure_resolve_target();
+	}
+
+	// Creating the resolve image records no GPU work
+	mtl::viewable_image* render_target::ensure_resolve_target()
+	{
 		if (!resolve_surface)
 		{
 			// Create a resolve surface
@@ -734,7 +779,8 @@ namespace mtl
 	// Resolve the planar MSAA data into a linear block
 	void render_target::resolve(mtl::command_list& cmd)
 	{
-		// No layouts or barriers: the resolve pass/dispatch is ordered after every previous command by cmd.
+		// No layouts or barriers: the resolve pass declares its attachment and sampled image, and the command list orders
+		// it after the earlier work that accessed them.
 		mtl::resolve_image(cmd, resolve_surface.get(), this);
 
 		msaa_flags &= ~(rsx::surface_state_flags::require_resolve);
@@ -800,6 +846,7 @@ namespace mtl
 
 	bool render_target::spill(mtl::command_list& cmd, std::vector<std::unique_ptr<mtl::viewable_image>>& resolve_cache)
 	{
+		note_spill(false);
 		u64 element_size;
 		switch (const auto fmt = format())
 		{
@@ -912,6 +959,7 @@ namespace mtl
 
 	void render_target::unspill(mtl::command_list& cmd)
 	{
+		note_spill(true);
 		// Recreate the image
 		const auto pdev = mtl::get_current_renderer();
 		create_impl(*pdev, info);
@@ -1057,6 +1105,9 @@ namespace mtl
 
 		const bool should_read_buffers = (state_flags & rsx::surface_state_flags::force_data_load) || read_buffers_config;
 
+		// The surface's Read Color/Depth Buffers decision: a memory load from the guest or a GPU clear.
+		note_surface_init(should_read_buffers);
+
 		if (!should_read_buffers)
 		{
 			clear_memory(cmd, this);
@@ -1084,9 +1135,25 @@ namespace mtl
 			return this;
 		}
 
-		// A read barrier should have been called before this!
-		ensure(resolve_surface); // "Read access without explicit barrier"
-		ensure(!(msaa_flags & rsx::surface_state_flags::require_resolve));
+		if (!resolve_surface) [[unlikely]]
+		{
+			// A surface the blit engine just created (create_blit_dst) is handed out for writing before its barrier
+			// (prepare_transfer_target) runs. Forced MSAA makes those multisampled too, so the single-sample image
+			// they are written through may not exist yet. Create it now; the barrier fills it before the transfer.
+			if (access_type.is_read())
+			{
+				rsx_log.warning("Metal: MSAA surface 0x%x read by a transfer before its resolve image existed", base_addr);
+			}
+
+			ensure_resolve_target();
+		}
+
+		if (msaa_flags & rsx::surface_state_flags::require_resolve) [[unlikely]]
+		{
+			// Only reachable without a barrier; the barrier for this access runs before the transfer and resolves then
+			rsx_log.warning("Metal: MSAA surface 0x%x handed to a transfer with a pending resolve", base_addr);
+		}
+
 		return resolve_surface.get();
 	}
 
@@ -1113,13 +1180,17 @@ namespace mtl
 			return;
 		}
 
-		// Apple GPUs cannot wait on attachment writes inside a render pass. Split the pass instead: the next encoder
-		// begins with a barrier on all previously encoded work (see mtl::command_list). Writes of passes that already
-		// ended are in memory, so only writes by the open pass (marked by the renderer) need the split, unless they
-		// come from the feedback streak the current draw belongs to.
-		if (cmd.is_render_pass_open() && !feedback_read_in_pass_allowed(cmd.open_pass_serial(), g_feedback_draw_key))
+		// Apple GPUs cannot wait on attachment writes inside a render pass. Split the pass instead: the draw that samples
+		// the surface then runs in the next pass, after a barrier on the ended pass's writes (the hazard tracker of
+		// mtl::command_list). Writes of passes that already ended are ordered that way, so only writes by the open
+		// pass (marked by the renderer) need the split, unless they come from the feedback streak the current draw
+		// belongs to. Not for a depth surface: written by the open pass means it is the draw pass's depth attachment,
+		// which shaders read through the renderer's copy of it (MTLGSRender::redirect_depth_attachment_read), made
+		// outside the pass when stale.
+		if (!is_depth_surface() && cmd.is_render_pass_open() &&
+			!feedback_read_in_pass_allowed(cmd.open_pass_serial(), g_feedback_draw_key))
 		{
-			cmd.end_render_pass();
+			cmd.end_render_pass(pass_end_reason::feedback);
 			g_feedback_loop_pass_splits++;
 			count_feedback_split(pass_split_reason::read_after_write);
 		}
@@ -1149,7 +1220,7 @@ namespace mtl
 		// Strict Rendering Mode keeps the explicit split.
 		if (cmd.is_render_pass_open() && g_cfg.video.strict_rendering_mode)
 		{
-			cmd.end_render_pass();
+			cmd.end_render_pass(pass_end_reason::feedback);
 			g_feedback_loop_pass_splits++;
 			count_feedback_split(pass_split_reason::write_after_read);
 		}
@@ -1225,6 +1296,14 @@ namespace mtl
 
 		if (old_contents.empty()) [[likely]]
 		{
+			if (samples() > 1 && access.is_transfer() && !resolve_surface &&
+				!(msaa_flags & rsx::surface_state_flags::require_unresolve))
+			{
+				// A transfer needs the single-sample resolve image, and this surface has none (it was only ever drawn to,
+				// or its resolve image was dropped). The multisampled image holds the data, so rebuild it from there.
+				msaa_flags |= rsx::surface_state_flags::require_resolve;
+			}
+
 			if (state_flags & rsx::surface_state_flags::erase_bkgnd)
 			{
 				// NOTE: This step CAN introduce MSAA flags!

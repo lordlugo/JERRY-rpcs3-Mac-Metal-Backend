@@ -10,8 +10,8 @@
 //  - output texels outside the destination (partial 16x16 tiles) are skipped.
 //
 // Resources: src needs MTL::TextureUsageShaderRead, dst needs MTL::TextureUsageShaderWrite. Both must have the same size.
-// Ordering: the kernel is recorded through cmd.compute() like every compute task, i.e. after an intra-encoder barrier
-// (or the queue barrier of a new encoder), so it reads what earlier commands wrote.
+// Ordering: like every compute task, the dispatch declares its input (read) and output (write) through program::bind,
+// so it is ordered after the earlier work that wrote the input or accesses the output (mtl::command_list).
 
 #include "../MTLCompute.h"
 #include "../mtlutils/sampler.h"

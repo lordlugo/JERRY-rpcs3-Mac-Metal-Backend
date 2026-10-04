@@ -4,8 +4,6 @@
 #include "gui_settings.h"
 #include "qt_utils.h"
 
-#include "Loader/ISO.h"
-
 #include <QApplication>
 
 game_list_grid::game_list_grid()
@@ -135,7 +133,8 @@ void game_list_grid::populate(
 			check_iso |= game->audio_in_archive;
 		}
 
-		if (check_iso && game->is_iso_file && is_iso_file(game->path))
+		// Known from the game enumeration: checking it again here would read every disc on the UI thread
+		if (check_iso && game->is_iso_file)
 		{
 			item->set_iso_path(game->path);
 		}

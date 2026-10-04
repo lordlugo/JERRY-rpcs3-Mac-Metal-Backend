@@ -120,5 +120,16 @@ namespace mtl
 
 			g_managed_heaps.clear();
 		}
+
+		u64 get_total_heap_size()
+		{
+			u64 result = 0;
+			for (const auto& heap : g_managed_heaps)
+			{
+				result += heap->size();
+			}
+
+			return result;
+		}
 	}
 }

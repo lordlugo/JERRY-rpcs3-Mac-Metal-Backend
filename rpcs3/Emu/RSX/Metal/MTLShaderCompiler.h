@@ -22,8 +22,12 @@ namespace mtl::glsl
 		std::string msl;                         // Generated Metal Shading Language source
 		std::string entry_point;                 // Entry point function name inside `msl`
 		bool needs_buffer_size_buffer = false;   // MSL reads spvBufferSizeConstants at layout.buffer_count
+		bool writes_storage = false;             // A storage buffer or image lacks NonWritable (GLSL readonly)
 		std::array<u32, 3> workgroup_size{ 1, 1, 1 }; // Compute only: GLSL local_size (dispatch must use it)
 		std::vector<std::pair<u32, MTL::VertexFormat>> vertex_attributes; // Vertex only: [[stage_in]] (location, format)
+		// SPIR-V specialization constants (GLSL layout(constant_id = N) const ...), which the MSL declares as function
+		// constants [[function_constant(N)]] defaulting to their GLSL value: (N, type), sorted by N
+		std::vector<std::pair<u32, MTL::DataType>> function_constants;
 	};
 
 	// Unique (per stage) MSL entry point names given to every translated shader.
@@ -38,7 +42,8 @@ namespace mtl::glsl
 		msl_translation_result& result);
 
 	// Build a Metal library from MSL through the device's MTL4Compiler. Returns an owned (+1) library or nullptr
-	// (errors, including the MSL, are logged). `fast_math` selects MTL::MathModeFast vs MTL::MathModeSafe.
+	// (errors, including the MSL, are logged). `fast_math` (!g_cfg.video.disable_msl_fast_math) selects
+	// MTL::MathModeRelaxed + fast floating-point functions (Inf/NaN preserved), otherwise MathModeSafe + precise functions.
 	MTL::Library* compile_msl_library(const std::string& msl, std::string_view label, bool fast_math);
 
 	// Debug switch: when set, every generated MSL source is written to the log (notice level).

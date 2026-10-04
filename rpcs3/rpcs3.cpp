@@ -23,6 +23,7 @@
 #include "rpcs3qt/uuid.h"
 
 #include "headless_application.h"
+#include "Utilities/crash_report.h"
 #include "Utilities/sema.h"
 #include "Utilities/date_time.h"
 #include "util/console.h"
@@ -172,6 +173,13 @@ std::set<std::string> get_one_drive_paths()
 #ifdef __linux__
 	extern void jit_announce(uptr, usz, std::string_view);
 #endif
+	// Orderly path: a signal raised from here (e.g. the abort below) must not
+	// produce a second, misleading native report from the installed handlers.
+	utils::crash_report::notify_orderly_fatal();
+
+	// The log file gets everything before any message is shown to the user.
+	logs::listener::sync_all();
+
 	std::string buf;
 
 	if (!s_is_error_launch)
@@ -183,6 +191,12 @@ std::set<std::string> get_one_drive_paths()
 		{
 			// Append thread id if it isn't already, except on main thread
 			fmt::append(buf, "\n\nThread id = %u.", thread_ctrl::get_tid());
+		}
+
+		// Name the failing thread (main thread has no named_thread, show tid only then).
+		if (const std::string tname = thread_ctrl::get_name(); tname != "not named_thread")
+		{
+			fmt::append(buf, "\nThread name = \"%s\".", tname);
 		}
 
 		if (!g_tls_serialize_name.empty())
@@ -215,6 +229,9 @@ std::set<std::string> get_one_drive_paths()
 		const auto [total, current] = utils::get_memory_usage();
 
 		fmt::append(buf, "\nRAM Usage: %dMB/%dMB (%dMB free)", current / (1024 * 1024), total / (1024 * 1024), (total - current) / (1024 * 1024));
+
+		// Point at the detailed crash report so the message is actionable on its own.
+		fmt::append(buf, "\nLog file: %s", fs::get_log_dir() + "RPCS3.log");
 	}
 
 	std::string_view text = s_is_error_launch ? _text : buf;
@@ -384,7 +401,7 @@ public:
 					std::string error = _msg.substr(rpcs3_prefix.size());
 					fmt::trim_back(error, " \t\n");
 
-					Emu.CallFromMainThread([error = std::move(error)]()
+					Emu.CallFromMainThread([error = std::move(error), tname = thread_ctrl::get_name(), tid = thread_ctrl::get_tid()]()
 					{
 						if (!qobject_cast<QApplication*>(QCoreApplication::instance()))
 						{
@@ -393,8 +410,17 @@ public:
 
 						auto box = new QMessageBox(QMessageBox::Critical, QStringLiteral("RPCS3"),
 							QObject::tr("Emulation stopped because of an error:"), QMessageBox::Ok);
-						box->setInformativeText(QString::fromStdString(error) +
-							QObject::tr("\n\nThe full log is RPCS3.log (File > Open Log Folder)."));
+						QString detail = QString::fromStdString(error);
+
+						if (tname != "not named_thread")
+						{
+							detail += QString::fromStdString(fmt::format("\nThread: \"%s\" (id %u).", tname, tid));
+						}
+
+						detail += QObject::tr("\n\nFull details were written to the log file:\n%1\n(File > Open Log Folder).")
+							.arg(QString::fromStdString(fs::get_log_dir() + "RPCS3.log"));
+
+						box->setInformativeText(detail);
 						box->setAttribute(Qt::WA_DeleteOnClose);
 						box->show();
 					}, nullptr, false);
@@ -698,6 +724,10 @@ int run_rpcs3(int argc, char** argv)
 		// Limit log size to ~25% of free space
 		log_file = logs::make_file_listener(log_name, stats.avail_free / 4);
 	}
+
+	// Crash reporting: native handlers in Thread.cpp record one-page summaries
+	// here; dialogs below point at the full report in RPCS3.log.
+	utils::crash_report::set_crash_files(log_name, fs::get_log_dir() + "last_crash.txt", rpcs3::get_verbose_version());
 
 	auto fatal_listener = std::make_unique<fatal_error_listener>();
 	logs::listener::add(fatal_listener.get());
@@ -1019,6 +1049,24 @@ int run_rpcs3(int argc, char** argv)
 		}
 
 		gui_app->Init();
+
+		// A native crash cannot show a dialog from its signal handler, so it leaves
+		// a one-page summary behind: report it now, with the log file location.
+		{
+			std::string last_crash;
+			const std::string summary_path = fs::get_log_dir() + "last_crash.txt";
+
+			if (utils::crash_report::read_last_summary(summary_path, last_crash))
+			{
+				utils::crash_report::clear_last_summary(summary_path);
+
+				const QString text = QString::fromStdString(last_crash) +
+					QObject::tr("\n\nA detailed crash report was written to the log file:\n%1\n(File > Open Log Folder).")
+						.arg(QString::fromStdString(fs::get_log_dir() + "RPCS3.log"));
+
+				QMessageBox::warning(gui_app->m_main_window, QObject::tr("Previous Session Crashed"), text);
+			}
+		}
 	}
 	else if (headless_application* headless_app = qobject_cast<headless_application*>(app.data()))
 	{
@@ -1026,6 +1074,13 @@ int run_rpcs3(int argc, char** argv)
 
 		headless_app->SetActiveUser(active_user);
 		headless_app->Init();
+
+		if (std::string last_crash; utils::crash_report::read_last_summary(fs::get_log_dir() + "last_crash.txt", last_crash))
+		{
+			utils::crash_report::clear_last_summary(fs::get_log_dir() + "last_crash.txt");
+			utils::output_stderr(fmt::format("RPCS3: previous session crashed:\n%s\nSee %s for the detailed crash report.\n",
+				last_crash, fs::get_log_dir() + "RPCS3.log"));
+		}
 	}
 	else
 	{

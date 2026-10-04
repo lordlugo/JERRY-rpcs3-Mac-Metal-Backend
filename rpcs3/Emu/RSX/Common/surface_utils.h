@@ -23,7 +23,11 @@ namespace rsx
 	enum class surface_sample_layout : u32
 	{
 		null = 0,
-		ps3 = 1
+		ps3 = 1,
+		// Forced host MSAA (forced_msaa.hpp): the host image is multisampled while the game sees a single-sample surface.
+		// The resolve image is the averaged single-sample image of the same size (depth/stencil: sample 0), unresolve
+		// broadcasts it to every sample.
+		forced = 2
 	};
 
 	enum class surface_inheritance_result : u32
@@ -642,6 +646,19 @@ namespace rsx
 				surface_inheritance_result::partial;
 		}
 
+		// The host image holds samples that must be resolved before transfers (PS3 MSAA in its sample layout, or forced
+		// host MSAA on a single-sample surface)
+		// Forced host MSAA surface (single-sample for the game, multisampled on the host)
+		bool is_forced_msaa() const
+		{
+			return sample_layout == surface_sample_layout::forced;
+		}
+
+		bool has_host_msaa_contents() const
+		{
+			return (spp > 1 && sample_layout != surface_sample_layout::null) || sample_layout == surface_sample_layout::forced;
+		}
+
 		void on_write(u64 write_tag = 0,
 			rsx::surface_state_flags resolve_flags = surface_state_flags::require_resolve,
 			surface_raster_type type = rsx::surface_raster_type::undefined)
@@ -658,7 +675,7 @@ namespace rsx
 			// HACK!! This should be cleared through memory barriers only
 			state_flags = rsx::surface_state_flags::ready;
 
-			if (spp > 1 && sample_layout != surface_sample_layout::null)
+			if (has_host_msaa_contents())
 			{
 				msaa_flags = resolve_flags;
 			}
@@ -692,7 +709,7 @@ namespace rsx
 			ensure(write_tag);
 			last_use_tag = write_tag;
 
-			if (spp > 1 && sample_layout != surface_sample_layout::null)
+			if (has_host_msaa_contents())
 			{
 				msaa_flags |= rsx::surface_state_flags::require_resolve;
 			}

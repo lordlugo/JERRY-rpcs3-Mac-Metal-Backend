@@ -39,9 +39,11 @@ namespace mtl
 		MTL4::Compiler* m_compiler = nullptr;
 		MTL::ResidencySet* m_residency = nullptr;
 
-		shared_mutex m_residency_lock;
-		bool m_residency_dirty = false;
+		mutable shared_mutex m_residency_lock;
+		bool m_residency_added = false;          // Allocations added since the last commit (the next submission may use them)
+		u64 m_first_pending_eviction_us = 0;     // When the oldest uncommitted removal was staged
 		u64 m_residency_count = 0;
+		u64 m_residency_commits = 0;             // Telemetry
 		// Allocations removed from m_residency whose removal has not been committed yet. The residency set may still
 		// reference them until commit(), so they are kept alive (retained) until then.
 		std::vector<MTL::Allocation*> m_pending_evictions;
@@ -76,10 +78,13 @@ namespace mtl
 		// Views and texture-buffers created from a registered parent do not need registering.
 		void make_resident(const MTL::Allocation* allocation);
 		void evict(const MTL::Allocation* allocation);   // Call only once the GPU has finished with the allocation
-		void commit_residency();                          // Called by command_list::submit before committing work
+		// Called by command_list::submit before committing work. Commits additions right away; removals are batched.
+		void commit_residency();
 		void attach_residency_set(const MTL::ResidencySet* set); // Extra sets (e.g. CAMetalLayer::residencySet)
 
 		u64 allocated_bytes() const;
+		u64 resident_allocation_count() const; // Registered and not evicted (telemetry)
+		u64 get_residency_commits_and_reset();  // Residency set commits since the last call (telemetry)
 	};
 
 	// Set by MTLGSRender during initialization; valid for the renderer's lifetime.

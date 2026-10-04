@@ -1,10 +1,12 @@
 #include "stdafx.h"
 #include "MTLProgramPipeline.h"
+#include "MTLHelpers.h"
 #include "MTLPipelineCompiler.h"
 #include "MTLResourceManager.h"
 #include "mtlutils/data_heap.h"
 #include "mtlutils/device.h"
 #include "mtlutils/sampler.h"
+#include "mtlutils/sampler_liveness.h"
 
 #include "util/asm.hpp"
 
@@ -84,9 +86,55 @@ namespace mtl
 			};
 
 			default_sampler_holder g_default_sampler;
+
+			// Sampler substitutions so far (a dead or missing sampler reached bind(); each is
+			// reported once per program/slot, this counts them for the log line).
+			atomic_t<u64> g_dead_sampler_total = 0;
+
+			// First live fallback: the default sampler, then the null sampler. Empty only when
+			// no sampler object is alive at all (renderer teardown); the caller then skips the
+			// write instead of faulting the driver.
+			MTL::ResourceID live_fallback_sampler()
+			{
+				const MTL::ResourceID def = g_default_sampler.get();
+				if (def._impl && sampler_liveness::contains(def._impl))
+				{
+					return def;
+				}
+
+				if (mtl::sampler* null_smp = mtl::null_sampler())
+				{
+					const MTL::ResourceID null_id = null_smp->resource_id();
+					if (null_id._impl && sampler_liveness::contains(null_id._impl))
+					{
+						return null_id;
+					}
+				}
+
+				return MTL::ResourceID{};
+			}
 		}
 
-		binding_layout build_binding_layout(const std::vector<program_input>& inputs)
+		void precache_fallback_samplers()
+	{
+		// Creates the bind-time sampler fallbacks once the render device exists, so the
+		// first draw never pays for their creation on the RSX thread and a live fallback
+		// is guaranteed from then until renderer teardown (see live_fallback_sampler()).
+		(void)g_default_sampler.get();
+		(void)mtl::null_sampler();
+	}
+
+	// Overflow-safe range check for argument-table slots: true when [index, index + count)
+	// escapes [0, limit). Written as a subtraction so an absurd count (e.g. a corrupt
+	// array_size near 2^32) degrades to "exceeds" instead of wrapping into an in-range
+	// index that bind() would write out of bounds. Shared by the layout builder and the
+	// program::init_layouts() validation so the two can never disagree.
+	static bool slot_range_exceeds(u32 index, u32 count, u32 limit)
+	{
+		return index >= limit || count > limit - index;
+	}
+
+	binding_layout build_binding_layout(const std::vector<program_input>& inputs)
 		{
 			binding_layout layout{};
 			u32 next_buffer = 0;
@@ -117,7 +165,7 @@ namespace mtl
 			// keeps umax and the translation of a shader that really uses the resource fails (the draw is skipped).
 			auto take_slots = [](u32& next, u32 count, u32 limit) -> u32
 			{
-				if (next + count > limit)
+				if (slot_range_exceeds(next, count, limit))
 				{
 					next = limit;
 					return umax;
@@ -154,23 +202,35 @@ namespace mtl
 				slot.texture_index = take_slots(next_texture, slot.array_size, max_texture_slots);
 
 				if (slot.texture_index != umax && slot.texture_index == next_sampler &&
-					next_sampler + slot.array_size <= max_sampler_slots)
+					!slot_range_exceeds(next_sampler, slot.array_size, max_sampler_slots))
 				{
 					slot.sampler_index = slot.texture_index;
 					next_sampler += slot.array_size;
 				}
 			}
 
-			// Pass 3: texel buffers and storage textures (no sampler)
+			// Pass 3: texel buffers, storage textures and separate images (no sampler)
 			for (const auto& in : inputs)
 			{
-				if (in.type != input_type_texel_buffer && in.type != input_type_storage_texture)
+				if (in.type != input_type_texel_buffer && in.type != input_type_storage_texture && in.type != input_type_separate_image)
 				{
 					continue;
 				}
 
 				auto& slot = claim(in);
 				slot.texture_index = take_slots(next_texture, slot.array_size, max_texture_slots);
+			}
+
+			// Pass 4: separate samplers, in the sampler slots the sampled textures left
+			for (const auto& in : inputs)
+			{
+				if (in.type != input_type_sampler)
+				{
+					continue;
+				}
+
+				auto& slot = claim(in);
+				slot.sampler_index = take_slots(next_sampler, slot.array_size, max_sampler_slots);
 			}
 
 			// Push constants: one block per stage, emulating Vulkan's shared push-constant space (absolute offsets)
@@ -189,6 +249,8 @@ namespace mtl
 				case input_type_texture:
 				case input_type_texel_buffer:
 				case input_type_storage_texture:
+				case input_type_separate_image:
+				case input_type_sampler:
 					break;
 				default:
 					fmt::throw_exception("Program input '%s' has an invalid type %u", in.name, static_cast<u32>(in.type));
@@ -223,11 +285,17 @@ namespace mtl
 			return 0;
 		}
 
+		gpu_access buffer_binding_info::access() const
+		{
+			return buffer ? read_buffer(buffer, offset, range) : read_buffer(raw_buffer, offset, range);
+		}
+
 		image_binding_info::image_binding_info(const mtl::image_view* view, const mtl::sampler* smp)
 			: texture(view ? view->value : nullptr)
 			, sampler(smp ? smp->value : nullptr)
 			, texture_id(view ? view->resource_id : MTL::ResourceID{})
 			, sampler_id(smp ? smp->resource_id() : MTL::ResourceID{})
+			, access(read_image(view))
 		{
 		}
 
@@ -285,6 +353,52 @@ namespace mtl
 				for (const auto& [location, slot] : m_layouts[stage].slots)
 				{
 					table_slots.push_back(slot);
+				}
+
+				// Every slot bind() writes must fit the argument table it targets and the
+				// shadow/binding arrays behind it (31 buffers, 64 textures, 16 samplers).
+				// Fail here, naming the program, instead of faulting inside the driver
+				// (setSamplerState/setTexture with an out-of-range index) with no context.
+				for (const resource_slot& slot : table_slots)
+				{
+					if (slot.array_size < 1)
+					{
+						fmt::throw_exception("Program slot with empty array");
+					}
+
+					// Same overflow-safe check the builder uses (see slot_range_exceeds):
+					// a slot that escapes the table is a programming error and must fail
+					// here, not as a driver segfault in setSamplerState/setTexture.
+					if (slot.buffer_index != umax && slot_range_exceeds(slot.buffer_index, slot.array_size, max_buffer_slots))
+					{
+						fmt::throw_exception("Program buffer slot %u+%u exceeds the argument table (%u buffers)",
+							slot.buffer_index, slot.array_size, max_buffer_slots);
+					}
+
+					if (slot.texture_index != umax && slot_range_exceeds(slot.texture_index, slot.array_size, max_texture_slots))
+					{
+						fmt::throw_exception("Program texture slot %u+%u exceeds the argument table (%u textures)",
+							slot.texture_index, slot.array_size, max_texture_slots);
+					}
+
+					if (slot.sampler_index != umax && slot_range_exceeds(slot.sampler_index, slot.array_size, max_sampler_slots))
+					{
+						fmt::throw_exception("Program sampler slot %u+%u exceeds the argument table (%u samplers)",
+							slot.sampler_index, slot.array_size, max_sampler_slots);
+					}
+				}
+
+				if (m_layouts[stage].push_constant_buffer_index != umax &&
+					m_layouts[stage].push_constant_buffer_index >= max_buffer_slots)
+				{
+					fmt::throw_exception("Program push-constant slot %u exceeds the argument table (%u buffers)",
+						m_layouts[stage].push_constant_buffer_index, max_buffer_slots);
+				}
+
+				if (m_layouts[stage].buffer_count > max_buffer_slots)
+				{
+					fmt::throw_exception("Program uses %u buffers, exceeding the argument table (%u buffers)",
+						m_layouts[stage].buffer_count, max_buffer_slots);
 				}
 
 				auto& bindings = m_bindings[stage];
@@ -376,6 +490,7 @@ namespace mtl
 		{
 			const MTL::GPUAddress address = buffer.gpu_address();
 			const u32 range = static_cast<u32>(std::min<u64>(buffer.range, u32{umax}));
+			const gpu_access access = buffer.access();
 
 			for_each_bound_slot(set_id, binding_point, [&](u32 stage, const resource_slot& slot)
 			{
@@ -386,6 +501,10 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+
+				// Always: an equal address may belong to another buffer object (a freed allocation's range reused)
+				bindings.buffer_access[slot.buffer_index] = access;
+
 				if (bindings.buffers[slot.buffer_index] == address &&
 					bindings.buffer_sizes[slot.buffer_index] == range)
 				{
@@ -412,6 +531,8 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+				bindings.texture_access[slot.texture_index] = image.access;
+
 				if (bindings.textures[slot.texture_index]._impl == texture_id._impl &&
 					(slot.sampler_index == umax || bindings.samplers[slot.sampler_index]._impl == sampler_id._impl))
 				{
@@ -442,6 +563,8 @@ namespace mtl
 				}
 
 				auto& bindings = m_bindings[stage];
+				bindings.texture_access[slot.texture_index] = read_buffer(view);
+
 				if (bindings.textures[slot.texture_index]._impl == texture_id._impl)
 				{
 					return;
@@ -456,9 +579,10 @@ namespace mtl
 		{
 			for_each_bound_slot(set_id, binding_point, [&](u32 stage, const resource_slot& slot)
 			{
-				if (slot.texture_index == umax) [[unlikely]]
+				// Combined image samplers have both slots, separate images only a texture, separate samplers only a sampler
+				if (slot.texture_index == umax && slot.sampler_index == umax) [[unlikely]]
 				{
-					rsx_log.error("Image array bound to (set=%u, binding=%u), which is not an image input", set_id, binding_point);
+					rsx_log.error("Image array bound to (set=%u, binding=%u), which is not an image or sampler input", set_id, binding_point);
 					return;
 				}
 
@@ -468,15 +592,24 @@ namespace mtl
 				for (u32 i = 0; i < count; ++i)
 				{
 					const auto& image = images[i];
-					bindings.textures[slot.texture_index + i] = image.texture_id;
 
-					if (slot.sampler_index != umax)
+					if (slot.texture_index != umax)
+					{
+						bindings.texture_access[slot.texture_index + i] = image.access;
+
+						if (bindings.textures[slot.texture_index + i]._impl != image.texture_id._impl)
+						{
+							bindings.textures[slot.texture_index + i] = image.texture_id;
+							bindings.dirty = true;
+						}
+					}
+
+					if (slot.sampler_index != umax && bindings.samplers[slot.sampler_index + i]._impl != image.sampler_id._impl)
 					{
 						bindings.samplers[slot.sampler_index + i] = image.sampler_id;
+						bindings.dirty = true;
 					}
 				}
-
-				bindings.dirty = true;
 			});
 		}
 
@@ -501,6 +634,12 @@ namespace mtl
 			}
 		}
 
+		void program::set_storage_writes(u32 stage_index, bool writes)
+		{
+			ensure(stage_index < binding_set_index_max_enum);
+			m_stage_writes_storage[stage_index] = writes;
+		}
+
 		void program::enable_buffer_size_table(u32 stage_index)
 		{
 			ensure(stage_index < binding_set_index_max_enum);
@@ -510,15 +649,151 @@ namespace mtl
 			m_bindings[stage_index].dirty = true;
 		}
 
+		void program::set_full_state_upgrade(std::shared_ptr<mtl::full_state_upgrade> upgrade)
+		{
+			ensure(m_render_pipeline);
+			m_full_state_upgrade = std::move(upgrade);
+		}
+
+		void program::update_full_state_upgrade()
+		{
+			bool finished = false;
+			if (MTL::RenderPipelineState* full_state = mtl::poll_full_state_upgrade(m_full_state_upgrade, finished))
+			{
+				// Draws recorded before (this command list included) still use the specialized pipeline
+				auto specialized = std::make_unique<mtl::ref<MTL::RenderPipelineState>>(m_render_pipeline);
+				mtl::get_gc()->dispose(specialized);
+
+				m_render_pipeline = full_state;
+
+				// A new identity, so that encoders which have the specialized pipeline set get the new one
+				m_uid = ++g_next_program_uid;
+			}
+
+			if (finished)
+			{
+				m_full_state_upgrade.reset();
+			}
+		}
+
+		void sampler_write_ring::record(u64 prog_uid, u32 stage, u32 slot, u64 sampler_id, bool live)
+		{
+			const u32 index = m_total.fetch_add(1, std::memory_order_relaxed) % capacity;
+			m_entries[index] = sampler_write_entry{prog_uid, sampler_id, stage, slot, live ? 1u : 0u};
+		}
+
+		bool sampler_write_ring::empty() const
+		{
+			return m_total.load(std::memory_order_relaxed) == 0;
+		}
+
+		void sampler_write_ring::format_last(std::string& out, u32 max_lines) const
+		{
+			const u32 total_all = m_total.load(std::memory_order_relaxed);
+			u32 count = std::min(total_all, capacity);
+			if (max_lines < count)
+			{
+				count = max_lines;
+			}
+
+			// total_all >= count, so the subtraction cannot underflow.
+			const u32 start = (total_all - count) % capacity;
+			for (u32 n = 0; n < count; ++n)
+			{
+				// Best-effort under a racing writer: an entry recorded concurrently
+				// with this read may show mixed old/new fields.
+				const sampler_write_entry entry = m_entries[(start + n) % capacity];
+				fmt::append(out, "prog=%llu stage=%u slot=%u id=0x%llx live=%u\n",
+					static_cast<unsigned long long>(entry.prog_uid),
+					entry.stage, entry.slot,
+					static_cast<unsigned long long>(entry.sampler_id),
+					entry.live);
+			}
+		}
+
+		sampler_write_ring& global_sampler_write_ring()
+		{
+			static sampler_write_ring ring;
+			return ring;
+		}
+
+		std::string sampler_write_section()
+		{
+			if (global_sampler_write_ring().empty())
+			{
+				return {};
+			}
+
+			std::string out = "Recent Metal sampler writes (oldest first, driver-visible setSamplerState calls):\n";
+			global_sampler_write_ring().format_last(out, 64);
+			return out;
+		}
+
+		void program::report_dead_sampler(u32 stage, u32 sampler_slot, u64 bad_id, u32 texture_slot, u32 array_size)
+		{
+			// One error per program/stage/slot; the count keeps the total visible.
+			if (stage < binding_set_index_max_enum && sampler_slot < 32)
+			{
+				const u32 bit = 1u << sampler_slot;
+				if (m_dead_sampler_reported[stage] & bit)
+				{
+					return;
+				}
+				m_dead_sampler_reported[stage] |= bit;
+			}
+
+			const u64 total = g_dead_sampler_total.fetch_add(1) + 1;
+
+			// The texture slot and array size say whether this is an out-of-range
+			// sampler index (layout bug) or a stale ID in a valid slot (lifetime
+			// bug): umax texture means a sampler-only slot.
+			if (texture_slot == umax)
+			{
+				rsx_log.error("Metal: sampler slot with no live sampler (stage %u, sampler slot %u, stored id=0x%llx, no texture slot, array %u); substituted a live fallback (total %llu).",
+					stage, sampler_slot,
+					static_cast<unsigned long long>(bad_id),
+					array_size,
+					static_cast<unsigned long long>(total));
+			}
+			else
+			{
+				rsx_log.error("Metal: sampler slot with no live sampler (stage %u, sampler slot %u, stored id=0x%llx, texture slot %u+%u); substituted a live fallback (total %llu).",
+					stage, sampler_slot,
+					static_cast<unsigned long long>(bad_id),
+					texture_slot, array_size,
+					static_cast<unsigned long long>(total));
+			}
+		}
+
 		void program::bind(mtl::command_list& cmd, mtl::data_heap& scratch)
 		{
-			auto write_table = [&](u32 stage, argument_table_slot table_slot)
+			// `declare(index, texture, access)`: what argument table slot `index` gives the shaders access to
+			auto write_table = [&](u32 stage, argument_table_slot table_slot, auto&& declare)
 			{
 				MTL4::ArgumentTable* table = cmd.argument_table(table_slot);
+				// Tables are created with the command list and released at its teardown; a null
+				// table here means recording into a destroyed list. Fail with a named error
+				// instead of segfaulting inside the driver's setSamplerState with no context.
+				ensure(table, "Metal: program bound to a command list without argument tables");
 				argument_table_shadow& contents = cmd.argument_table_contents(table_slot);
 				const binding_layout& layout = m_layouts[stage];
 				auto& bindings = m_bindings[stage];
 				bool missing = false;
+
+				// Storage bindings are writes unless the shader of the stage cannot write any. Every bind_uniform*() records
+				// the access of what it binds (buffers: the bound range; images and arrays of them, separate images
+				// included: the view's subresources; texel buffers: the viewed range), so a bound slot without one is a
+				// programming error: order the command after everything (counted as a full-barrier fallback).
+				const auto access_of = [&](const resource_slot& slot, const gpu_access& access, bool bound)
+				{
+					if (bound && access.kind == gpu_access::none) [[unlikely]]
+					{
+						return gpu_access::undeclared();
+					}
+
+					const bool storage = slot.type == input_type_storage_buffer || slot.type == input_type_storage_texture;
+					return (storage && m_stage_writes_storage[stage]) ? access.as_write() : access;
+				};
 
 				// Argument tables are shared by every program recorded into this command list, and each draw/dispatch
 				// snapshots the table when encoded. Every slot this stage uses must hold this program's resource, but only
@@ -536,6 +811,11 @@ namespace mtl
 							{
 								table->setAddress(address, slot.buffer_index + i);
 							}
+
+							// A binding with an empty range gives the shader no bytes (e.g. the instanced constants of a program
+							// without constants): nothing to declare, not an undescribed access
+							declare(slot.buffer_index + i, false, access_of(slot, bindings.buffer_access[slot.buffer_index + i],
+								address != 0 && bindings.buffer_sizes[slot.buffer_index + i] != 0));
 						}
 						continue;
 					}
@@ -551,6 +831,8 @@ namespace mtl
 							{
 								table->setTexture(texture_id, slot.texture_index + i);
 							}
+
+							declare(slot.texture_index + i, true, access_of(slot, bindings.texture_access[slot.texture_index + i], texture_id._impl != 0));
 						}
 					}
 
@@ -559,15 +841,54 @@ namespace mtl
 						for (u32 i = 0; i < slot.array_size; ++i)
 						{
 							MTL::ResourceID sampler_id = bindings.samplers[slot.sampler_index + i];
-							if (!sampler_id._impl)
+
+							// Resolve under the liveness lock and HOLD it across the driver call:
+							// the sampler object behind a live ID can be destroyed on another
+							// thread (pool eviction, GPU-completion reclamation) between check and
+							// use. The guard makes destruction wait, so a live-checked ID cannot
+							// fault the driver mid-call (the 0x448/0x449 setSamplerState segfaults).
+							auto live_guard = sampler_liveness::retain_if_live(sampler_id._impl);
+
+							if (!live_guard.owns_lock())
 							{
-								sampler_id = g_default_sampler.get();
+								// Dead or missing sampler: the object behind a cached ID was destroyed
+								// (or nothing was ever bound). setSamplerState faults natively on a dead
+								// ID, so substitute a live fallback and name the slot for the log.
+								report_dead_sampler(stage, slot.sampler_index + i, sampler_id._impl, slot.texture_index, slot.array_size);
+								sampler_id = live_fallback_sampler();
+								live_guard = sampler_liveness::retain_if_live(sampler_id._impl);
+							}
+
+							if (!live_guard.owns_lock()) [[unlikely]]
+							{
+								// No live sampler at all (renderer teardown): leave the table's
+								// contents rather than faulting the driver.
+								continue;
+							}
+
+							if (sampler_trace_enabled())
+							{
+								// Verbose per-write logging (enable with RPCS3_METAL_SAMPLER_TRACE=1).
+								// The log channel prefix carries the draw's FIFO position; match the ID
+								// against the "created id=" lines to recover the sampler configuration.
+								// (The always-on ring below captures the same facts without the log spam.)
+								// live=1 is proven by the held guard, not re-checked.
+								rsx_log.notice("Metal sampler trace: prog=%llu stage=%u slot=%u id=0x%llx live=%u table=%p",
+									static_cast<unsigned long long>(m_uid),
+									stage, slot.sampler_index + i,
+									static_cast<unsigned long long>(sampler_id._impl),
+									1u,
+									static_cast<const void*>(table));
 							}
 
 							if (contents.update_sampler(slot.sampler_index + i, sampler_id))
 							{
+								// Always recorded, before the driver call, so a faulting write is
+								// already in the ring when the crash report dumps it.
+								global_sampler_write_ring().record(m_uid, stage, slot.sampler_index + i, sampler_id._impl, true);
 								table->setSamplerState(sampler_id, slot.sampler_index + i);
 							}
+							// live_guard releases here: destruction of this ID may now proceed.
 						}
 					}
 				}
@@ -628,38 +949,80 @@ namespace mtl
 
 			if (is_compute())
 			{
-				// compute() orders this command after the previous one; the caller's dispatch can then use
-				// compute_unordered() since it depends only on this bind.
-				// NOTE: The pipeline state and the table are set for every dispatch. The compute encoder also records the
-				// copies and fills, and dispatches are rare next to draws, so its state is not tracked.
-				MTL4::ComputeCommandEncoder* encoder = cmd.compute();
-				encoder->setComputePipelineState(m_compute_pipeline);
-				encoder->setArgumentTable(write_table(binding_set_index_compute, table_compute));
+				// The dispatch that follows is a command of its own: cmd.dispatch() orders it after the earlier commands
+				// its resources conflict with (the table contents are captured by the dispatch, so the table can be
+				// written first). The caller records the dispatch on cmd.compute_encoder(). Like the render encoder state
+				// below, the pipeline state and the table are set once per encoder (dispatch() may begin a new one, which
+				// resets the bindings, so they are read after it).
+				std::array<gpu_access, max_buffer_slots + max_texture_slots> accesses;
+				usz access_count = 0;
+
+				MTL4::ArgumentTable* table = write_table(binding_set_index_compute, table_compute, [&](u32, bool, const gpu_access& access)
+				{
+					accesses[access_count++] = access;
+				});
+
+				MTL4::ComputeCommandEncoder* encoder = cmd.dispatch({ accesses.data(), access_count });
+				compute_encoder_bindings& encoder_state = cmd.compute_bindings();
+				encoder_state_counters& counters = cmd.state_counters();
+
+				if (counters.count(encoder_state.program_uid != m_uid))
+				{
+					encoder->setComputePipelineState(m_compute_pipeline);
+					encoder_state.program_uid = m_uid;
+				}
+
+				if (counters.count(!encoder_state.table_set))
+				{
+					encoder->setArgumentTable(table);
+					encoder_state.table_set = true;
+				}
 				return;
 			}
 
 			MTL4::RenderCommandEncoder* encoder = cmd.render_encoder();
 			ensure(encoder, "Graphics program bound outside of a render pass");
 
+			if (m_full_state_upgrade) [[unlikely]]
+			{
+				// Specialized render pipeline: counts this draw, swaps in the full-state pipeline once it is ready
+				update_full_state_upgrade();
+			}
+
+			// What the draws read: each slot is declared for the open pass (skipped when it did not change)
+			auto declare_vertex = [&](u32 index, bool texture, const gpu_access& access)
+			{
+				cmd.table_access(table_vertex, index, texture, access);
+			};
+
+			auto declare_fragment = [&](u32 index, bool texture, const gpu_access& access)
+			{
+				cmd.table_access(table_fragment, index, texture, access);
+			};
+
+			// Declarations first, pipeline state after: until the pass has a pipeline state it has no draw, and the
+			// command list may still encode the barriers a declaration needs (render_encoder_bindings::program_uid)
+			MTL4::ArgumentTable* vertex_table = write_table(binding_set_index_vertex, table_vertex, declare_vertex);
+			MTL4::ArgumentTable* fragment_table = write_table(binding_set_index_fragment, table_fragment, declare_fragment);
+
 			// The pipeline state and the stage tables are render encoder state: set once per encoder (and pipeline).
 			// Changes to a table's contents after it was set are seen by the draws encoded later.
 			render_encoder_bindings& encoder_state = cmd.render_bindings();
+			encoder_state_counters& counters = cmd.state_counters();
 
-			if (encoder_state.program_uid != m_uid)
+			if (counters.count(encoder_state.program_uid != m_uid))
 			{
 				encoder->setRenderPipelineState(m_render_pipeline);
 				encoder_state.program_uid = m_uid;
 			}
 
-			MTL4::ArgumentTable* vertex_table = write_table(binding_set_index_vertex, table_vertex);
-			if (!(encoder_state.tables_set & (1u << table_vertex)))
+			if (counters.count(!(encoder_state.tables_set & (1u << table_vertex))))
 			{
 				encoder->setArgumentTable(vertex_table, MTL::RenderStageVertex);
 				encoder_state.tables_set |= (1u << table_vertex);
 			}
 
-			MTL4::ArgumentTable* fragment_table = write_table(binding_set_index_fragment, table_fragment);
-			if (!(encoder_state.tables_set & (1u << table_fragment)))
+			if (counters.count(!(encoder_state.tables_set & (1u << table_fragment))))
 			{
 				encoder->setArgumentTable(fragment_table, MTL::RenderStageFragment);
 				encoder_state.tables_set |= (1u << table_fragment);

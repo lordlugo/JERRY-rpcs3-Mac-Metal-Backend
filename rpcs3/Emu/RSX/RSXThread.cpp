@@ -3,6 +3,10 @@
 
 #include "Capture/rsx_capture.h"
 #include "Common/surface_store.h"
+#include "Common/guest_frame_limit.hpp"
+#include "Common/forced_msaa.hpp"
+#include "Emu/Cell/timing_probe.h"
+#include "Common/sync_wait_stats.hpp"
 #include "Core/RSXReservationLock.hpp"
 #include "Core/RSXEngLock.hpp"
 #include "Host/MM.h"
@@ -18,18 +22,22 @@
 #include "Emu/System.h"
 #include "Emu/system_utils.hpp"
 #include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Cell/lv2/sys_event.h"
 #include "Emu/Cell/lv2/sys_time.h"
 #include "Emu/Cell/Modules/cellGcmSys.h"
 #include "util/serialization_ext.hpp"
 #include "Overlays/overlay_perf_metrics.h"
+
+#include <cstring>
 #include "Overlays/overlay_debug_overlay.h"
 #include "Overlays/overlay_manager.h"
 
 #include "Utilities/date_time.h"
 
 #include "util/asm.hpp"
+#include "util/logs.hpp"
 
 #include <span>
 #include <thread>
@@ -43,6 +51,11 @@ atomic_t<bool> g_user_asked_for_recording = false;
 atomic_t<bool> g_user_asked_for_screenshot = false;
 atomic_t<bool> g_user_asked_for_frame_capture = false;
 atomic_t<bool> g_disable_frame_limit = false;
+atomic_t<u32> g_guest_logic_rate_multiplier = 1;
+atomic_t<bool> g_guest_speed_lock = false;
+
+// Runtime timestep retimer (PPUModule.cpp): incremental scan of the game's writable memory, one slice per guest flip
+extern void game_patches_runtime_on_flip();
 rsx::frame_trace_data frame_debug;
 rsx::frame_capture_data frame_capture;
 
@@ -127,7 +140,8 @@ namespace rsx
 	constexpr u32 fs_export_config_mask =
 		RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE |
 		RSX_SHADER_CONTROL_ROP_MULTISAMPLED |
-		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING;
+		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING |
+		RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST;
 
 	rsx_iomap_table::rsx_iomap_table() noexcept
 		: ea(fill_array(-1))
@@ -1038,11 +1052,13 @@ namespace rsx
 	void thread::post_vblank_event(u64 post_event_time)
 	{
 		vblank_count++;
+		timing_probe::hit(timing_probe::vblank_signals);
 
 		if (isHLE)
 		{
 			if (auto ptr = vblank_handler)
 			{
+				timing_probe::hit(timing_probe::vblank_handler_calls);
 				intr_thread->cmd_list
 				({
 					{ ppu_cmd::set_args, 1 }, u64{1},
@@ -1259,6 +1275,10 @@ namespace rsx
 			manager->stop_audio();
 		}
 
+		// FIFO idle period whose queued zcull reports were already drained (see below)
+		u64 zcull_drained_idle_ts = 0;
+		u64 zcull_submitted_idle_ts = 0;
+
 		while (!test_stopped())
 		{
 			// Wait for external pause events
@@ -1291,10 +1311,43 @@ namespace rsx
 				// Update other sub-units
 				zcull_ctrl->update(this);
 
+				// An idle GPU finishes everything it was given: once the FIFO has run dry, write every queued zcull
+				// report and every label held back for them. Otherwise a guest that waits on one of those (polling a
+				// report or a semaphore from the CPU or an SPU) before it submits more work would wait forever, since
+				// nothing else forces the reports out while the RSX is idle.
+				// RPCS3 Metal fork: in two steps. After 1 ms idle the queued work is only submitted (update with the
+				// hint flag): the reports and labels then retire through the regular update as the GPU finishes them,
+				// without the RSX thread waiting. The hard sync (waiting for the GPU) only runs if the FIFO is still
+				// empty 20 ms later. Hard-syncing at 1 ms made the RSX thread wait for the GPU whenever the game paused
+				// its command stream for a moment (GTA IV: ~6.4 ms per frame, logged at the last method, a semaphore
+				// release), and new commands then waited behind it: hitches and lower fps.
+				if (performance_counters.state == FIFO::state::empty &&
+					(zcull_ctrl->has_pending() || zcull_ctrl->has_deferred_labels()))
+				{
+					const u64 idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp;
+
+					if (performance_counters.FIFO_idle_timestamp != zcull_submitted_idle_ts && idle_us >= 1000)
+					{
+						zcull_submitted_idle_ts = performance_counters.FIFO_idle_timestamp;
+						zcull_ctrl->update(this, 0, true);
+					}
+					else if (performance_counters.FIFO_idle_timestamp != zcull_drained_idle_ts && idle_us >= 20'000)
+					{
+						zcull_drained_idle_ts = performance_counters.FIFO_idle_timestamp;
+						zcull_ctrl->sync(this);
+					}
+				}
+
 				if (m_host_dma_ctrl)
 				{
 					m_host_dma_ctrl->update();
 				}
+			}
+
+			// Stall tripwire at a coarse cadence (diagnostic only, never blocks)
+			if ((m_cycles_counter & 1023) == 0)
+			{
+				check_stall_tripwire();
 			}
 
 			// Execute FIFO queue
@@ -1367,7 +1420,18 @@ namespace rsx
 		{
 			// NOTE: This has to be executed immediately
 			// Delaying this operation can cause desync due to the delay in firing the flip event
+			const u64 flip_start = get_system_time();
 			handle_emu_flip(async_flip_buffer);
+
+			// The flip (and its frame limiter wait, counted on its own) is not time the FIFO spent idle or a semaphore
+			// acquire spent waiting
+			const u64 now = get_system_time();
+			g_sync_wait_stats.rsx_async_flip_us += now - flip_start;
+
+			if (performance_counters.state != FIFO::state::running)
+			{
+				performance_counters.FIFO_idle_timestamp = std::min(performance_counters.FIFO_idle_timestamp + (now - flip_start), now);
+			}
 		}
 
 		if (state != FIFO::state::lock_wait)
@@ -2122,11 +2186,14 @@ namespace rsx
 
 		// Resolve MSAA here if needed
 		if (!!(expected_ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) &&
-			REGS(m_ctx)->surface_antialias() != rsx::surface_antialiasing::center_1_sample &&
+			rsx::surface_is_host_multisampled(REGS(m_ctx)->surface_antialias()) &&
 			backend_config.supports_hw_msaa)
 		{
 			expected_ctrl |= RSX_SHADER_CONTROL_ROP_MULTISAMPLED;
 		}
+
+		// Exports the backend decides for the current draw and its surfaces (e.g. a depth bounds test in the program)
+		expected_ctrl |= get_backend_fragment_program_export_config();
 
 		// Depth compare
 		if (!g_cfg.video.emulate_depth_compare) [[ likely ]]
@@ -2148,7 +2215,7 @@ namespace rsx
 
 		// Resolve MSAA here if needed
 		if ((expected_ctrl & (RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE | RSX_SHADER_CONTROL_ROP_MULTISAMPLED)) == RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE &&
-			REGS(m_ctx)->surface_antialias() != rsx::surface_antialiasing::center_1_sample &&
+			rsx::surface_is_host_multisampled(REGS(m_ctx)->surface_antialias()) &&
 			backend_config.supports_hw_msaa)
 		{
 			expected_ctrl |= RSX_SHADER_CONTROL_ROP_MULTISAMPLED;
@@ -2369,11 +2436,23 @@ namespace rsx
 
 		if (REGS(m_ctx)->msaa_alpha_to_coverage_enabled())
 		{
-			const bool is_multiple_samples = REGS(m_ctx)->surface_antialias() != rsx::surface_antialiasing::center_1_sample;
-			if (!backend_config.supports_hw_a2c || (!is_multiple_samples && !backend_config.supports_hw_a2c_1spp))
+			// Host sample count: with forced MSAA a single-sample guest surface is multisampled, so the hardware coverage
+			// path applies (real anti-aliased alpha-to-coverage instead of the shader emulation)
+			const bool is_multiple_samples = rsx::surface_is_host_multisampled(REGS(m_ctx)->surface_antialias());
+			const bool emulate_a2c = !backend_config.supports_hw_a2c || (!is_multiple_samples && !backend_config.supports_hw_a2c_1spp);
+			if (emulate_a2c)
 			{
 				// Emulation required
 				current_fragment_program.ctrl |= RSX_SHADER_CONTROL_ALPHA_TO_COVERAGE;
+			}
+
+			// Diagnostic: name once per session which alpha-to-coverage path this game uses
+			static atomic_t<u8> s_a2c_logged = 0;
+			const u8 a2c_bit = emulate_a2c ? 1 : 2;
+			if (!(s_a2c_logged & a2c_bit) && !(s_a2c_logged.fetch_or(a2c_bit) & a2c_bit))
+			{
+				rsx_log.notice("RSX: the game uses alpha-to-coverage (%s, guest AA mode %d)",
+					emulate_a2c ? "emulated in the shader" : "host hardware coverage", static_cast<int>(REGS(m_ctx)->surface_antialias()));
 			}
 		}
 
@@ -2726,6 +2805,70 @@ namespace rsx
 		}
 
 		last_host_flip_timestamp = get_system_time();
+		stall_tripwire_armed = true;
+	}
+
+	void thread::check_stall_tripwire()
+	{
+		// Diagnostic only: fires when the task loop keeps turning with no display progress while running.
+		// Catches silent wedges (no logs, no draws, no flips, hot CPU) that recovery timeouts cannot see.
+		if (!stall_tripwire_armed || Emu.IsPausedOrReady() || !rsx_thread_running || !ctrl)
+		{
+			return;
+		}
+
+		const u64 now = get_system_time();
+		const u32 put = static_cast<u32>(ctrl->put);
+
+		if (now - last_host_flip_timestamp <= 15'000'000)
+		{
+			// Display progress (or early session): re-arm for the next episode
+			stall_tripwire_fired = false;
+			stall_tripwire_last_put = put;
+			return;
+		}
+
+		if (!stall_tripwire_fired)
+		{
+			stall_tripwire_fired = true;
+
+			const char* fifo_state_name = "unknown";
+			switch (performance_counters.state)
+			{
+			case FIFO::state::running: fifo_state_name = "running"; break;
+			case FIFO::state::empty: fifo_state_name = "empty"; break;
+			case FIFO::state::spinning: fifo_state_name = "spinning (jump-to-self: the game parked RSX and never released it)"; break;
+			case FIFO::state::nop: fifo_state_name = "nop"; break;
+			case FIFO::state::lock_wait: fifo_state_name = "lock_wait"; break;
+			case FIFO::state::paused: fifo_state_name = "paused"; break;
+			}
+
+			const std::string tripwire_msg = fmt::format("RSX stall tripwire: no display flip for %llu s while the RSX task loop is turning (GET=0x%x PUT=0x%x%s, FIFO state=%s, last method=0x%x). Capture a native backtrace of rsx::thread for the exact wait site.",
+				(now - last_host_flip_timestamp) / 1'000'000,
+				static_cast<u32>(ctrl->get), put,
+				put == stall_tripwire_last_put ? ", PUT static" : ", PUT advancing",
+				fifo_state_name,
+				fifo_ctrl ? fifo_ctrl->last_cmd() : 0u);
+
+			rsx_log.error("%s", tripwire_msg);
+
+			if (zcull_ctrl)
+			{
+				rsx_log.error("RSX stall: zcull reports queued: %s, labels held back for reports: %s",
+					zcull_ctrl->has_pending() ? "yes" : "no", zcull_ctrl->has_deferred_labels() ? "yes" : "no");
+			}
+
+			// Name the game-side wait while the threads are still parked.
+			const std::string thread_states = dump_stall_thread_states();
+
+			// The game is wedged: a force-quit or relaunch must not eat this report.
+			// Mirror it to the append-only sidecar (survives log rotation) and flush
+			// the log to disk now, before anything else can lose it.
+			append_stall_sidecar(stall_sidecar_path(), tripwire_msg + "\n" + thread_states);
+			logs::listener::sync_all();
+		}
+
+		stall_tripwire_last_put = put;
 	}
 
 	void thread::check_zcull_status(bool framebuffer_swap)
@@ -2896,6 +3039,19 @@ namespace rsx
 		return zcull_ctrl->defer_label_write(this, address, value);
 	}
 
+	void thread::sync_all_zcull_reports()
+	{
+		m_eng_interrupt_mask.clear(rsx::pipe_flush_interrupt);
+		mm_flush();
+
+		if (zcull_ctrl->has_pending() || zcull_ctrl->has_deferred_labels())
+		{
+			zcull_ctrl->sync(this, true);
+		}
+
+		m_graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
+	}
+
 	void thread::flush_deferred_labels()
 	{
 		if (zcull_ctrl && zcull_ctrl->has_deferred_labels() && is_current_thread()) [[unlikely]]
@@ -2912,6 +3068,29 @@ namespace rsx
 	bool thread::has_deferred_labels() const
 	{
 		return zcull_ctrl && zcull_ctrl->has_deferred_labels();
+	}
+
+	void thread::reset_flip_semaphore()
+	{
+		const u32 address = label_addr + 0x10;
+
+		// NOTE: Realhw resets 16 bytes of this semaphore for some reason
+		// Unprotected mapping: emulator bookkeeping must not look like a guest read of pending zcull reports sharing the page
+		vm::get_super_ptr<atomic_t<u128>>(address)->store(u128{});
+
+		// The FIFO releases the flip semaphore (nv406e::semaphore_release, "flip pending") before the flip command, and
+		// that release may still be held back behind labels waiting for zcull reports (util::write_gcm_label). Landing
+		// after this reset, it would leave the semaphore pending until the next flip, which the FIFO only reaches after
+		// its wait for this flip (cellGcmSetWaitFlip): the RSX would stall in nv406e::semaphore_acquire for the whole
+		// driver recovery timeout. Queue the reset behind it instead (the reset above covers the common case).
+		// Not through defer_label(): its release-ordering DMA sync can run on_semaphore_acquire_wait -> do_local_task ->
+		// handle_emu_flip, i.e. a flip nested inside the flip-done notification of handle_emu_flip (m_queued_flip is no
+		// longer in progress there), which then loops on its flip_notification_count. A driver write needs no sync.
+		if (is_current_thread() && has_deferred_label_at(address) && !zcull_ctrl->defer_label_write(this, address, 0))
+		{
+			flush_deferred_labels();
+			vm::get_super_ptr<atomic_t<u128>>(address)->store(u128{});
+		}
 	}
 
 	bool thread::is_fifo_idle() const
@@ -3042,6 +3221,16 @@ namespace rsx
 		}
 
 		// Error. Should reset the queue
+		if (last_fifo_recover_target == restore_point && current_time - last_fifo_recover_time < 100'000)
+		{
+			// Diagnostic only. Skipping ahead to PUT instead was tried: it drops the game's flip and semaphore commands
+			// and the game then waits for them forever (SvR 2011 froze), so recovery stays as upstream.
+			rsx_log.error("FIFO recovery: restore point 0x%x desynced again right away (stale restore point)", restore_point);
+		}
+
+		last_fifo_recover_target = restore_point;
+		last_fifo_recover_time = current_time;
+
 		fifo_ctrl->set_get(restore_point);
 		fifo_ret_addr = saved_fifo_ret;
 		std::this_thread::sleep_for(2ms);
@@ -3143,6 +3332,365 @@ namespace rsx
 	{
 		// Last fifo cmd for logging and utility
 		return fifo_ctrl->last_cmd();
+	}
+
+	std::string crash_context_provider()
+	{
+		std::string out;
+
+		if (auto rsx = get_current_renderer())
+		{
+			// The DMA control block lives in guest-mapped memory: validate the mapping
+			// before touching it, so the reporter itself can never fault.
+			if (rsx->ctrl)
+			{
+				if (auto [addr, ok] = vm::try_get_addr(rsx->ctrl); ok)
+				{
+					fmt::append(out, "RSX FIFO: GET=0x%x PUT=0x%x\n", +rsx->ctrl->get, +rsx->ctrl->put);
+				}
+			}
+
+			if (rsx->fifo_ctrl)
+			{
+				fmt::append(out, "RSX last method: 0x%x\n", rsx->fifo_ctrl->last_cmd());
+			}
+		}
+
+		return out;
+	}
+
+	std::string format_stall_thread_line(const char* kind, u32 id, const std::string& name, bool waiting, u32 pc, const char* func, const char* pc_name, const char* extra)
+	{
+		std::string out;
+		fmt::append(out, "%s[0x%x] \"%s\": %s", kind ? kind : "?", id, name, waiting ? "waiting" : "running");
+
+		if (func && *func)
+		{
+			fmt::append(out, " in %s", func);
+		}
+
+		fmt::append(out, " at %s 0x%x", pc_name ? pc_name : "PC", pc);
+
+		if (extra && *extra)
+		{
+			fmt::append(out, " %s", extra);
+		}
+
+		return out;
+	}
+
+	std::string stall_sidecar_path()
+	{
+		return fs::get_log_dir() + "RSXStallReports.log";
+	}
+
+	bool append_stall_sidecar(const std::string& path, const std::string& text)
+	{
+		if (path.empty() || text.empty())
+		{
+			return false;
+		}
+
+		fs::file sidecar(path, fs::create + fs::append + fs::write);
+		if (!sidecar)
+		{
+			return false;
+		}
+
+		// Wall-clock header: the sidecar outlives the session log, so each entry
+		// must carry its own timestamp.
+		const std::string entry = fmt::format("===== RSX stall report (%s) =====\n%s\n", date_time::current_time(), text);
+
+		if (sidecar.write(entry.data(), entry.size()) != entry.size())
+		{
+			return false;
+		}
+
+		// To disk now: a force-kill right after the wedge must keep this entry.
+		sidecar.sync();
+		return true;
+	}
+
+	std::string format_spu_wait_detail(u32 ev_mask, u32 ev_pending, u32 mfc_depth, u32 raddr, u32 out_mbox, u32 out_intr_mbox)
+	{
+		std::string out;
+		fmt::append(out, " evmask=0x%x evpend=0x%x mfc=%u raddr=0x%x outmb=%u outintr=%u",
+			ev_mask, ev_pending, mfc_depth, raddr, out_mbox, out_intr_mbox);
+		return out;
+	}
+
+	std::string format_stall_wait_args(const char* func, u64 g3, u64 g4, u64 g5, u64 g6)
+	{
+		if (!func || !*func)
+		{
+			return {};
+		}
+
+		// Signatures from rpcs3/Emu/Cell/lv2 (sys_timer.h, sys_event.h, sys_spu.h,
+		// sys_lwcond.h, sys_lwmutex.h, sys_event_flag.h). Values print raw: a zero
+		// timeout generally means "wait indefinitely", a small usleep means a poll loop.
+		if (!std::strcmp(func, "sys_timer_usleep"))
+		{
+			return fmt::format("sleep=0x%llx", g3);
+		}
+
+		if (!std::strcmp(func, "sys_event_queue_receive"))
+		{
+			return fmt::format("queue=0x%x timeout=0x%llx", static_cast<u32>(g3), g5);
+		}
+
+		if (!std::strcmp(func, "sys_spu_thread_group_join"))
+		{
+			return fmt::format("group=0x%x", static_cast<u32>(g3));
+		}
+
+		if (!std::strcmp(func, "_sys_lwcond_queue_wait"))
+		{
+			return fmt::format("cond=0x%x mutex=0x%x timeout=0x%llx", static_cast<u32>(g3), static_cast<u32>(g4), g5);
+		}
+
+		if (!std::strcmp(func, "_sys_lwmutex_lock"))
+		{
+			return fmt::format("mutex=0x%x timeout=0x%llx", static_cast<u32>(g3), g5);
+		}
+
+		if (!std::strcmp(func, "sys_event_flag_wait"))
+		{
+			return fmt::format("flag=0x%x pattern=0x%llx timeout=0x%llx", static_cast<u32>(g3), g4, g6);
+		}
+
+		return {};
+	}
+
+	std::string format_stall_code_words(u32 base, const u32* words, usz count)
+	{
+		std::string out;
+		fmt::append(out, "code=0x%x:[", base);
+
+		for (usz i = 0; i < count; i++)
+		{
+			fmt::append(out, "%s%08x", i ? " " : "", words[i]);
+		}
+
+		out += ']';
+		return out;
+	}
+
+	std::string format_stall_gprs(const u64* gpr)
+	{
+		std::string out = "gpr=[";
+
+		for (u32 i = 0; i < 32; i++)
+		{
+			fmt::append(out, "%s%llx", i ? " " : "", gpr[i]);
+		}
+
+		out += ']';
+		return out;
+	}
+
+	bool decode_stall_poll_addr(const u32* words, usz count, const u64* gpr, u32& ea)
+	{
+		if (!words || !gpr || !count)
+		{
+			return false;
+		}
+
+		// Last load wins: spills and setup loads precede it, the poll load sits right
+		// before the compare/branch into the sleep call.
+		for (usz i = count; i-- > 0;)
+		{
+			const u32 w = words[i];
+			const u32 op = w >> 26;
+
+			if (op == 32 || op == 34 || op == 40 || op == 42) // lwz, lbz, lhz, lha
+			{
+				const u32 ra = (w >> 16) & 0x1f;
+				const s32 d = static_cast<s16>(w & 0xffff);
+				const u64 base = ra ? gpr[ra] : 0;
+				ea = static_cast<u32>(base + d);
+				return true;
+			}
+
+			if (op == 31 && ((w >> 1) & 0x3ff) == 20) // lwarx
+			{
+				const u32 ra = (w >> 16) & 0x1f;
+				const u32 rb = (w >> 11) & 0x1f;
+				const u64 base = ra ? gpr[ra] : 0;
+				ea = static_cast<u32>(base + gpr[rb]);
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	std::string format_stall_poll_value(u32 ea, u32 value)
+	{
+		std::string out;
+		fmt::append(out, "pollval=[0x%x]=0x%x", ea, value);
+		return out;
+	}
+
+	std::string format_stall_event_queue(u32 id, u64 name, u64 key, usz backlog)
+	{
+		std::string out;
+		fmt::append(out, "EVQ[0x%x] name=0x%llx key=0x%llx backlog=%u", id, name, key, static_cast<u32>(backlog));
+		return out;
+	}
+
+	std::string dump_stall_thread_states()
+	{
+		// What every PPU thread is blocked in when the screen wedges: the parked
+		// FIFO alone cannot say whether the game waits on a mutex, a flip, an SPU
+		// queue or nothing at all. Bounded (first 32 threads) and read-only.
+		std::string out;
+		u32 total = 0, waiting = 0;
+
+		idm::select<named_thread<ppu_thread>>([&](u32 id, named_thread<ppu_thread>& cpu)
+		{
+			total++;
+
+			if (total > 32)
+			{
+				return;
+			}
+
+			const auto flags = +cpu.state;
+			const bool is_wait = !!(flags & cpu_flag::wait);
+
+			if (is_wait)
+			{
+				waiting++;
+			}
+
+			const char* func = cpu.current_function ? cpu.current_function : cpu.last_function;
+
+			// WHAT the thread waits for, decoded from the parked syscall's argument
+			// registers (best-effort like the CIA read: the thread is parked inside the
+			// call, so GPR3-GPR6 still hold its arguments). Unknown waits decode empty.
+			std::string extra;
+			if (is_wait)
+			{
+				extra = format_stall_wait_args(func, cpu.gpr[3], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6]);
+			}
+
+			fmt::append(out, "%s\n", format_stall_thread_line("PPU", id, thread_ctrl::get_name(cpu), is_wait, cpu.cia, func, "CIA",
+				extra.empty() ? nullptr : extra.c_str()));
+
+			// Poll-loop context: a thread parked in usleep is usually spinning on a
+			// user-space flag (the GoW prologue wedge polls every 30 us). Dump the code
+			// words around the sleep call site (the loop body that loads the flag) and
+			// the GPR file (the load's base register), so the next report names the
+			// polled address instead of just the sleep. Checked reads only, bounded.
+			if (is_wait && func && !std::strcmp(func, "sys_timer_usleep"))
+			{
+				u32 words[16]{};
+				usz count = 0;
+
+				for (u32 addr = cpu.cia; count < std::size(words) && vm::check_addr(addr, 0, 4); addr -= 4)
+				{
+					words[count++] = vm::read32(addr);
+
+					if (addr < 4)
+					{
+						break;
+					}
+				}
+
+				if (count)
+				{
+					// Ascending for the formatter.
+					for (usz lo = 0, hi = count - 1; lo < hi; lo++, hi--)
+					{
+						std::swap(words[lo], words[hi]);
+					}
+
+					fmt::append(out, "    %s\n", format_stall_code_words(cpu.cia - static_cast<u32>((count - 1) * 4), words, count));
+					fmt::append(out, "    %s\n", format_stall_gprs(cpu.gpr));
+
+					// The polled flag's live value: stuck-at-zero across freezes means the
+					// producer never ran; advancing values mean it stalls partway (which
+					// chunk fails). Word read at the decoded address, checked only.
+					u32 poll_ea = 0;
+
+					if (decode_stall_poll_addr(words, count, cpu.gpr, poll_ea) && vm::check_addr(poll_ea & ~3u, 0, 4))
+					{
+						fmt::append(out, "    %s\n", format_stall_poll_value(poll_ea, vm::read32(poll_ea & ~3u)));
+					}
+				}
+			}
+		});
+
+		fmt::append(out, "%u PPU thread(s), %u waiting\n", total, waiting);
+
+		// SPU side: a group join that never returns (the BigSpursHdlr0 wedge) means
+		// an SPU thread group stuck mid-work. Same bounded read-only pass.
+		u32 spu_total = 0, spu_waiting = 0;
+
+		idm::select<named_thread<spu_thread>>([&](u32 id, named_thread<spu_thread>& spu)
+		{
+			spu_total++;
+
+			if (spu_total > 16)
+			{
+				return;
+			}
+
+			const auto flags = +spu.state;
+			const bool is_wait = !!(flags & cpu_flag::wait);
+
+			if (is_wait)
+			{
+				spu_waiting++;
+			}
+
+			// Best-effort cross-thread read (same class as the PC read): torn values
+			// are acceptable forensics. One atomic load for a consistent pair.
+			// The reservation address is only meaningful while waiting (stale after
+			// wake), so it reads as zero for running threads.
+			const auto spu_events = spu.ch_events.load();
+			fmt::append(out, "%s%s\n", format_stall_thread_line("SPU", id, thread_ctrl::get_name(spu), is_wait, spu.pc, nullptr, "PC"),
+				format_spu_wait_detail(static_cast<u32>(spu_events.mask), static_cast<u32>(spu_events.events), spu.mfc_size,
+					is_wait ? spu.wait_raddr.load() : 0,
+					spu.ch_out_mbox.get_count(), spu.ch_out_intr_mbox.get_count()));
+		});
+
+		fmt::append(out, "%u SPU thread(s), %u waiting\n", spu_total, spu_waiting);
+
+		// Event-queue backlog: PPU dispatchers (SPURS handlers) starve either because
+		// nothing was posted (producer-side stall) or because posted events never woke
+		// them (delivery bug — directly fixable). Bounded, non-blocking: a queue whose
+		// lock is held is skipped instead of hanging the report.
+		u32 evq_total = 0, evq_backlog = 0;
+
+		idm::select<lv2_obj, lv2_event_queue>([&](u32 id, lv2_event_queue& queue)
+		{
+			evq_total++;
+
+			if (evq_total > 32)
+			{
+				return;
+			}
+
+			if (!queue.mutex.try_lock_shared())
+			{
+				return;
+			}
+
+			const usz backlog = queue.events.size();
+			queue.mutex.unlock_shared();
+
+			if (backlog)
+			{
+				evq_backlog++;
+				fmt::append(out, "%s\n", format_stall_event_queue(id, queue.name, queue.key, backlog));
+			}
+		});
+
+		fmt::append(out, "%u event queue(s), %u with backlog\n", evq_total, evq_backlog);
+		rsx_log.error("RSX stall thread states (what the game waits on):\n%s", out);
+		return out;
 	}
 
 	void invalid_method(context*, u32, u32);
@@ -3551,7 +4099,7 @@ namespace rsx
 
 		// Reset current stats
 		m_frame_stats = {};
-		m_profiler.enabled = !!g_cfg.video.debug_overlay;
+		m_profiler.enabled = true; // The debug overlay and the renderers' periodic telemetry report m_frame_stats
 	}
 
 	f64 thread::get_cached_display_refresh_rate()
@@ -3656,9 +4204,33 @@ namespace rsx
 			limit = limit2;
 		}
 
+		// Game speed lock: a limit above the vblank rate (Display on a 120 Hz screen, 120) would make fixed-timestep
+		// games run their 1/60 s steps 120 times per second. Keep the guest at the vblank rate (times the logic rate
+		// multiplier of a retimed game); the presenter still refreshes at the display rate with even pacing.
+		if (!g_disable_frame_limit)
+		{
+			const double vblank_hz = rsx::effective_vblank_hz(g_cfg.video.vblank_rate.get(), g_cfg.video.vblank_ntsc.get());
+			// A game retimed by the timestep governor (PPUModule.cpp) steps exactly 1/120 s: cap it at exactly 120 fps
+			const u32 multiplier = g_guest_logic_rate_multiplier.load();
+			const double locked = multiplier > 1 ? rsx::apply_game_speed_lock(limit, 60., multiplier, true)
+			                                     : rsx::apply_game_speed_lock(limit, vblank_hz, 1, g_guest_speed_lock.load());
+
+			if (locked != limit)
+			{
+				if (!m_game_speed_lock_logged)
+				{
+					m_game_speed_lock_logged = true;
+					rsx_log.notice("Game speed lock: guest frame rate capped at %.2f fps (frame limit %.2f fps, vblank %.2f Hz, logic rate x%u)",
+						locked, limit, vblank_hz, multiplier);
+				}
+
+				limit = locked;
+			}
+		}
+
 		if (limit)
 		{
-			const u64 needed_us = static_cast<u64>(1000000 / limit);
+			const u64 needed_us = rsx::next_frame_interval_us(limit, target_rsx_flip_carry);
 			const u64 time = std::max<u64>(get_system_time(), target_rsx_flip_time > needed_us ? target_rsx_flip_time - needed_us : 0);
 
 			if (int_flip_index)
@@ -3682,6 +4254,7 @@ namespace rsx
 					}
 
 					performance_counters.idle_time += delay_us;
+					g_sync_wait_stats.add(sync_wait::frame_limiter, get_system_time() - (deadline - delay_us));
 				}
 			}
 
@@ -3722,6 +4295,8 @@ namespace rsx
 		m_queued_flip.skip_frame |= g_cfg.video.disable_video_output && !g_cfg.video.perf_overlay.enabled;
 
 		flip(m_queued_flip);
+
+		game_patches_runtime_on_flip();
 
 		last_guest_flip_timestamp = get_system_time() - 1000000;
 		flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;

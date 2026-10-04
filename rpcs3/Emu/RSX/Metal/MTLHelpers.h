@@ -146,8 +146,9 @@ namespace mtl
 
 	// ---- Scratch resources (port of vkutils/scratch.{h,cpp}; implemented in MTLTexture.cpp) ------------------------
 	// Double-buffered, growable device_local (private) scratch buffer. New/grown buffers are zero-filled on `cmd`.
-	// Replaced buffers are retired through the GC. Stage/access masks of the VK version are unnecessary (cmd.compute()
-	// serializes every transfer).
+	// Replaced buffers are retired through the GC. Stage/access masks of the VK version are unnecessary: every command
+	// using the buffer declares its accesses, and the command list orders reuses after earlier uses (real hazards, so
+	// transfers through the same scratch buffer run one after another; the two buffers alternate).
 	mtl::buffer* get_scratch_buffer(mtl::command_list& cmd, u64 min_required_size, bool zero_memory = false);
 
 	// Shared 2D scratch image per (format, format class); at least requested_width x requested_height (aligned to 256).

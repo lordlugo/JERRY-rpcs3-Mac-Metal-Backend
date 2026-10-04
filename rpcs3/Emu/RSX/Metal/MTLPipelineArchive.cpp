@@ -1,11 +1,14 @@
 #include "stdafx.h"
 #include "MTLPipelineArchive.h"
+#include "MTLProgramPipeline.h" // record_compile_time
+#include "MTLPipelineCompiler.h"
 #include "mtlutils/device.h"
 
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu/cache_utils.hpp"
 #include "Utilities/File.h"
+#include "Utilities/Thread.h"
 
 #include <atomic>
 #include <charconv>
@@ -15,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -65,6 +69,38 @@
 // number), and the next boot supersedes older sessions' files up to that session except the base file itself, as if a
 // new base file had been written. A base confirmed 7 boots in a row is rewritten anyway. A missing, torn or stale
 // base.txt never matches, so the worst case is a rewrite of the base file; it is deleted along with that file.
+//
+// Flexible render pipelines (MTLPipelineCompiler.cpp)
+// ----------------------------------------------------
+// Render pipelines are created by specializing an unspecialized pipeline (one per shader pair and fixed state) with
+// their colour attachment configuration; heavily drawn ones are rebuilt with full state in the background.
+//  - Unspecialized and full-state pipelines are built here (lookupArchives + capture), so both come back as archive
+//    hits in later sessions.
+//  - Specializations are not: newRenderPipelineStateBySpecialization takes no task options (no lookupArchives), a
+//    specialization is not something a descriptor can look up, and it costs little. They use the device's compiler, so
+//    that the archives do not grow with data no lookup can use.
+//  - A full-state pipeline is preferred over a specialization, but only when it is known to be archived: looking it up
+//    blindly would compile it in full on a miss. So every archive file gets a sidecar, <file>.keys, listing the keys of
+//    the full-state render pipelines its serializer recorded (written after the file is in place; a missing or broken
+//    sidecar only means those pipelines are specialized again). The keys of the files opened at boot form the set
+//    is_full_state_archived() answers from. Sidecars are deleted with their file.
+//  - Runtime fallback: if a serializer holding unspecialized pipelines cannot be written, they are no longer recorded
+//    (unspecialized-not-recorded.txt keeps that for later sessions until the identity changes); everything else still is.
+//
+// First lookups
+// -------------
+// Boot logs with archives (26 / 44 / 64 MiB) showed the first builds with lookups, the shader interpreter's pipeline on a
+// worker and the RSX thread's first overlay pipeline (the shader cache dialog), returning together only after 1.6 / 6.8 /
+// 13.3 s; without archives the interpreter was ready after 1.5-2 s and the RSX thread was never held up. Whatever Metal
+// does on the first lookups (opening the archives), nothing waits for it any more:
+//  - The archive thread makes the first lookup: a trivial compute pipeline on a compiler of its own, so that no compiler
+//    that builds pipelines is involved. Its time is logged ("ready for lookups").
+//  - Until it has returned (m_lookup_ready), builds compile without lookups (the capturing compiler still records them),
+//    is_full_state_archived() is false (such pipelines are specialized instead of compiled with full state), and the
+//    shader cache preload does not start (pipeline_archive_ready(); the pipe compiler is woken when it becomes true).
+//  - The shader interpreter's pipelines never use the archive (use_archive = false): they are the only ones whose
+//    functions are specialized with function constants, their uber shader is by far the largest function, and in those
+//    logs the RSX thread waited exactly as long as the interpreter pipeline's build with lookups.
 
 namespace mtl
 {
@@ -74,15 +110,24 @@ namespace mtl
 		using clock_type = std::chrono::steady_clock;
 
 		// Bump when the naming or the policy changes, or when every shader binary changes: a different identity discards
-		// every archive. 2: invariant vertex positions and snapped MSAA texture lookups.
-		constexpr u32 archive_format_version = 2;
+		// every archive. 2: invariant vertex positions and snapped MSAA texture lookups. 3: MathModeRelaxed instead of
+		// MathModeFast, draw offsets as fragment push constants, required threadgroup size on compute pipelines.
+		// 4: used by two separate development builds (flexible render pipelines; colour attachment mapping), skipped so
+		// that neither's archives are taken for the other's. 5: flexible render pipelines (unspecialized pipelines, .keys
+		// sidecars), keys hash each shader's MSL once and include the function constant values of specialized shaders,
+		// render pipelines inherit the encoder's colour attachment map. 6: render pipelines use the identity colour
+		// attachment mapping again (no colour attachment maps). 7: vertex programs compute DP4/DPH as explicit fma chains and
+		// fetch w = 1 exactly (every vertex shader binary changes).
+		constexpr u32 archive_format_version = 7;
 
 		constexpr std::string_view archive_extension = ".mtl4archive";
+		constexpr std::string_view keys_extension = ".keys"; // Sidecar: <archive file name>.keys
 		constexpr std::string_view base_suffix = "-base";
 		constexpr std::string_view temp_extension = ".tmp";
 		constexpr std::string_view incoming_dir = "incoming/"; // Archives are written here first (with their final name), then moved
 		constexpr std::string_view identity_file_name = "identity.txt";
 		constexpr std::string_view base_record_file_name = "base.txt";
+		constexpr std::string_view no_unspecialized_file_name = "unspecialized-not-recorded.txt"; // See write()
 
 		// A base file confirmed by this many boots in a row is rewritten anyway, which bounds the cost of anything that
 		// changes the binaries without changing the pipeline keys (normally archive_format_version covers that)
@@ -99,6 +144,26 @@ namespace mtl
 		constexpr auto retire_max_interval = 300s;   // ...or this long
 		constexpr auto retire_wait_limit = 120s;     // Longest wait for builds still using a retired compiler
 		constexpr auto final_retire_wait_limit = 2s; // Same during shutdown
+
+		// The first lookup of the archives of earlier sessions has not returned yet (see "First lookups")
+		atomic_t<bool> g_lookups_warming{ false };
+
+		// Builds that took this long are logged (the first few): what the first lookups cost, a straggling compile
+		constexpr u64 slow_build_us = 2'000'000;
+		constexpr u32 max_slow_build_logs = 8;
+		std::atomic<u32> g_slow_build_logs{ 0 };
+
+		void record_build_time(bool looked_up, clock_type::time_point start, const char* what)
+		{
+			const u64 elapsed_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(clock_type::now() - start).count());
+			record_compile_time(looked_up ? compile_step::archive_pipeline : compile_step::compiled_pipeline, elapsed_us);
+
+			if (elapsed_us >= slow_build_us && g_slow_build_logs++ < max_slow_build_logs)
+			{
+				rsx_log.warning("Metal: building a %s pipeline took %.1f s (%s archive lookups, thread %s)", what, elapsed_us / 1'000'000.,
+					looked_up ? "with" : "without", thread_ctrl::get_name());
+			}
+		}
 
 		// sSSSSSSSS-kkkk[-base].mtl4archive
 		struct archive_file
@@ -224,6 +289,60 @@ namespace mtl
 			return info.is_directory ? fs::remove_all(path) : fs::remove_file(path);
 		}
 
+		// <archive>.keys: magic, key count, keys (u64 each, host byte order: the archives are tied to this machine)
+		constexpr u64 keys_file_magic = 0x5359454b344c544dull; // "MTL4KEYS"
+
+		std::string get_keys_path(const std::string& archive_path)
+		{
+			return archive_path + std::string(keys_extension);
+		}
+
+		bool read_keys_file(const std::string& path, std::vector<u64>& keys)
+		{
+			fs::file file(path);
+			if (!file)
+			{
+				return false;
+			}
+
+			const u64 size = file.size();
+			if (size < 2 * sizeof(u64) || size % sizeof(u64) || size > (64ull << 20))
+			{
+				return false;
+			}
+
+			std::vector<u64> data(size / sizeof(u64));
+			if (file.read(data.data(), size) != size || data[0] != keys_file_magic || data[1] != data.size() - 2)
+			{
+				return false;
+			}
+
+			keys.insert(keys.end(), data.begin() + 2, data.end());
+			return true;
+		}
+
+		bool write_keys_file(const std::string& path, std::vector<u64> keys)
+		{
+			std::sort(keys.begin(), keys.end());
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+			std::vector<u64> data;
+			data.reserve(keys.size() + 2);
+			data.push_back(keys_file_magic);
+			data.push_back(keys.size());
+			data.insert(data.end(), keys.begin(), keys.end());
+
+			// Never a torn sidecar under the final name: a partial one would list keys the archive does not hold
+			const std::string temp_path = path + std::string(temp_extension);
+			if (!fs::write_file(temp_path, fs::rewrite, data) || !fs::rename(temp_path, path, true))
+			{
+				remove_entry(temp_path);
+				return false;
+			}
+
+			return true;
+		}
+
 		double to_mib(u64 bytes)
 		{
 			return static_cast<double>(bytes) / 0x100000;
@@ -258,6 +377,19 @@ namespace mtl
 			atomic_t<u32> pipeline_count{ 0 };                     // Pipelines successfully built with `compiler`
 			atomic_t<u64> key_digest{ 0 };                         // Sum of their mixed keys (independent of build order)
 			atomic_t<bool> keys_known{ true };                     // False once a pipeline without a key was built
+			atomic_t<u32> unspecialized_count{ 0 };                // Unspecialized render pipelines among them
+
+			std::mutex full_state_lock;
+			std::vector<u64> full_state_keys;                      // Full-state render pipelines built (the .keys sidecar)
+
+			void add_full_state_key(u64 key)
+			{
+				if (key)
+				{
+					std::lock_guard lock(full_state_lock);
+					full_state_keys.push_back(key);
+				}
+			}
 
 			void add_key(u64 key)
 			{
@@ -306,7 +438,9 @@ namespace mtl
 			MTL4::CompilerTaskOptions* m_lookup_options = nullptr; // +1, lookupArchives = m_archives
 			u64 m_archive_bytes = 0;                               // Archive thread only after init
 			atomic_t<bool> m_lookup_enabled{ false };
+			atomic_t<bool> m_lookup_ready{ false };                // The first lookup has returned (warm_up_lookups)
 			std::optional<base_record> m_base_record;              // Describes the loaded base file (archive thread only after init)
+			std::unordered_set<u64> m_full_state_keys;             // Full-state render pipelines in m_archives (read-only after init)
 
 			// Current capturing compiler. Builds hold a reference while they use it.
 			std::mutex m_bundle_lock;
@@ -314,6 +448,7 @@ namespace mtl
 			u32 m_next_bundle_index = 0; // Init, then archive thread only
 			bool m_capture_enabled = false;
 			u32 m_write_failures = 0;           // Consecutive failed writes (archive thread only)
+			atomic_t<bool> m_capture_unspecialized{ true }; // False: unspecialized pipelines are built without capture (see write())
 
 			atomic_t<u64> m_last_build_time{ 0 }; // clock_type ticks
 			clock_type::time_point m_init_time{};
@@ -392,12 +527,19 @@ namespace mtl
 
 					remove_files(files);
 					remove_entry(record_path());
+					remove_entry(m_directory + std::string(no_unspecialized_file_name)); // Another OS may write them fine
 
 					if (!fs::write_file(identity_path, fs::rewrite, identity))
 					{
 						rsx_log.error("Metal: cannot write %s (%s); the pipeline archive is disabled", identity_path, fs::g_tls_error);
 						return false;
 					}
+				}
+
+				if (fs::is_file(m_directory + std::string(no_unspecialized_file_name)))
+				{
+					m_capture_unspecialized = false;
+					rsx_log.warning("Metal: unspecialized render pipelines are not recorded in the pipeline archive (an earlier session could not write them)");
 				}
 
 				// 2. Files of sessions older than the newest complete one are superseded (see "File policy")
@@ -487,6 +629,7 @@ namespace mtl
 					{
 						rsx_log.warning("Metal: pipeline archive %s cannot be opened (%s); deleting it", file.name, mtl::to_string(error));
 						remove_entry(path);
+						remove_entry(get_keys_path(path));
 						continue;
 					}
 
@@ -494,6 +637,13 @@ namespace mtl
 					m_archives.push_back(archive);
 					m_archive_names.push_back(file.name);
 					m_archive_bytes += file.size;
+
+					// Its full-state render pipelines (none known without a valid sidecar: those get specialized)
+					std::vector<u64> keys;
+					if (read_keys_file(get_keys_path(path), keys))
+					{
+						m_full_state_keys.insert(keys.begin(), keys.end());
+					}
 				}
 
 				if (!m_archives.empty())
@@ -503,6 +653,11 @@ namespace mtl
 					m_lookup_options = MTL4::CompilerTaskOptions::alloc()->init();
 					m_lookup_options->setLookupArchives(NS::Array::array(objects.data(), objects.size())); // Copied (retained)
 					m_lookup_enabled = true;
+				}
+				else
+				{
+					// Nothing to look up in
+					m_lookup_ready = true;
 				}
 
 				// The record only matters while the base file it describes is in use
@@ -525,10 +680,16 @@ namespace mtl
 					rsx_log.warning("Metal: pipelines built in this session will not be added to the pipeline archive");
 				}
 
-				rsx_log.notice("Metal: pipeline archive %s: %u file(s), %.1f MiB loaded (session %u)",
-					m_directory, ::size32(m_archives), to_mib(m_archive_bytes), m_session);
+				rsx_log.notice("Metal: pipeline archive %s: %u file(s), %.1f MiB loaded, %u full-state render pipeline(s) listed (session %u)",
+					m_directory, ::size32(m_archives), to_mib(m_archive_bytes), ::size32(m_full_state_keys), m_session);
 
 				return !m_archives.empty() || m_capture_enabled;
+			}
+
+			// The archive thread makes the first lookup (warm_up_lookups) before anything uses the archives
+			bool needs_warm_up() const
+			{
+				return !m_lookup_ready;
 			}
 
 			void start()
@@ -538,6 +699,12 @@ namespace mtl
 				{
 #ifdef __APPLE__
 					pthread_setname_np("RSX Pipeline Archive");
+
+					// A std::thread inherits the QoS of the thread that creates the renderer (the UI or an emulator thread,
+					// both user-interactive), so the archive writes (the base file takes most of a second right after the
+					// shader cache preload) would compete with the emulation threads on equal terms. Nothing waits for them
+					// during emulation; the final write raises the class again (thread_main), since shutdown waits for it.
+					pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
 					self->thread_main();
 				});
@@ -608,17 +775,37 @@ namespace mtl
 				m_cv.notify_all();
 			}
 
-			template <typename T, typename D, typename F>
-			T* build(const D* descriptor, NS::Error** error, u64 key, F&& compile)
+			// The archives of earlier sessions hold this full-state render pipeline (their sidecars list it), and lookups
+			// are ready: otherwise building it with full state would be a compile
+			bool has_full_state(u64 key) const
 			{
+				return m_lookup_enabled && m_lookup_ready && m_full_state_keys.contains(key);
+			}
+
+			enum class build_class
+			{
+				compute,
+				full_state_render,   // Listed in the sidecar of the file it is written to
+				unspecialized_render,
+			};
+
+			template <typename T, typename D, typename F>
+			T* build(const D* descriptor, NS::Error** error, u64 key, build_class type, F&& compile)
+			{
+				const auto start = clock_type::now();
 				std::shared_ptr<capture_bundle> bundle;
+
+				// Unspecialized pipelines are built without capture (lookups only) once a file holding them failed to write
+				if (type != build_class::unspecialized_render || m_capture_unspecialized)
 				{
 					std::lock_guard lock(m_bundle_lock);
 					bundle = m_bundle;
 				}
 
 				MTL4::Compiler* compiler = bundle ? bundle->compiler : g_render_device->compiler();
-				const MTL4::CompilerTaskOptions* options = m_lookup_enabled ? m_lookup_options : nullptr;
+
+				// Not before the first lookup has returned (see "First lookups")
+				const MTL4::CompilerTaskOptions* options = (m_lookup_enabled && m_lookup_ready) ? m_lookup_options : nullptr;
 
 				NS::Error* build_error = nullptr;
 				T* result = compile(compiler, descriptor, options, &build_error);
@@ -631,15 +818,7 @@ namespace mtl
 
 					if (result)
 					{
-						if (m_lookup_enabled.exchange(false))
-						{
-							rsx_log.error("Metal: a pipeline failed to build with the pipeline archive (%s) but built without it. "
-								"The archive is ignored for the rest of the session and rebuilt.", mtl::to_string(build_error));
-
-							std::lock_guard lock(m_mutex);
-							m_discard_requested = true;
-							m_cv.notify_all();
-						}
+						on_lookup_failure(build_error);
 					}
 					else
 					{
@@ -647,10 +826,21 @@ namespace mtl
 					}
 				}
 
+				record_build_time(!!options, start, type == build_class::compute ? "compute" : "render");
+
 				if (result)
 				{
 					if (bundle)
 					{
+						if (type == build_class::full_state_render)
+						{
+							bundle->add_full_state_key(key);
+						}
+						else if (type == build_class::unspecialized_render)
+						{
+							bundle->unspecialized_count++;
+						}
+
 						bundle->add_key(key);
 						bundle->pipeline_count++;
 						m_last_build_time = static_cast<u64>(clock_type::now().time_since_epoch().count());
@@ -695,6 +885,7 @@ namespace mtl
 				std::vector<archive_file> files;
 
 				std::vector<std::string> leftovers;
+				std::vector<std::string> sidecars;
 
 				if (fs::dir dir(m_directory); dir)
 				{
@@ -709,6 +900,12 @@ namespace mtl
 						if (entry.name.ends_with(temp_extension))
 						{
 							leftovers.push_back(entry.name);
+							continue;
+						}
+
+						if (entry.name.ends_with(keys_extension))
+						{
+							sidecars.push_back(entry.name);
 							continue;
 						}
 
@@ -729,6 +926,16 @@ namespace mtl
 					remove_entry(m_directory + name);
 				}
 
+				// Sidecars whose archive file is gone (deleted by an interrupted cleanup)
+				for (const std::string& name : sidecars)
+				{
+					const std::string_view archive_name = std::string_view(name).substr(0, name.size() - keys_extension.size());
+					if (std::none_of(files.begin(), files.end(), [&](const archive_file& file) { return file.name == archive_name; }))
+					{
+						remove_entry(m_directory + name);
+					}
+				}
+
 				// Leftovers of an interrupted write (the staging directory)
 				remove_entry(m_directory + std::string(incoming_dir.substr(0, incoming_dir.size() - 1)));
 
@@ -743,6 +950,8 @@ namespace mtl
 					{
 						rsx_log.warning("Metal: cannot delete pipeline archive %s (%s)", file.name, fs::g_tls_error);
 					}
+
+					remove_entry(get_keys_path(m_directory + file.name));
 				}
 
 				files.clear();
@@ -785,6 +994,11 @@ namespace mtl
 
 			void thread_main()
 			{
+				if (!m_lookup_ready)
+				{
+					warm_up_lookups();
+				}
+
 				std::unique_lock lock(m_mutex);
 
 				while (true)
@@ -796,6 +1010,14 @@ namespace mtl
 					const bool discard = std::exchange(m_discard_requested, false);
 
 					lock.unlock();
+
+#ifdef __APPLE__
+					if (final)
+					{
+						// Renderer shutdown waits (bounded) for this write: no longer background work
+						pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+					}
+#endif
 					{
 						mtl::autorelease_scope pool;
 
@@ -825,6 +1047,101 @@ namespace mtl
 			{
 				std::lock_guard lock(m_mutex);
 				return m_final_requested;
+			}
+
+			// A build failed with the archives of earlier sessions but works without them
+			void on_lookup_failure(NS::Error* error)
+			{
+				if (m_lookup_enabled.exchange(false))
+				{
+					rsx_log.error("Metal: a pipeline failed to build with the pipeline archive (%s) but built without it. "
+						"The archive is ignored for the rest of the session and rebuilt.", mtl::to_string(error));
+
+					std::lock_guard lock(m_mutex);
+					m_discard_requested = true;
+					m_cv.notify_all();
+				}
+			}
+
+			// The first lookup in the archives of earlier sessions (see "First lookups"). Archive thread, before anything else.
+			void warm_up_lookups()
+			{
+				mtl::autorelease_scope pool;
+				const auto start = clock_type::now();
+
+#ifdef __APPLE__
+				// Builds wait for it to use the archives: at their class, not at this thread's utility class
+				const qos_class_t thread_qos = qos_class_self();
+				pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+
+				static constexpr std::string_view source =
+					"#include <metal_stdlib>\n"
+					"using namespace metal;\n"
+					"kernel void rpcs3_archive_warm_up(device uint* data [[buffer(0)]], uint index [[thread_position_in_grid]])\n"
+					"{\n"
+					"\tdata[index] = index;\n"
+					"}\n";
+
+				NS::Error* error = nullptr;
+				bool looked_up = false;
+
+				// A compiler of its own: no compiler that builds pipelines is involved in whatever the first lookup costs
+				auto compiler_desc = mtl::ref(MTL4::CompilerDescriptor::alloc()->init());
+				compiler_desc->setLabel(mtl::ns_str("RSX pipeline archive warm-up"));
+
+				if (auto compiler = mtl::ref(m_device->newCompiler(compiler_desc.get(), &error)))
+				{
+					auto options = mtl::ref(MTL::CompileOptions::alloc()->init());
+					options->setLanguageVersion(MTL::LanguageVersion3_2);
+
+					auto library_desc = mtl::ref(MTL4::LibraryDescriptor::alloc()->init());
+					library_desc->setSource(mtl::ns_str(source));
+					library_desc->setName(mtl::ns_str("rpcs3_archive_warm_up"));
+					library_desc->setOptions(options.get());
+
+					if (auto library = mtl::ref(compiler->newLibrary(library_desc.get(), &error)))
+					{
+						auto function = mtl::ref(MTL4::LibraryFunctionDescriptor::alloc()->init());
+						function->setLibrary(library.get());
+						function->setName(mtl::ns_str("rpcs3_archive_warm_up"));
+
+						auto descriptor = mtl::ref(MTL4::ComputePipelineDescriptor::alloc()->init());
+						descriptor->setComputeFunctionDescriptor(function.get());
+
+						auto pipeline = mtl::ref(compiler->newComputePipelineState(descriptor.get(), m_lookup_options, &error));
+						looked_up = true;
+
+						if (!pipeline)
+						{
+							// Same rule as build(): the archives must not make builds fail
+							NS::Error* retry_error = nullptr;
+							if (auto retry = mtl::ref(compiler->newComputePipelineState(descriptor.get(), nullptr, &retry_error)))
+							{
+								on_lookup_failure(error);
+							}
+						}
+					}
+				}
+
+				if (!looked_up)
+				{
+					// Runtime failure of a Metal API (not of the archives): the first real lookup pays instead
+					rsx_log.warning("Metal: the first lookup in the pipeline archive could not be made in advance (%s)", mtl::to_string(error));
+				}
+
+#ifdef __APPLE__
+				pthread_set_qos_class_self_np(thread_qos, 0);
+#endif
+
+				m_lookup_ready = true;
+				g_lookups_warming = false;
+
+				rsx_log.notice("Metal: pipeline archive ready for lookups %.0f ms after renderer start (the first lookup took %.0f ms, %u file(s), %.1f MiB)",
+					static_cast<double>(elapsed_ms(m_init_time)), static_cast<double>(elapsed_ms(start)), ::size32(m_archives), to_mib(m_archive_bytes));
+
+				// The shader cache preload was waiting for it
+				pipe_compiler::on_pipeline_archive_ready();
 			}
 
 			bool should_retire()
@@ -866,7 +1183,17 @@ namespace mtl
 				std::shared_ptr<capture_bundle> next;
 				if (!final && m_capture_enabled)
 				{
+#ifdef __APPLE__
+					// The compiler builds every pipeline from now on. Created at the class of the threads that use it (the
+					// pipe compiler workers), not at this thread's utility class, in case Metal keeps the creator's QoS
+					// for work of its own.
+					const qos_class_t thread_qos = qos_class_self();
+					pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
 					next = create_bundle();
+					pthread_set_qos_class_self_np(thread_qos, 0);
+#else
+					next = create_bundle();
+#endif
 
 					if (!next)
 					{
@@ -955,8 +1282,25 @@ namespace mtl
 				NS::Error* error = nullptr;
 				if (!bundle.serializer->serializeAsArchiveAndFlushToURL(NS::URL::fileURLWithPath(mtl::ns_str(temp_path)), &error))
 				{
-					rsx_log.error("Metal: cannot write the pipeline archive (%u pipeline(s)) to %s: %s", count, temp_path, mtl::to_string(error));
+					rsx_log.error("Metal: cannot write the pipeline archive (%u pipeline(s), %u unspecialized) to %s: %s",
+						count, bundle.unspecialized_count.load(), temp_path, mtl::to_string(error));
 					remove_entry(temp_path);
+
+					if (bundle.unspecialized_count)
+					{
+						// Serializers have failed silently on data they did not handle (CaptureDescriptors, see create_bundle).
+						// Unspecialized pipelines are the newest kind of data in them: stop recording those, for later
+						// sessions too (until the OS or GPU changes), and keep the archive for everything else. They are
+						// then compiled at every boot. Not counted as a failure of the archive.
+						if (m_capture_unspecialized.exchange(false))
+						{
+							rsx_log.error("Metal: unspecialized render pipelines are no longer recorded in the pipeline archive");
+							fs::write_file(m_directory + std::string(no_unspecialized_file_name), fs::rewrite,
+								std::string("An archive holding unspecialized render pipelines could not be written. Delete this file to try again.\n"));
+						}
+
+						return;
+					}
 
 					if (++m_write_failures >= 2 && m_capture_enabled)
 					{
@@ -990,7 +1334,22 @@ namespace mtl
 					return;
 				}
 
-				rsx_log.notice("Metal: saved %u pipeline(s) to the pipeline archive %s (%.1f MiB, %llu ms)", count, name, to_mib(size), elapsed_ms(start));
+				// After the file is in place: a sidecar never lists pipelines of a file that does not exist
+				std::vector<u64> full_state_keys;
+				{
+					std::lock_guard lock(bundle.full_state_lock);
+					full_state_keys = std::move(bundle.full_state_keys);
+				}
+
+				const usz full_state_count = full_state_keys.size();
+				if (full_state_count && !write_keys_file(get_keys_path(m_directory + name), std::move(full_state_keys)))
+				{
+					rsx_log.warning("Metal: cannot write the full-state pipeline list of %s (%s); those pipelines will be specialized again",
+						name, fs::g_tls_error);
+				}
+
+				rsx_log.notice("Metal: saved %u pipeline(s) (%u with full state) to the pipeline archive %s (%.1f MiB, %llu ms)",
+					count, static_cast<u32>(full_state_count), name, to_mib(size), elapsed_ms(start));
 
 				if (base)
 				{
@@ -1021,6 +1380,7 @@ namespace mtl
 				for (const std::string& name : m_archive_names)
 				{
 					remove_entry(m_directory + name);
+					remove_entry(get_keys_path(m_directory + name));
 				}
 
 				rsx_log.notice("Metal: deleted %u pipeline archive file(s)", ::size32(m_archive_names));
@@ -1137,17 +1497,20 @@ namespace mtl
 			return;
 		}
 
+		// Until the archive thread's first lookup has returned
+		g_lookups_warming = archive->needs_warm_up();
+
 		archive->start();
 
 		std::lock_guard lock(g_archive_lock);
 		g_archive = std::move(archive);
 	}
 
-	void on_pipeline_cache_preloaded()
+	void on_pipeline_cache_preloaded(bool complete)
 	{
 		if (const auto archive = get_archive())
 		{
-			archive->on_preload_finished(!Emu.IsStopped());
+			archive->on_preload_finished(complete);
 		}
 	}
 
@@ -1174,34 +1537,57 @@ namespace mtl
 			add_lingering_archive(std::move(archive));
 		}
 
+		// Nothing waits for its lookups any more
+		g_lookups_warming = false;
+
 		// Otherwise the Metal objects are released here (last reference)
 	}
 
-	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error, u64 key)
+	MTL::RenderPipelineState* new_render_pipeline_state(const MTL4::RenderPipelineDescriptor* descriptor, NS::Error** error, u64 key,
+		render_pipeline_kind kind, bool use_archive)
 	{
-		if (const auto archive = get_archive())
+		if (const auto archive = use_archive ? get_archive() : nullptr)
 		{
 			return archive->build<MTL::RenderPipelineState>(descriptor, error, key,
+				kind == render_pipeline_kind::full_state ? pipeline_archive::build_class::full_state_render : pipeline_archive::build_class::unspecialized_render,
 				[](MTL4::Compiler* compiler, const MTL4::RenderPipelineDescriptor* desc, const MTL4::CompilerTaskOptions* options, NS::Error** err)
 				{
 					return compiler->newRenderPipelineState(desc, options, err);
 				});
 		}
 
-		return g_render_device->compiler()->newRenderPipelineState(descriptor, nullptr, error);
+		const auto start = clock_type::now();
+		MTL::RenderPipelineState* result = g_render_device->compiler()->newRenderPipelineState(descriptor, nullptr, error);
+		record_build_time(false, start, "render");
+		return result;
 	}
 
-	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error, u64 key)
+	MTL::ComputePipelineState* new_compute_pipeline_state(const MTL4::ComputePipelineDescriptor* descriptor, NS::Error** error, u64 key,
+		bool use_archive)
 	{
-		if (const auto archive = get_archive())
+		if (const auto archive = use_archive ? get_archive() : nullptr)
 		{
-			return archive->build<MTL::ComputePipelineState>(descriptor, error, key,
+			return archive->build<MTL::ComputePipelineState>(descriptor, error, key, pipeline_archive::build_class::compute,
 				[](MTL4::Compiler* compiler, const MTL4::ComputePipelineDescriptor* desc, const MTL4::CompilerTaskOptions* options, NS::Error** err)
 				{
 					return compiler->newComputePipelineState(desc, options, err);
 				});
 		}
 
-		return g_render_device->compiler()->newComputePipelineState(descriptor, nullptr, error);
+		const auto start = clock_type::now();
+		MTL::ComputePipelineState* result = g_render_device->compiler()->newComputePipelineState(descriptor, nullptr, error);
+		record_build_time(false, start, "compute");
+		return result;
+	}
+
+	bool is_full_state_archived(u64 key)
+	{
+		const auto archive = get_archive();
+		return archive && archive->has_full_state(key);
+	}
+
+	bool pipeline_archive_ready()
+	{
+		return !g_lookups_warming;
 	}
 }

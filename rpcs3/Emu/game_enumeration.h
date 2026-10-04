@@ -9,6 +9,7 @@
 #include "vfs_config.h"
 #include "Loader/ISO.h"
 #include "Loader/iso_cache.h"
+#include "iso_media_cache.h"
 
 #include <string>
 #include <set>
@@ -120,6 +121,9 @@ std::optional<game_info_type> game_enumeration<game_info_type>::get_game_info(co
 
 	if (info.is_iso_file)
 	{
+		// Determined here, on a worker thread, for the game list (its context menu must not read the disc)
+		info.iso_type = iso_file_decryption::check_type(dir_or_elf);
+
 		const std::string iso_cache_key = is_ps3_game ? dir_or_elf : dir_or_elf + "//" + game_dir;
 		// Only construct iso_archive (which walks the full directory tree) in case of raw device or
 		// when no valid cache entry exists for this ISO path + mtime
@@ -128,6 +132,9 @@ std::optional<game_info_type> game_enumeration<game_info_type>::get_game_info(co
 			// Reuse the archive the caller has already built for this path (a raw device never uses the cache)
 			archive = shared_archive ? shared_archive : std::make_shared<iso_archive>(dir_or_elf);
 			if (!archive->is_valid()) return std::nullopt;
+
+			// Kept for the icon, hover video and sound loads of the game list, which would parse the disc again
+			iso_media_cache::add_archive(dir_or_elf, archive);
 		}
 
 		// Track this ISO path for cache cleanup after scan completes.
@@ -164,6 +171,8 @@ std::optional<game_info_type> game_enumeration<game_info_type>::get_game_info(co
 			sys_log.warning("Cached psf for iso not valid: '%s'", info.path);
 			archive = shared_archive ? shared_archive : std::make_shared<iso_archive>(dir_or_elf);
 			if (!archive->is_valid()) return std::nullopt;
+
+			iso_media_cache::add_archive(dir_or_elf, archive);
 
 			cache_entry = {}; // Reset so the cache gets rewritten after scan.
 			psf = {};

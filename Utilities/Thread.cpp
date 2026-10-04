@@ -41,6 +41,7 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 #include "stack_trace.h" // RPCS3 Metal fork: native call stack in fatal segfault reports
+#include "crash_report.h"
 #endif
 #if defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <pthread_np.h>
@@ -2313,6 +2314,12 @@ static LONG exception_handler(PEXCEPTION_POINTERS pExp) noexcept
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
+	if (utils::crash_report::is_orderly_fatal())
+	{
+		// Orderly fatal already in progress: let the system handle it.
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
 	const auto ptr = reinterpret_cast<u8*>(pExp->ExceptionRecord->ExceptionInformation[1]);
 	const bool is_writing = pExp->ExceptionRecord->ExceptionInformation[0] == 1;
 	const bool is_executing = pExp->ExceptionRecord->ExceptionInformation[0] == 8;
@@ -2376,6 +2383,12 @@ static LONG exception_handler(PEXCEPTION_POINTERS pExp) noexcept
 
 static LONG exception_filter(PEXCEPTION_POINTERS pExp) noexcept
 {
+	if (utils::crash_report::is_orderly_fatal())
+	{
+		// Orderly fatal already in progress: let the system handle it.
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
 	std::string msg = fmt::format("Unhandled Win32 exception 0x%08X.\n", pExp->ExceptionRecord->ExceptionCode);
 
 	if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
@@ -2496,10 +2509,34 @@ static LONG exception_filter(PEXCEPTION_POINTERS pExp) noexcept
 		fmt::append(msg, "%s\n", symbol);
 	}
 	
-	sys_log.fatal("\n%s", msg);
+	// Full detail goes to the log file first (error level: no dialog is triggered
+	// from here; the dialog below carries the short reason instead).
+	sys_log.error("\n%s", msg);
 	logs::listener::sync_all();
 
-	thread_ctrl::emergency_exit(msg);
+	// One-page summary for the next-launch notice (skipped for orderly fatals).
+	if (!utils::crash_report::is_orderly_fatal())
+	{
+		const DWORD code = pExp->ExceptionRecord->ExceptionCode;
+		const bool is_access = code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2;
+		utils::crash_report::record_native_crash(
+			code == EXCEPTION_ACCESS_VIOLATION ? "EXCEPTION_ACCESS_VIOLATION" :
+			code == EXCEPTION_ILLEGAL_INSTRUCTION ? "EXCEPTION_ILLEGAL_INSTRUCTION" :
+			code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "EXCEPTION_INT_DIVIDE_BY_ZERO" :
+			code == EXCEPTION_STACK_OVERFLOW ? "EXCEPTION_STACK_OVERFLOW" : "WIN_EXCEPTION",
+			static_cast<int>(code),
+			is_access ? static_cast<u64>(pExp->ExceptionRecord->ExceptionInformation[1]) : 0,
+			is_access);
+	}
+
+	const DWORD code = pExp->ExceptionRecord->ExceptionCode;
+	const bool is_access = code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2;
+	const std::string short_reason = is_access
+		? fmt::format("Native crash (access violation at 0x%llx). A detailed crash report was written to RPCS3.log.",
+			static_cast<unsigned long long>(pExp->ExceptionRecord->ExceptionInformation[1]))
+		: fmt::format("Native crash (Win32 exception 0x%08X). A detailed crash report was written to RPCS3.log.", code);
+
+	thread_ctrl::emergency_exit(short_reason);
 }
 
 const bool s_exception_handler_set = []() -> bool
@@ -2523,8 +2560,17 @@ const bool s_exception_handler_set = []() -> bool
 
 #else
 
-static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
+static void signal_handler(int sig, siginfo_t* info, void* uct) noexcept
 {
+	if (utils::crash_report::is_orderly_fatal())
+	{
+		// Orderly fatal already in progress (dialog shown, aborting): re-raise
+		// instead of looping through the crash reporter again.
+		::signal(sig, SIG_DFL);
+		::raise(sig);
+		::_exit(1);
+	}
+
 	ucontext_t* context = static_cast<ucontext_t*>(uct);
 
 #if defined(ARCH_X64)
@@ -2584,31 +2630,40 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
 	const u64 seg_off = (reinterpret_cast<u64>(info->si_addr) - reinterpret_cast<u64>(vm::g_exec_addr)) - vm::g_exec_addr_seg_offset;
 	const auto cause = is_executing ? "executing" : is_writing ? "writing" : "reading";
 
-	if (auto [addr, ok] = vm::try_get_addr(info->si_addr); ok && !is_executing)
+	// Signal name for the report (this handler covers SEGV/BUS/FPE/ABRT).
+	const char* sig_name = sig == SIGBUS ? "Bus error" : sig == SIGFPE ? "Arithmetic fault" : sig == SIGABRT ? "Aborted" : "Segfault";
+	const char* sig_code = sig == SIGBUS ? "SIGBUS" : sig == SIGFPE ? "SIGFPE" : sig == SIGABRT ? "SIGABRT" : "SIGSEGV";
+
+	if (sig != SIGABRT)
 	{
-		// Try to process access violation
-		if (thread_ctrl::get_current() && handle_access_violation(addr, is_writing, false, context))
+		if (auto [addr, ok] = vm::try_get_addr(info->si_addr); ok && !is_executing)
 		{
-			return;
+			// Try to process access violation
+			if (thread_ctrl::get_current() && handle_access_violation(addr, is_writing, false, context))
+			{
+				return;
+			}
+		}
+
+		if (exec64 < 0x100000000ull && !is_executing)
+		{
+			if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(exec64), is_writing, true, context))
+			{
+				return;
+			}
+		}
+		else if (seg_off < 0x80000000ull && !is_executing)
+		{
+			if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(seg_off * 2), is_writing, true, context))
+			{
+				return;
+			}
 		}
 	}
 
-	if (exec64 < 0x100000000ull && !is_executing)
-	{
-		if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(exec64), is_writing, true, context))
-		{
-			return;
-		}
-	}
-	else if (seg_off < 0x80000000ull && !is_executing)
-	{
-		if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(seg_off * 2), is_writing, true, context))
-		{
-			return;
-		}
-	}
-
-	std::string msg = fmt::format("Segfault %s location %p at %p.\n", cause, info->si_addr, RIP(context));
+	std::string msg = sig == SIGABRT
+		? fmt::format("Aborted at %p.\n", RIP(context))
+		: fmt::format("%s %s location %p at %p.\n", sig_name, cause, info->si_addr, RIP(context));
 
 	if (vm::try_get_addr(info->si_addr).second)
 	{
@@ -2679,9 +2734,18 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
 	}
 #endif
 
-	sys_log.fatal("\n%s", msg);
+	// Full detail goes to the log file first (error level: no dialog is triggered
+	// from here; the dialog below carries the short reason instead).
+	sys_log.error("\n%s", msg);
 	sys_log.notice("\n%s", dump_useful_thread_info());
 	logs::listener::sync_all();
+
+	// One-page summary for the next-launch notice (skipped for orderly fatals and
+	// for recovered JIT faults, which return before reaching here).
+	if (!utils::crash_report::is_orderly_fatal())
+	{
+		utils::crash_report::record_native_crash(sig_code, sig, reinterpret_cast<u64>(info->si_addr), sig != SIGABRT);
+	}
 
 	if (IsDebuggerPresent())
 	{
@@ -2690,18 +2754,37 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
 		return;
 	}
 
-	thread_ctrl::emergency_exit(msg);
+	const std::string short_reason = sig == SIGABRT
+		? fmt::format("Native crash (SIGABRT). A detailed crash report was written to RPCS3.log.")
+		: fmt::format("Native crash (%s %s location %p at %p). A detailed crash report was written to RPCS3.log.",
+			sig_name, cause, info->si_addr, RIP(context));
+
+	thread_ctrl::emergency_exit(short_reason);
 }
 
-static void sigill_handler(int /*sig*/, siginfo_t* info, void* /*uct*/) noexcept
+static void sigill_handler(int sig, siginfo_t* info, void* /*uct*/) noexcept
 {
+	if (utils::crash_report::is_orderly_fatal())
+	{
+		// Orderly fatal already in progress: re-raise instead of looping.
+		::signal(sig, SIG_DFL);
+		::raise(sig);
+		::_exit(1);
+	}
+
 	std::string msg = fmt::format("Illegal instruction at %p (%s).\n", info->si_addr, *reinterpret_cast<be_t<u128>*>(info->si_addr));
 
 	append_thread_name(msg);
 
-	sys_log.fatal("\n%s", msg);
+	// Full detail to the log first; the dialog below carries the short reason.
+	sys_log.error("\n%s", msg);
 	sys_log.notice("\n%s", dump_useful_thread_info());
 	logs::listener::sync_all();
+
+	if (!utils::crash_report::is_orderly_fatal())
+	{
+		utils::crash_report::record_native_crash("SIGILL", sig, reinterpret_cast<u64>(info->si_addr), true);
+	}
 
 	if (IsDebuggerPresent())
 	{
@@ -2710,7 +2793,7 @@ static void sigill_handler(int /*sig*/, siginfo_t* info, void* /*uct*/) noexcept
 		return;
 	}
 
-	thread_ctrl::emergency_exit(msg);
+	thread_ctrl::emergency_exit(fmt::format("Native crash (illegal instruction at %p). A detailed crash report was written to RPCS3.log.", info->si_addr));
 }
 
 void sigpipe_signaling_handler(int)
@@ -2730,13 +2813,23 @@ const bool s_exception_handler_set = []() -> bool
 		std::abort();
 	}
 
-#ifdef __APPLE__
 	if (::sigaction(SIGBUS, &sa, NULL) == -1)
 	{
 		std::fprintf(stderr, "sigaction(SIGBUS) failed (%d).\n", errno);
 		std::abort();
 	}
-#endif
+
+	if (::sigaction(SIGFPE, &sa, NULL) == -1)
+	{
+		std::fprintf(stderr, "sigaction(SIGFPE) failed (%d).\n", errno);
+		std::abort();
+	}
+
+	if (::sigaction(SIGABRT, &sa, NULL) == -1)
+	{
+		std::fprintf(stderr, "sigaction(SIGABRT) failed (%d).\n", errno);
+		std::abort();
+	}
 
 	sa.sa_sigaction = sigill_handler;
 	if (::sigaction(SIGILL, &sa, NULL) == -1)
@@ -2910,7 +3003,20 @@ void thread_base::set_name(std::string name)
 #endif
 
 #if defined(__APPLE__)
-	name.resize(std::min<usz>(15, name.size()));
+	// Up to 63 bytes (MAXTHREADNAMESIZE - 1), cut at a UTF-8 character boundary: whole emulation thread names such as
+	// "PPU[0x1000009] EXRenderThreadNew" or "RawSPU[0x0000001]", which the per-thread CPU telemetry reports
+	if (name.size() > 63)
+	{
+		usz size = 63;
+
+		while (size && (static_cast<u8>(name[size]) & 0xc0) == 0x80)
+		{
+			size--;
+		}
+
+		name.resize(size);
+	}
+
 	pthread_setname_np(name.c_str());
 #elif defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 	pthread_set_name_np(pthread_self(), name.c_str());
@@ -2937,6 +3043,16 @@ u64 thread_base::finalize(thread_state result_state) noexcept
 	FILETIME ctime, etime, ktime, utime;
 	GetThreadTimes(GetCurrentThread(), &ctime, &etime, &ktime, &utime);
 	const u64 time = ((ktime.dwLowDateTime | static_cast<u64>(ktime.dwHighDateTime) << 32) + (utime.dwLowDateTime | static_cast<u64>(utime.dwHighDateTime) << 32)) * 100ull - tls_time;
+	tls_time += time;
+	const u64 fsoft = 0;
+	const u64 fhard = 0;
+	const u64 ctxvol = 0;
+	const u64 ctxinv = 0;
+#elif defined(__APPLE__)
+	// No per-thread rusage on macOS: only the thread's CPU time is available
+	static thread_local u64 tls_time{};
+	const u64 cycles = 0; // Not supported
+	const u64 time = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - tls_time;
 	tls_time += time;
 	const u64 fsoft = 0;
 	const u64 fhard = 0;
@@ -3460,22 +3576,82 @@ void thread_ctrl::set_name(std::string name)
 	g_tls_this_thread->set_name(std::move(name));
 }
 
+namespace
+{
+	std::vector<thread_ctrl::fatal_context_provider> s_fatal_context_providers;
+}
+
+void thread_ctrl::add_fatal_context_provider(fatal_context_provider provider)
+{
+	if (!provider)
+	{
+		return;
+	}
+
+	for (const auto registered : s_fatal_context_providers)
+	{
+		if (registered == provider)
+		{
+			return;
+		}
+	}
+
+	s_fatal_context_providers.push_back(provider);
+}
+
 [[noreturn]] void thread_ctrl::emergency_exit(std::string_view reason)
 {
-	// Print stacktrace
-#ifdef __cpp_lib_stacktrace
-	if (rpcs3::is_local_build())
-	{
-		std::ostringstream oss;
-		oss << std::stacktrace::current();
-		sys_log.notice("StackTrace\n\n%s\n", oss.str());
-	}
-#endif
+	// A signal raised from this path (e.g. the abort after the dialog) must not
+	// produce a second, misleading native report from the installed handlers.
+	utils::crash_report::notify_orderly_fatal();
 
 	if (const std::string info = dump_useful_thread_info(); !info.empty())
 	{
 		sys_log.notice("\n%s", info);
 	}
+
+	// The full crash report goes to the log file BEFORE anything is shown to the
+	// user. The native backtrace is always captured here, not only on local builds.
+	utils::crash_report::context ctx{};
+	ctx.kind = "fatal";
+	ctx.thread_id = get_tid();
+	ctx.thread_name = get_name_cached();
+	ctx.reason = std::string{reason};
+	ctx.backtrace = utils::get_backtrace_symbols(utils::get_backtrace(96));
+
+	if (auto ppu = cpu_thread::get_current<ppu_thread>())
+	{
+		if (auto func = ppu->current_function)
+		{
+			fmt::append(ctx.extra, "PPU current function: %s\n", func);
+		}
+	}
+
+	{
+		const auto [total, current] = utils::get_memory_usage();
+		fmt::append(ctx.extra, "RAM usage: %dMB/%dMB (%dMB free)\n",
+			current / (1024 * 1024), total / (1024 * 1024), (total - current) / (1024 * 1024));
+
+		if (total - current <= 256 * 1024 * 1024)
+		{
+			ctx.extra += "Possible RAM deficiency.\n";
+		}
+	}
+
+	for (const auto provider : s_fatal_context_providers)
+	{
+		if (std::string provider_lines = provider(); !provider_lines.empty())
+		{
+			ctx.extra += provider_lines;
+
+			if (provider_lines.back() != '\n')
+			{
+				ctx.extra += '\n';
+			}
+		}
+	}
+
+	sys_log.error("%s", utils::crash_report::format_report(ctx));
 
 	std::string reason_buf;
 

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Cell/timing_probe.h"
 #include "sys_time.h"
 
 #include "sys_process.h"
@@ -343,6 +344,7 @@ error_code sys_time_get_timezone(vm::ptr<s32> timezone, vm::ptr<s32> summertime)
 error_code sys_time_get_current_time(vm::ptr<s64> sec, vm::ptr<s64> nsec)
 {
 	sys_time.trace("sys_time_get_current_time(sec=*0x%x, nsec=*0x%x)", sec, nsec);
+	timing_probe::hit(timing_probe::sys_time_get_current_time);
 
 	if (!sec)
 	{

@@ -7,6 +7,7 @@
 #include "Emu/RSX/gcm_enums.h"
 #include "Utilities/geometry.h"
 
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -14,6 +15,19 @@
 
 namespace mtl
 {
+	// Snap a sampler LOD parameter (min/max LOD, bias) to 0.5 steps. RSX registers carry
+	// continuously-varying floats (GoW Ascension's min_lod jitters ~0.03/frame) and the pool
+	// dedupes by exact float equality, so raw values mint a new MTLSamplerState — and a new
+	// driver GPU resource ID — per distinct value. Past ~1024 simultaneously-live
+	// argument-buffer samplers the driver segfaults resolving the newest ID in
+	// setSamplerState (the RSX 0x448/0x449 class: killer ID 0x400/0x401, max-created ==
+	// killer). Snapping makes jitter dedupe to one shared state; half a mip step on clamp
+	// and bias bounds is visually invisible (the Nearest path already rounded bias this way).
+	inline float quantize_sampler_lod(float lod)
+	{
+		return std::floor(lod * 2.f + 0.5f) * 0.5f;
+	}
+
 	// Metal only has three fixed border colors (no custom border color). Exact RSX border colors that do not map to
 	// one of these are approximated (see get_closest_border_color).
 	struct border_color_t

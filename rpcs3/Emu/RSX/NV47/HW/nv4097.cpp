@@ -5,6 +5,7 @@
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/RSX/Common/BufferUtils.h"
 #include "Emu/system_config.h"
+#include "Emu/System.h"
 
 #define RSX(ctx) ctx->rsxthr
 #define REGS(ctx) (&rsx::method_registers)
@@ -739,6 +740,26 @@ namespace rsx
 			});
 		}
 
+		// Titles that must see a full pipeline sync (every queued zcull report written) at the texture read semaphore,
+		// like Strict Rendering Mode, instead of the deferred label below. Toy Story 3 reads zcull reports with the CPU
+		// right after this label and flickers textures/black otherwise.
+		static bool title_needs_full_zcull_sync_on_texture_semaphore()
+		{
+			static constexpr std::string_view serials[] = { "BLUS30480", "BLES00897", "BLES00898", "BLJM60223", "NPUB30558", "NPEB00600" };
+
+			const std::string& title_id = Emu.GetTitleID();
+			for (const std::string_view serial : serials)
+			{
+				if (title_id == serial)
+				{
+					return true;
+				}
+			}
+
+			// Other regions / re-releases: match the title itself
+			return Emu.GetTitle().starts_with("Toy Story 3");
+		}
+
 		void texture_read_semaphore_release(context* ctx, u32 reg, u32 arg)
 		{
 			// Pipeline barrier seems to be equivalent to a SHADER_READ stage barrier.
@@ -765,6 +786,15 @@ namespace rsx
 			if (g_cfg.video.strict_rendering_mode) [[ unlikely ]]
 			{
 				util::write_gcm_label<true, true>(ctx, reg, addr, arg);
+				return;
+			}
+
+			if (title_needs_full_zcull_sync_on_texture_semaphore()) [[ unlikely ]]
+			{
+				// Full zcull sync: wait until every queued report is in memory, then release the label. (write_gcm_label's
+				// own pipeline flush would hold the label back behind the reports instead, see sync_and_defer_label.)
+				RSX(ctx)->sync_all_zcull_reports();
+				util::write_gcm_label<true, false>(ctx, reg, addr, arg);
 				return;
 			}
 

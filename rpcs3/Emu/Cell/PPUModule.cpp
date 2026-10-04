@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/Cell/GamePatches.h"
 
 #include "Utilities/bin_patch.h"
 #include "Utilities/StrUtil.h"
@@ -26,6 +27,382 @@
 #include "Emu/Cell/Modules/StaticHLE.h"
 
 #include <map>
+#include <array>
+#include <vector>
+#include <chrono>
+#include <algorithm>
+#include <iterator>
+#include <tuple>
+
+// Guest simulation rate in vblank multiples (RSXThread.cpp): 2 while the timestep governor has retimed the game
+extern atomic_t<u32> g_guest_logic_rate_multiplier;
+// Guest held at the vblank rate (RSXThread.cpp): fixed-timestep games that cannot be retimed safely
+extern atomic_t<bool> g_guest_speed_lock;
+
+#include "Emu/Cell/timing_probe.h"
+
+LOG_CHANNEL(ppu_dt_log, "PPU_DT");
+
+namespace
+{
+	// Timestep governor: true 120 fps for fixed-timestep games, automatically, for every game.
+	//
+	// Most PS3 games advance their simulation by a fixed 1/60 s per frame. When the frame limit lets them flip at
+	// 120 fps (Frame Limit 120, or Display on a 120 Hz screen) they run twice as fast. Such games compute the step
+	// once (dt = 1.0f / 60) and keep it in a global or an object in writable memory, where it stays exactly 1/60.
+	// Rewriting it to 1/120 makes 120 steps/s advance game time at the correct rate (Ben 10 Ultimate Alien: one
+	// float at 0x94a4dc, found and verified over a 5-minute session).
+	//
+	// The governor engages only when all of these hold, judged each second on the RSX thread:
+	//  - the game really flips fast: >= 85 fps for 2 consecutive seconds (a vsync-locked or 30 fps game never does,
+	//    so its timing is never touched);
+	//  - the game does not keep time with a clock: fewer than 0.5 reads per frame of the system time, flip time or
+	//    vblank count, and no vblank handler (clock-driven games already run at the right speed at any frame rate);
+	//  - the candidates are few and stable: aligned 1/60 floats/doubles in the main module's writable data that hold
+	//    1/60 in two consecutive full scan passes, at most kMaxSites of them (a flood means coincidental data).
+	// While engaged, the guest is capped at exactly 120 fps (the steps are now 1/120 s). If the game settles below
+	// 75 fps for 2 seconds, every site goes back to 1/60 (at 60 fps the original steps are right) and the cap is
+	// lifted; it re-engages above 85 fps. 80 fps is where both settings are equally wrong (f/120 vs f/60).
+	//
+	// Cost: nothing at all while the game runs below 85 fps; otherwise one 256 KiB slice of memory compared per frame.
+	struct dt_governor
+	{
+		static constexpr u32 kMaxSites = 8;
+		static constexpr u32 kSlice = 256 * 1024;
+
+		std::vector<std::pair<u32, u32>> ranges; // [addr, addr + size): writable non-executable LOAD segments
+		std::vector<u32> f_sites, d_sites;       // sorted: retimed (or retimable after a revert) sites
+		std::vector<u32> pass_f, pass_d;         // 1/60 hits of the current pass (not yet known)
+		std::vector<u32> prev_f, prev_d;         // 1/60 hits of the previous pass
+		bool pass_flood = false;
+
+		usz range_index = 0;
+		u32 range_offset = 0;
+		u64 passes = 0;
+
+		u64 flips = 0;
+		u64 window_start_us = 0;
+		u64 window_flips = 0;
+		std::array<u64, 5> window_probe{};
+		f64 fps = 0.;
+		u32 high_windows = 0;
+		u32 low_windows = 0;
+		u32 clock_windows = 0;
+		bool clock_driven = false;
+		bool retime_verified = false;            // Title known to run correctly when its 1/60 steps are retimed
+		bool speed_locked = false;               // Fixed-timestep game held at 60 fps (sticky for the session)
+		std::string title_id;
+		bool engaged = false;
+		u64 restores = 0;
+		u64 windows = 0;
+		bool ambiguous_logged = false;
+	};
+
+	atomic_t<bool> g_dt_armed = false;
+	dt_governor g_dt; // Filled by the loader before arming, then owned by the RSX thread
+
+	std::array<u64, 5> dt_clock_probe()
+	{
+		using namespace timing_probe;
+		return {
+			sys_time_get_system_time.load(std::memory_order_relaxed),
+			sys_time_get_current_time.load(std::memory_order_relaxed),
+			gcm_get_last_flip_time.load(std::memory_order_relaxed),
+			gcm_get_vblank_count.load(std::memory_order_relaxed),
+			vblank_handler_calls.load(std::memory_order_relaxed),
+		};
+	}
+
+	constexpr u32 dt_bits_hi(bool is_double, bool to120)
+	{
+		return is_double ? static_cast<u32>((to120 ? game_patches::kDt120Bits64 : game_patches::kDt60Bits64) >> 32)
+		                 : (to120 ? game_patches::kDt120Bits : game_patches::kDt60Bits);
+	}
+
+	// Compare-and-swap one site between 1/60 and 1/120. A double's low word is identical for both values, so only
+	// its high (exponent) word changes. Only a word that still holds the expected value is ever written.
+	bool dt_swap(u32 site, bool is_double, bool to120)
+	{
+		if (!vm::check_addr(site, vm::page_readable | vm::page_writable, is_double ? 8 : 4))
+		{
+			return false;
+		}
+
+		return vm::_ptr<atomic_be_t<u32>>(site)->compare_and_swap_test(dt_bits_hi(is_double, !to120), dt_bits_hi(is_double, to120));
+	}
+
+	void dt_set_engaged(dt_governor& g, bool engage)
+	{
+		u32 changed = 0;
+
+		for (const u32 site : g.f_sites)
+		{
+			changed += dt_swap(site, false, engage);
+		}
+
+		for (const u32 site : g.d_sites)
+		{
+			changed += dt_swap(site, true, engage);
+		}
+
+		g.engaged = engage;
+
+		// The 120 fps cap applies only once a step has actually been retimed (an engaged governor that has not found
+		// one yet leaves the frame rate alone)
+		g_guest_logic_rate_multiplier = engage && (g.f_sites.size() + g.d_sites.size()) ? 2 : 1;
+
+		ppu_dt_log.notice("Timestep governor: %s at %.1f fps (%u of %u sites %s)", engage ? "engaged, game capped at 120 fps" : "released, game back on 1/60 s steps",
+			g.fps, changed, g.f_sites.size() + g.d_sites.size(), engage ? "1/60 -> 1/120" : "1/120 -> 1/60");
+	}
+
+	// End of a full scan pass: sites seen at 1/60 in this pass and the previous one are stable timesteps
+	void dt_end_pass(dt_governor& g)
+	{
+		g.passes++;
+		std::sort(g.pass_f.begin(), g.pass_f.end());
+		std::sort(g.pass_d.begin(), g.pass_d.end());
+
+		if (!g.pass_flood && g.engaged)
+		{
+			std::vector<u32> new_f, new_d;
+			std::set_intersection(g.pass_f.begin(), g.pass_f.end(), g.prev_f.begin(), g.prev_f.end(), std::back_inserter(new_f));
+			std::set_intersection(g.pass_d.begin(), g.pass_d.end(), g.prev_d.begin(), g.prev_d.end(), std::back_inserter(new_d));
+
+			if (new_f.size() + new_d.size() + g.f_sites.size() + g.d_sites.size() > dt_governor::kMaxSites)
+			{
+				if (!g.ambiguous_logged)
+				{
+					g.ambiguous_logged = true;
+					ppu_dt_log.warning("Timestep governor: %u stable 1/60 values is more than %u, too many to be a timestep; left alone",
+						new_f.size() + new_d.size() + g.f_sites.size() + g.d_sites.size(), dt_governor::kMaxSites);
+				}
+			}
+			else
+			{
+				for (const auto& [list, sites, is_double] : {std::tuple{&new_f, &g.f_sites, false}, std::tuple{&new_d, &g.d_sites, true}})
+				{
+					for (const u32 site : *list)
+					{
+						if (dt_swap(site, is_double, true))
+						{
+							sites->insert(std::upper_bound(sites->begin(), sites->end(), site), site);
+							g_guest_logic_rate_multiplier = 2;
+							ppu_dt_log.success("Timestep governor: %s at 0x%x retimed 1/60 -> 1/120 s (pass %u, flip %u, %.1f fps)",
+								is_double ? "double" : "float", site, g.passes, g.flips, g.fps);
+						}
+					}
+				}
+			}
+		}
+
+		g.prev_f = std::move(g.pass_f);
+		g.prev_d = std::move(g.pass_d);
+		g.pass_f.clear();
+		g.pass_d.clear();
+		g.pass_flood = false;
+	}
+
+	void dt_collect(dt_governor& g, const game_patches::scan_result& hits, bool is_double)
+	{
+		if (hits.overflow)
+		{
+			g.pass_flood = true;
+			return;
+		}
+
+		auto& known = is_double ? g.d_sites : g.f_sites;
+		auto& pass = is_double ? g.pass_d : g.pass_f;
+
+		for (u32 i = 0; i < hits.count; i++)
+		{
+			const u32 site = hits.sites[i];
+
+			if (std::binary_search(known.begin(), known.end(), site))
+			{
+				// The game stored 1/60 again at a retimed site: retime it again
+				g.restores += g.engaged && dt_swap(site, is_double, true);
+			}
+			else if (pass.size() < game_patches::kMaxDtSites)
+			{
+				pass.push_back(site);
+			}
+			else
+			{
+				g.pass_flood = true;
+			}
+		}
+	}
+
+	void dt_scan_slice(dt_governor& g)
+	{
+		if (g.ranges.empty())
+		{
+			return;
+		}
+
+		const auto [addr, size] = g.ranges[g.range_index];
+		const u32 len = std::min(dt_governor::kSlice, size - g.range_offset);
+		const u32 base = addr + g.range_offset;
+
+		if (len >= 4 && vm::check_addr(base, vm::page_readable | vm::page_writable, len))
+		{
+			const u8* ptr = vm::_ptr<u8>(base);
+			dt_collect(g, game_patches::scan_dt_literals(ptr, len, base), false);
+			dt_collect(g, game_patches::scan_dt64_literals(ptr, len, base), true);
+		}
+
+		g.range_offset += std::max<u32>(len, 4);
+
+		if (g.range_offset >= size)
+		{
+			g.range_offset = 0;
+
+			if (++g.range_index == g.ranges.size())
+			{
+				g.range_index = 0;
+				dt_end_pass(g);
+			}
+		}
+	}
+
+	// One-second evaluation window: frame rate, clock usage, engage/release decisions
+	void dt_end_window(dt_governor& g, u64 now)
+	{
+		const auto probe = dt_clock_probe();
+		const f64 secs = static_cast<f64>(now - g.window_start_us) / 1'000'000.;
+		g.fps = g.window_flips / secs;
+
+		u64 clock_reads = 0;
+		for (usz i = 0; i < 4; i++)
+		{
+			clock_reads += probe[i] - g.window_probe[i];
+		}
+
+		const u64 handler_calls = probe[4] - g.window_probe[4];
+		const bool high = g.fps >= 85.;
+		const bool low = g.fps < 75.;
+
+		g.high_windows = high ? g.high_windows + 1 : 0;
+		g.low_windows = low ? g.low_windows + 1 : 0;
+
+		// Clock-driven games already run at the right speed at any frame rate: judged only while the game flips fast
+		// and before the governor engages (its own retiming does not change what the game reads)
+		if (high && !g.engaged && !g.clock_driven)
+		{
+			const bool uses_clock = handler_calls > 0 || clock_reads * 2 >= g.window_flips;
+			g.clock_windows = uses_clock ? g.clock_windows + 1 : 0;
+
+			if (g.clock_windows >= 3)
+			{
+				g.clock_driven = true;
+				ppu_dt_log.notice("Timestep governor: game keeps time with a clock (%u clock reads, %u vblank handler calls over %u frames); it runs at the right speed at %.0f fps by itself, timing left alone",
+					clock_reads, handler_calls, g.window_flips, g.fps);
+			}
+		}
+
+		if (!g.engaged && !g.speed_locked && !g.clock_driven && g.high_windows >= 2 && g.clock_windows == 0)
+		{
+			if (g.retime_verified)
+			{
+				dt_set_engaged(g, true);
+			}
+			else
+			{
+				// A fixed-timestep game (flips fast, keeps no clock). Retiming its 1/60 values is only correct when they are
+				// the game's only notion of time; many games also count frames (animations, timers, AI), which a retime
+				// cannot fix and which leaves the game half retimed (SmackDown vs. Raw 2011: two 1/60 values, still too fast
+				// and broken physics). So hold it at the vblank rate: correct game speed, display still at its own rate.
+				g.speed_locked = true;
+				g_guest_speed_lock = true;
+				ppu_dt_log.warning("Timestep governor: %s is a fixed-timestep game (%.1f fps, no clock) not verified for retiming: game logic held at 60 fps for correct speed and physics; the display keeps its refresh rate",
+					g.title_id, g.fps);
+			}
+		}
+		else if (g.engaged && g.low_windows >= 2)
+		{
+			dt_set_engaged(g, false);
+		}
+
+		// Status: every 10 s for the first minute, then every minute
+		if ((g.windows < 60 && g.windows % 10 == 9) || g.windows % 60 == 59)
+		{
+			ppu_dt_log.notice("Timestep governor: %.1f fps, %s, %u float + %u double sites retimed, %u full passes, game re-stored 1/60 %u times; per second: %u clock reads, %u vblank handler calls",
+				g.fps, g.engaged ? "engaged (120 fps cap)" : g.speed_locked ? "speed lock (fixed-timestep game held at 60 fps)" : g.clock_driven ? "idle (clock-driven game)" : "idle",
+				g.f_sites.size(), g.d_sites.size(), g.passes, g.restores,
+				clock_reads, handler_calls);
+		}
+
+		g.windows++;
+		g.window_start_us = now;
+		g.window_flips = 0;
+		g.window_probe = probe;
+	}
+}
+
+// Called by the RSX thread after every guest flip (RSXThread.cpp, handle_emu_flip)
+void game_patches_runtime_on_flip()
+{
+	if (!g_dt_armed)
+	{
+		return;
+	}
+
+	auto& g = g_dt;
+	const u64 now = get_system_time();
+
+	g.flips++;
+	g.window_flips++;
+
+	if (!g.window_start_us)
+	{
+		g.window_start_us = now;
+		g.window_probe = dt_clock_probe();
+	}
+	else if (now - g.window_start_us >= 1'000'000)
+	{
+		dt_end_window(g, now);
+	}
+
+	// Scan only while it can matter: engaged (find new or re-stored sites). A game below 85 fps costs nothing.
+	if (g.engaged)
+	{
+		dt_scan_slice(g);
+	}
+}
+
+// Arms the governor for a newly loaded main executable (ppu_load_exec)
+void game_patches_runtime_arm(const std::vector<std::pair<u32, u32>>& ranges)
+{
+	// Titles whose fixed timestep is fully retimed by rewriting their 1/60 values, verified in play (true 120 fps with
+	// correct speed). Every other fixed-timestep game is held at 60 fps instead (see dt_end_window).
+	static constexpr std::string_view retime_verified[] =
+	{
+		"BLES01110", // Ben 10 Ultimate Alien: Cosmic Destruction (EU): one float at 0x94a4dc, verified over 5+ minutes
+	};
+
+	g_dt_armed = false;
+	g_guest_logic_rate_multiplier = 1;
+	g_guest_speed_lock = false;
+	g_dt = {};
+	g_dt.ranges = ranges;
+	g_dt.title_id = Emu.GetTitleID();
+	g_dt.retime_verified = std::find(std::begin(retime_verified), std::end(retime_verified), g_dt.title_id) != std::end(retime_verified);
+
+	u64 bytes = 0;
+	for (const auto& r : ranges)
+	{
+		bytes += r.second;
+	}
+
+	if (!ranges.empty())
+	{
+		ppu_dt_log.notice("Timestep governor: armed for %s over %u KiB of writable game data (%s)", g_dt.title_id, bytes / 1024,
+			g_dt.retime_verified ? "verified title: retimed to a true 120 fps when it runs fast without a clock"
+			                     : "a fixed-timestep game running fast is held at 60 fps; clock-driven games are left alone");
+		g_dt_armed = true;
+	}
+}
+
 #include <span>
 #include <set>
 #include <shared_mutex>
@@ -2512,6 +2889,21 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	else
 	{
 		ppu_loader.success("PPU executable hash: %s (<- %u)", hash, applied.size());
+	}
+
+	// Timestep governor (true 120 fps for fixed-timestep games): watches the main module's writable data
+	{
+		std::vector<std::pair<u32, u32>> ranges;
+
+		for (const auto& seg : _main.segs)
+		{
+			if (seg.type == 0x1u /* LOAD */ && !(seg.flags & 0x1u) /* PF_X */ && (seg.flags & 0x2u) /* PF_W */ && seg.size >= 8)
+			{
+				ranges.emplace_back(seg.addr, seg.size);
+			}
+		}
+
+		game_patches_runtime_arm(ranges);
 	}
 
 	// Initialize HLE modules

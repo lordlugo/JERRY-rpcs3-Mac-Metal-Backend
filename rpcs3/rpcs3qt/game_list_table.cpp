@@ -310,7 +310,8 @@ void game_list_table::populate(
 			check_iso |= game->audio_in_archive;
 		}
 
-		if (check_iso && game->is_iso_file && is_iso_file(game->path))
+		// Known from the game enumeration: checking it again here would read every disc on the UI thread
+		if (check_iso && game->is_iso_file)
 		{
 			icon_item->set_iso_path(game->path);
 		}

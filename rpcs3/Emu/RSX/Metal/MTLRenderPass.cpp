@@ -125,113 +125,21 @@ namespace mtl
 		desc->setVisibilityResultType(visibility_result_buffer ? MTL::VisibilityResultTypeAccumulate : MTL::VisibilityResultTypeReset);
 	}
 
-	void apply_clear_load_ops(MTL4::RenderPassDescriptor* desc, const framebuffer_info& fb, const attachment_clear_info& clear)
-	{
-		for (u32 index = 0; index < fb.color_count; ++index)
-		{
-			if (clear.color_mask & (1u << index))
-			{
-				auto attachment = desc->colorAttachments()->object(index);
-				attachment->setLoadAction(MTL::LoadActionClear);
-				attachment->setClearColor(clear.color);
-			}
-		}
-
-		if (!fb.depth_stencil)
-		{
-			return;
-		}
-
-		const auto aspect = fb.depth_stencil->aspect();
-		if (clear.clear_depth && (aspect & aspect_depth))
-		{
-			auto attachment = desc->depthAttachment();
-			attachment->setLoadAction(MTL::LoadActionClear);
-			attachment->setClearDepth(clear.depth);
-		}
-
-		if (clear.clear_stencil && (aspect & aspect_stencil))
-		{
-			auto attachment = desc->stencilAttachment();
-			attachment->setLoadAction(MTL::LoadActionClear);
-			attachment->setClearStencil(clear.stencil);
-		}
-	}
-
-	void restore_load_ops(MTL4::RenderPassDescriptor* desc, const framebuffer_info& fb)
-	{
-		for (u32 index = 0; index < fb.color_count; ++index)
-		{
-			desc->colorAttachments()->object(index)->setLoadAction(MTL::LoadActionLoad);
-		}
-
-		if (!fb.depth_stencil)
-		{
-			return;
-		}
-
-		const auto aspect = fb.depth_stencil->aspect();
-		if (aspect & aspect_depth)
-		{
-			desc->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
-		}
-
-		if (aspect & aspect_stencil)
-		{
-			desc->stencilAttachment()->setLoadAction(MTL::LoadActionLoad);
-		}
-	}
-
-	MTL4::RenderCommandEncoder* begin_single_target_pass(mtl::command_list& cmd, MTL::Texture* target, u32 width, u32 height, const MTL::ClearColor* clear_color)
-	{
-		auto desc = ref(MTL4::RenderPassDescriptor::alloc()->init());
-		auto attachment = desc->colorAttachments()->object(0);
-		attachment->setTexture(target);
-		attachment->setStoreAction(MTL::StoreActionStore);
-
-		if (clear_color)
-		{
-			attachment->setLoadAction(MTL::LoadActionClear);
-			attachment->setClearColor(*clear_color);
-		}
-		else
-		{
-			attachment->setLoadAction(MTL::LoadActionLoad);
-		}
-
-		desc->setRenderTargetWidth(width);
-		desc->setRenderTargetHeight(height);
-		desc->setDefaultRasterSampleCount(1);
-
-		return cmd.begin_render_pass(desc.get());
-	}
-
 	void clear_color_texture(mtl::command_list& cmd, MTL::Texture* target, u32 width, u32 height, const MTL::ClearColor& color)
 	{
-		begin_single_target_pass(cmd, target, width, height, &color);
-		cmd.end_render_pass();
+		cmd.defer_clear(target, aspect_color, width, height, { .color = color });
 	}
 
 	// -----------------------------------------------------------------------------------------------------------------
 
-	MTL4::RenderCommandEncoder* render_pass_tracker::begin(mtl::command_list& cmd, const MTL4::RenderPassDescriptor* desc)
+	MTL4::RenderCommandEncoder* render_pass_tracker::begin(mtl::command_list& cmd, MTL4::RenderPassDescriptor* desc)
 	{
-		auto encoder = cmd.begin_render_pass(desc);
+		auto encoder = cmd.begin_render_pass(desc, true);
 
 		m_cmd = &cmd;
 		m_encoder = ref<MTL4::RenderCommandEncoder>::retain(encoder);
 		m_pass_id++;
 		return encoder;
-	}
-
-	void render_pass_tracker::end(mtl::command_list& cmd)
-	{
-		if (is_open(cmd))
-		{
-			cmd.end_render_pass();
-		}
-
-		reset();
 	}
 
 	void render_pass_tracker::reset()

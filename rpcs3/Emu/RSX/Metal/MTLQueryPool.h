@@ -45,6 +45,9 @@ namespace mtl
 		// Re-initializes a recycled pool: clears results and takes 'size' references again
 		void rearm();
 
+		// Drops the references of slots that will never be handed out from this pool (retired early)
+		void release_unused(u32 count);
+
 		inline u32 size() const
 		{
 			return m_size;
@@ -115,16 +118,17 @@ namespace mtl
 		const MTL::Buffer* get_visibility_result_buffer() const;
 
 		// `active_pass` is the render encoder of the main pass if one is open on `cmd`, otherwise nullptr.
-		// A query that is open while a render pass (re)starts must be re-armed with resume_query().
+		// A query that is open while a render pass (re)starts must be re-armed with resume_query(). Arming a query in a
+		// pass declares the pass's write of the query's visibility result slot (hazard tracking).
 		void begin_query(command_buffer_chunk& cmd, MTL4::RenderCommandEncoder* active_pass, u32 index);
 		void end_query(command_buffer_chunk& cmd, MTL4::RenderCommandEncoder* active_pass, u32 index);
-		void resume_query(MTL4::RenderCommandEncoder* active_pass, u32 index);
+		void resume_query(mtl::command_list& cmd, MTL4::RenderCommandEncoder* active_pass, u32 index);
 
 		bool check_query_status(u32 index);
 		u32  get_query_result(u32 index);
 
 		// GPU copy of `count` consecutive slots (8 bytes each) into dst. Ends the active render pass (results are only
-		// written when a pass completes).
+		// written when a pass completes); ordered after the passes that wrote the slots.
 		void get_query_result_indirect(mtl::command_list& cmd, u32 index, u32 count, const mtl::buffer* dst, u64 dst_offset, u64 bytes_per_slot = query_pool::slot_size);
 
 		// `active_pass` is ended (via cmd) when a new pool has to be started.
@@ -132,6 +136,13 @@ namespace mtl
 		void free_query(mtl::command_list& /*cmd*/, u32 index);
 
 		void on_query_pool_released(std::unique_ptr<mtl::query_pool>& pool);
+
+		// Telemetry: pools retired while queries were still using them, and recycled pools waiting for reuse
+		std::pair<usz, usz> get_pool_counts()
+		{
+			std::lock_guard lock(m_query_pool_cache_lock);
+			return { m_consumed_pools.size(), m_query_pool_cache.size() };
+		}
 
 		template<typename T>
 			requires std::ranges::range<T> && std::same_as<std::ranges::range_value_t<T>, u32> // List of u32

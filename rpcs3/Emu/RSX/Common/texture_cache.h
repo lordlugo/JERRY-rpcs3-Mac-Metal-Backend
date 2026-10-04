@@ -1787,11 +1787,8 @@ namespace rsx
 					surface_scaling_config_t scaling_config{};
 					if (!g_cfg.video.disable_blit_engine_upscaling)
 					{
-						scaling_config =
-						{
-							.scale_percent = static_cast<u16>(g_cfg.video.resolution_scale_percent),
-							.min_scalable_dimension = static_cast<u16>(g_cfg.video.min_scalable_dimension),
-						};
+						// The renderer's active scale (it can run below the configured one: dynamic resolution)
+						scaling_config = rsx::get_current_renderer()->resolution_scaling_config;
 					}
 
 					auto dst_surface = m_rtts.create_surface_from_rsx_section(
@@ -3612,6 +3609,9 @@ namespace rsx
 			else
 			{
 				src_area = src_subres.src_area;
+				// Re-validate right before use: work since the lookup (destination lookup, invalidation) may have
+				// changed this surface's MSAA resolve state
+				src_subres.surface->memory_barrier(cmd, rsx::surface_access::transfer_read);
 				vram_texture = src_subres.surface->get_surface(rsx::surface_access::transfer_read);
 				typeless_info.src_context = texture_upload_context::framebuffer_storage;
 			}

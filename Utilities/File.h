@@ -229,9 +229,13 @@ namespace fs
 	// Check whether the path points to a raw device (e.g. "\\.\E:" on Windows, "/dev/sr0" on Linux, "/dev/rdisk2" on macOS)
 	bool is_optical_raw_device(const std::string& path);
 
-	// Check whether the path points to an optical drive or to a mounted disc image (either the raw device itself or the
-	// mount point of the disc/image). If so, provide the raw device in "raw_device" if requested
-	bool get_optical_raw_device(const std::string& path, std::string* raw_device = nullptr);
+	// Check whether the path points to an optical drive or to a mounted disc image, either the raw device itself or the mount
+	// point of the disc/image (e.g. "E:\", "/media/user/DISC", "/Volumes/DISC"). If so, provide in "source" the file the disc
+	// is read from and in "is_raw_device" whether it is a raw device:
+	// - on macOS, a mounted plain ISO image (not compressed, the device data are the file data) is read from its image file,
+	//   like any other ISO file (buffered, cached by the system, any size and alignment);
+	// - otherwise the raw device (an optical drive, or an image which is not a plain ISO), which only accepts whole sectors
+	bool get_optical_disc_source(const std::string& path, std::string* source = nullptr, bool* is_raw_device = nullptr);
 
 	// Get filesystem information
 	bool statfs(const std::string& path, device_stat& info);

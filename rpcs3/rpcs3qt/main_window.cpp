@@ -93,6 +93,7 @@
 
 #include <QEventLoop>
 #include <QTimer>
+#include <QtConcurrent>
 
 #ifdef _WIN32
 #include "raw_mouse_settings_dialog.h"
@@ -353,7 +354,12 @@ QString main_window::GetCurrentTitle()
 // returns appIcon
 QIcon main_window::GetAppIcon() const
 {
-	return m_app_icon;
+	// Loaded since Boot() on a worker thread: when the game window asks for it, the boot has been running for hundreds of
+	// ms already. Should the load not have started yet, waiting runs it here, like it used to be
+	QFuture<QIcon> app_icon = m_app_icon;
+	app_icon.waitForFinished();
+
+	return app_icon.resultCount() > 0 ? app_icon.result() : QIcon();
 }
 
 void main_window::OnMissingFw()
@@ -570,7 +576,8 @@ void main_window::Boot(const std::string& path, const std::string& title_id, boo
 
 	Emu.GracefulShutdown(false);
 
-	m_app_icon = gui::utils::get_app_icon_from_path(path, title_id);
+	// It may be read from the disc (from an ISO or through the raw device of a disc volume): not on the UI thread
+	m_app_icon = QtConcurrent::run(&gui::utils::get_app_icon_from_path, path, title_id);
 
 	std::optional<std::string> db_config = std::nullopt;
 

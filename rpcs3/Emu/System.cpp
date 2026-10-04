@@ -294,9 +294,14 @@ void init_fxo_for_exec(utils::serial* ar, bool full = false)
 static std::string get_builtin_title_config(std::string_view title_id, std::string_view title)
 {
 	// Grand Theft Auto IV (disc, PSN, Complete Edition). Approximate SPU floats break collision: the car falls through
-	// the world into the water in the prologue. The official entry also turns MSAA off for it.
+	// the world into the water in the prologue.
 	// Its frames take 26-40 ms with the SPUs saturated, and its audio arrives late accordingly: a 100 ms audio buffer
-	// covers that without gaps (the default 34 ms does not).
+	// covers that without gaps (the default 34 ms does not). Time stretching is off: the queue hovers around the
+	// stretch threshold (75 ms of 100), so playback kept slowing down ("slow audio"); the buffer absorbs the lateness.
+	// MSAA stays on Auto (the official entry turns it off, leaving every edge aliased): single-sample surfaces get the
+	// fork's forced host MSAA, which anti-aliases geometry edges (the GPU is 26-41% busy at the game's 30 fps cap).
+	// Its 30 fps cap is in the game code (timed with the timebase; a 120 Hz vblank left it at 30). The resolution
+	// scale is the user's own.
 	static constexpr std::string_view gta4_serials[] = { "BLES00229", "BLUS30127", "NPEB00882", "BLES01128", "BLUS30682" };
 
 	if (std::ranges::contains(gta4_serials, title_id) || title.starts_with("Grand Theft Auto IV"))
@@ -306,14 +311,65 @@ static std::string get_builtin_title_config(std::string_view title_id, std::stri
 			"  SPU XFloat Accuracy: Accurate\n"
 			"  Sleep Timers Accuracy: As Host\n"
 			"Video:\n"
-			"  MSAA: Disabled\n"
+			"  MSAA: Auto\n"
 			"  Multithreaded RSX: true\n"
 			"  Write Color Buffers: true\n"
 			"Audio:\n"
-			"  Desired Audio Buffer Duration: 100\n";
+			"  Desired Audio Buffer Duration: 100\n"
+			"  Enable Time Stretching: false\n";
+	}
+
+	// God of War: Ascension. From the official recommendations, confirmed by its logs here:
+	// - Accurate RSX reservation access: without it the game froze in the menus (one SPURS kernel spinning at 100%,
+	//   RSX parked on a jump-to-self that the SPU never released, no flip for 15 s), and its SPU audio stopped first:
+	//   every audio period after the main menu came up was silent.
+	// - Write Color Buffers: its lighting and post-processing run on the SPUs from the color buffers in memory.
+	// - Approximate ZCULL (Accurate ZCULL stats off): precise stats made the RSX submit ~43 query batches per frame.
+	// - SPU Block Size Mega: the game is SPU-bound.
+	// - MSAA stays on Auto (forced host MSAA), per the user.
+	static constexpr std::string_view gow_ascension_serials[] = { "BCES01741", "BCUS98232", "BCJS37008", "BCAS25017", "BCES01742", "NPEA00445", "NPUA80918" };
+
+	if (std::ranges::contains(gow_ascension_serials, title_id) || title.starts_with("God of War: Ascension") || title.starts_with("God of War Ascension"))
+	{
+		return
+			"Core:\n"
+			"  SPU Block Size: Mega\n"
+			"  Accurate RSX reservation access: true\n"
+			"  Sleep Timers Accuracy: As Host\n"
+			"Video:\n"
+			"  Write Color Buffers: true\n"
+			"  Relaxed ZCULL Sync: false\n"
+			"  Accurate ZCULL stats: false\n";
+	}
+
+	// Far Cry 3 (official recommendations): Write Color Buffers fixes its graphics, Accurate RSX reservation access
+	// keeps it from freezing.
+	static constexpr std::string_view far_cry_3_serials[] = { "BLUS30687", "BLES01138", "BLES01139", "BLJM60535", "NPUB31047", "NPEB01181" };
+
+	if (std::ranges::contains(far_cry_3_serials, title_id) || title.starts_with("Far Cry® 3") || title.starts_with("Far Cry 3"))
+	{
+		return
+			"Core:\n"
+			"  Accurate RSX reservation access: true\n"
+			"Video:\n"
+			"  Write Color Buffers: true\n";
 	}
 
 	return {};
+}
+
+// RPCS3 Metal fork: settings a title cannot run without (freezes), forced even over a custom config
+static bool title_needs_accurate_rsx_reservations(std::string_view title_id, std::string_view title)
+{
+	static constexpr std::string_view serials[] =
+	{
+		"BCES01741", "BCUS98232", "BCJS37008", "BCAS25017", "BCES01742", "NPEA00445", "NPUA80918", // God of War: Ascension
+		"BLUS30687", "BLES01138", "BLES01139", "BLJM60535", "NPUB31047", "NPEB01181",              // Far Cry 3
+	};
+
+	return std::ranges::contains(serials, title_id) ||
+		title.starts_with("God of War: Ascension") || title.starts_with("God of War Ascension") ||
+		title.starts_with("Far Cry® 3") || title.starts_with("Far Cry 3");
 }
 
 // Some settings are not allowed with certain conditions
@@ -475,6 +531,9 @@ void Emulator::Init()
 
 	jit_runtime::initialize();
 
+	// Fatal reports include the RSX command-stream position (see crash_report.h).
+	thread_ctrl::add_fatal_context_provider(&rsx::crash_context_provider);
+
 	const std::string emu_dir = rpcs3::utils::get_emu_dir();
 	auto make_path_verbose = [&](const std::string& path, bool must_exist_outside_emu_dir)
 	{
@@ -615,6 +674,49 @@ void Emulator::Init()
 			if (!g_cfg.audio.enable_time_stretching.get())
 			{
 				g_cfg.audio.enable_time_stretching.set(true);
+			}
+		}},
+		{ "metal-fork-defaults-v8", "Read Color/Depth Buffers: On, Write Depth Buffer: On, Force Hardware MSAA Resolve: On", []()
+		{
+			// The Metal backend implements all of these (surface init from memory, depth readback, resolve-surface
+			// sampling); previously off by default, move installs still on them to the new default.
+			if (!g_cfg.video.read_color_buffers.get())
+			{
+				g_cfg.video.read_color_buffers.set(true);
+			}
+
+			if (!g_cfg.video.read_depth_buffer.get())
+			{
+				g_cfg.video.read_depth_buffer.set(true);
+			}
+
+			if (!g_cfg.video.write_depth_buffer.get())
+			{
+				g_cfg.video.write_depth_buffer.set(true);
+			}
+
+			if (!g_cfg.video.force_hw_MSAA_resolve.get())
+			{
+				g_cfg.video.force_hw_MSAA_resolve.set(true);
+			}
+		}},
+		{ "metal-fork-defaults-v9", "Audio Format: Surround 5.1 (spatial audio)", []()
+		{
+			// With Stereo the emulated system reports a stereo TV and every game mixes its surround down to 2 channels
+			// before Core Audio sees it, so spatial audio never engages. Manual with no format selected is the same.
+			if (g_cfg.audio.format.get() == audio_format::stereo ||
+				(g_cfg.audio.format.get() == audio_format::manual && g_cfg.audio.formats.get() == 0))
+			{
+				g_cfg.audio.format.set(audio_format::surround_5_1);
+			}
+		}},
+		{ "metal-fork-defaults-v10", "RSX FIFO Fetch Accuracy: Ordered & Atomic", []()
+		{
+			// Atomic (the previous default) can execute a command block assembled from two moments of a list the game is
+			// patching, and desync (Dead FIFO crashes and freezes in SvR 2011, Pirates of the Caribbean, WWE)
+			if (g_cfg.core.rsx_fifo_accuracy.get() == rsx_fifo_mode::atomic)
+			{
+				g_cfg.core.rsx_fifo_accuracy.set(rsx_fifo_mode::atomic_ordered);
 			}
 		}},
 	};
@@ -1235,7 +1337,7 @@ game_boot_result Emulator::BootGame(const std::string& path, const std::string& 
 	m_db_config = db_config;
 
 	// Handle files and special paths inside Load unmodified
-	if (direct || !fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (direct || !fs::is_dir(path) || fs::get_optical_disc_source(path))
 	{
 		m_path = path;
 
@@ -1942,6 +2044,64 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				{
 					sys_log.error("Failed to apply database config");
 				}
+			}
+
+			// RPCS3 Metal fork: titles that run with a 120 Hz vblank by default, with or without a custom config. Only the
+			// default 60 Hz is replaced: a rate chosen in a custom config is kept.
+			{
+				struct vblank_120_title
+				{
+					std::string_view name;           // Title prefix (other regions / re-releases)
+					std::array<std::string_view, 6> serials; // Unused entries are empty
+				};
+
+				static constexpr vblank_120_title vblank_120_titles[] =
+				{
+					{ "Toy Story 3", {{ "BLUS30480", "BLES00897", "BLES00898", "BLJM60223", "NPUB30558", "NPEB00600" }} },
+					{ "X-Men Origins: Wolverine", {{ "BLES00150", "BLUS30216" }} },
+					{ "Assassin's Creed II", {{ "BLES00669", "BLUS30364", "BLJM60192", "NPEB00573", "NPUB30406" }} },
+				};
+
+				for (const vblank_120_title& entry : vblank_120_titles)
+				{
+					const bool serial_match = !m_title_id.empty() && std::ranges::contains(entry.serials, std::string_view{m_title_id});
+					if (!serial_match && !m_title.starts_with(entry.name))
+					{
+						continue;
+					}
+
+					if (g_cfg.video.vblank_rate.get() == 60)
+					{
+						g_cfg.video.vblank_rate.set(120);
+						sys_log.notice("%s: Vblank Rate set to 120 Hz (title default)", entry.name);
+					}
+
+					break;
+				}
+			}
+
+			// RPCS3 Metal fork: freezes without it (see get_builtin_title_config), so a custom config cannot turn it off
+			if (!g_cfg.core.rsx_accurate_res_access && title_needs_accurate_rsx_reservations(m_title_id, m_title))
+			{
+				g_cfg.core.rsx_accurate_res_access.set(true);
+				sys_log.notice("Accurate RSX reservation access: on (%s freezes without it)", m_title_id);
+			}
+
+			// RPCS3 Metal fork: per-game configs made while Atomic was the default still say Atomic (see metal-fork-defaults-v10)
+			if (g_cfg.core.rsx_fifo_accuracy.get() == rsx_fifo_mode::atomic)
+			{
+				g_cfg.core.rsx_fifo_accuracy.set(rsx_fifo_mode::atomic_ordered);
+				sys_log.notice("RSX FIFO Fetch Accuracy: Ordered & Atomic (config said Atomic)");
+			}
+
+			// RPCS3 Metal fork: per-game configs made while Stereo was the default still say Stereo (or Manual with no
+			// format), which makes every game mix down to 2 channels. Offer 5.1 instead so surround reaches Core Audio's
+			// spatial renderer (in memory only; the files are not changed).
+			if (g_cfg.audio.format.get() == audio_format::stereo ||
+				(g_cfg.audio.format.get() == audio_format::manual && g_cfg.audio.formats.get() == 0))
+			{
+				g_cfg.audio.format.set(audio_format::surround_5_1);
+				sys_log.notice("Audio Format: Surround 5.1 offered to the game (config said stereo only)");
 			}
 
 			// Disable incompatible settings
@@ -4658,7 +4818,7 @@ game_boot_result Emulator::AddGame(std::string path, bool is_iso)
 	fmt::trim_back(path, fs::delim);
 
 	// Handle files directly
-	if (!fs::is_dir(path) || fs::get_optical_raw_device(path))
+	if (!fs::is_dir(path) || fs::get_optical_disc_source(path))
 	{
 		return AddGameToYml(path, is_iso);
 	}

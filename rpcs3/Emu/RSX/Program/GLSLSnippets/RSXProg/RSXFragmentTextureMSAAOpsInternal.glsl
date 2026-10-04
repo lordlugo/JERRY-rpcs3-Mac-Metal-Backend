@@ -43,43 +43,64 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 		return sample0;
 	}
 
+	// Filtered read. Positions are in sample-expanded texels (texel_coords, snapped as above).
+	//  - Minification (the common case: an MSAA surface drawn at its pixel size, i.e. the game's own downsample or
+	//    resolve): box filter over the screen pixel's footprint, CENTRED on the lookup position. A lookup at a pixel
+	//    centre then averages exactly that pixel's own samples, which is what the PS3's texture unit returns. The
+	//    footprint used to start at the lookup position, which averaged the last sample of one pixel with the first
+	//    sample of the next: edge pixels picked up a neighbour's sample, alternately per row (stair-stepped,
+	//    checkerboard-like edges, e.g. WWE SmackDown vs. Raw 2011).
+	//  - Magnification: bilinear between the two nearest texel centres (texel centre = index + 0.5).
+	//  - 1:1 on an axis: the texel under the position.
+	const vec2 footprint = actual_step * vec2(image_size);
+	vec2 start = texel_coords;
+
+	if (!no_filter.x)
+	{
+		start.x -= (actual_step.x > uv_step.x) ? 0.5 * footprint.x : 0.5;
+	}
+
+	if (!no_filter.y)
+	{
+		start.y -= (actual_step.y > uv_step.y) ? 0.5 * footprint.y : 0.5;
+	}
+
+	const ivec2 base = ivec2(floor(start));
 	vec4 a, b;
-	float factor;
-	const vec4 sample2 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(0, 1));     // Top left
 
 	if (no_filter.x)
 	{
 		// No scaling, 1:1
-		a = sample0;
-		b = sample2;
+		a = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 0));
+		b = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 1));
+	}
+	else if (actual_step.x > uv_step.x)
+	{
+		// Downscale in X: box filter over up to 3 texels
+		const vec3 weights = compute2x2DownsampleWeights(start.x, 1.0, footprint.x);
+		const vec4 s00 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 0));
+		const vec4 s10 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(1, 0));
+		const vec4 s20 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(2, 0));
+		a = fma(s00, weights.xxxx, s10 * weights.y) + (s20 * weights.z);
+
+		if (!no_filter.y)
+		{
+			const vec4 s01 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 1));
+			const vec4 s11 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(1, 1));
+			const vec4 s21 = texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(2, 1));
+			b = fma(s01, weights.xxxx, s11 * weights.y) + (s21 * weights.z);
+		}
+		else
+		{
+			b = a;
+		}
 	}
 	else
 	{
-		// Filter required, sample more data
-		const vec4 sample1 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(1, 0));     // Bottom right
-		const vec4 sample3 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(1, 1));     // Top right
-
-		if (actual_step.x > uv_step.x)
-		{
-		    // Downscale in X, centered (in texel units, consistent with the snapped texel index)
-		    const vec3 weights = compute2x2DownsampleWeights(texel_coords.x, 1.0, actual_step.x * image_size.x);
-
-		    const vec4 sample4 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(2, 0));    // Further bottom right
-		    a = fma(sample0, weights.xxxx, sample1 * weights.y) + (sample4 * weights.z);                   // Weighted sum
-
-		    if (!no_filter.y)
-		    {
-		        const vec4 sample5 = texelFetch2DMS(tex, clamp_bounds, sample_count, icoords, ivec2(2, 1));    // Further top right
-		        b = fma(sample2, weights.xxxx, sample3 * weights.y) + (sample5 * weights.z);                   // Weighted sum
-		    }
-		}
-		else if (actual_step.x < uv_step.x)
-		{
-		    // Upscale in X
-		    factor = fract(texel_coords.x);
-		    a = mix(sample0, sample1, factor);
-		    b = mix(sample2, sample3, factor);
-		}
+		// Upscale in X: bilinear between texel centres
+		const float fx = fract(start.x);
+		a = mix(texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 0)), texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(1, 0)), fx);
+		b = mix(texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(0, 1)), texelFetch2DMS(tex, clamp_bounds, sample_count, base, ivec2(1, 1)), fx);
 	}
 
 	if (no_filter.y)
@@ -89,16 +110,14 @@ vec4 sampleTexture2DMS(in _MSAA_SAMPLER_TYPE_ tex, const in vec2 coords, const i
 	}
 	else if (actual_step.y > uv_step.y)
 	{
-		// Downscale in Y
-		const vec3 weights = compute2x2DownsampleWeights(texel_coords.y, 1.0, actual_step.y * image_size.y);
-		// We only have 2 rows computed for performance reasons, so combine rows 1 and 2
+		// Downscale in Y. Only 2 rows are fetched for performance reasons, so the third row's weight goes to row 2.
+		const vec3 weights = compute2x2DownsampleWeights(start.y, 1.0, footprint.y);
 		return a * weights.x + b * (weights.y + weights.z);
 	}
-	else if (actual_step.y < uv_step.y)
+	else
 	{
-		// Upscale in Y
-		factor = fract(texel_coords.y);
-		return mix(a, b, factor);
+		// Upscale in Y: bilinear between texel centres
+		return mix(a, b, fract(start.y));
 	}
 }
 

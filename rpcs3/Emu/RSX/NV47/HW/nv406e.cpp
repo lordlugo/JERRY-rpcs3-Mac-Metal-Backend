@@ -3,6 +3,7 @@
 #include "nv47_sync.hpp"
 
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/RSX/Common/sync_wait_stats.hpp"
 #include "Emu/system_config.h"
 
 #include "context_accessors.define.h"
@@ -13,10 +14,26 @@ namespace rsx
 	{
 		void set_reference(context* ctx, u32 /*reg*/, u32 arg)
 		{
+			auto& dma = *vm::_ptr<RsxDmaControl>(RSX(ctx)->dma_address);
+
+			// RPCS3 Metal fork: REF tells the game how far the RSX got, so it must not get ahead of the zcull reports
+			// queued before it. sync() made sure of that by waiting for the GPU to write them, stalling the RSX thread
+			// for the whole queued GPU work (God of War: Ascension: ~6.6 ms per frame, the GPU idle in the meantime).
+			// Instead, when the CPU reads reports, REF is written like a deferred semaphore: once the reports before it
+			// have landed, in order with the other deferred labels, while the RSX keeps processing commands. The game
+			// sees REF advance when the work before it is done on the GPU, as it did after the stall.
+			const u32 ref_address = RSX(ctx)->dma_address + 0x48; // RsxDmaControl::ref (resv[0x40], put, get, ref)
+			if (RSX(ctx)->defer_label(ref_address, arg))
+			{
+				// Fragment constants may have been updated (as sync() marks)
+				RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
+				dma.get.release(RSX(ctx)->fifo_ctrl->get_pos());
+				return;
+			}
+
 			RSX(ctx)->sync();
 
 			// Write ref+get (get will be written again with the same value at command end)
-			auto& dma = *vm::_ptr<RsxDmaControl>(RSX(ctx)->dma_address);
 			dma.get.release(RSX(ctx)->fifo_ctrl->get_pos());
 			dma.ref.store(arg);
 		}
@@ -55,6 +72,7 @@ namespace rsx
 
 			u64 start = get_system_time();
 			u64 last_check_val = start;
+			const u64 async_flip_start_us = g_sync_wait_stats.rsx_async_flip_us;
 			const bool is_flip_sema = (addr == RSX(ctx)->label_addr + 0x10);
 
 			while (sema != arg)
@@ -103,15 +121,28 @@ namespace rsx
 					// hot-spinning the cacheline so the producer is scheduled sooner.
 					std::this_thread::yield();
 				}
-				else
+				else if (get_system_time() - start < 200)
 				{
 					// Wait until the value changes or until 100us pass.
 					utils::spin_on_cacheline_once(atomic_sema, sema, 100);
 				}
+				else
+				{
+					// RPCS3 Metal fork: a wait that lasts (the game's SPUs/PPU still producing: God of War: Ascension
+					// ~4.6 ms per frame) sleeps in short steps instead of keeping a P-core spinning, which the SPU
+					// threads it waits for need. 50 us steps keep the wake-up latency far below a frame.
+					thread_ctrl::wait_for(50);
+				}
 			}
 
 			RSX(ctx)->fifo_wake_delay();
-			RSX(ctx)->performance_counters.idle_time += (get_system_time() - start);
+
+			const u64 wait_us = get_system_time() - start;
+			RSX(ctx)->performance_counters.idle_time += wait_us;
+
+			// Flips run while waiting (on_semaphore_acquire_wait) are work, not waiting
+			const u64 async_flip_us = g_sync_wait_stats.rsx_async_flip_us - async_flip_start_us;
+			g_sync_wait_stats.add(is_flip_sema ? sync_wait::flip_semaphore : sync_wait::semaphore, wait_us - std::min(wait_us, async_flip_us));
 		}
 
 		void semaphore_release(context* ctx, u32 reg, u32 arg)

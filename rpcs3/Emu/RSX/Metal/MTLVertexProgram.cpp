@@ -18,13 +18,26 @@ std::string MTLVertexDecompilerThread::getIntTypeName(usz /*elementCount*/)
 
 std::string MTLVertexDecompilerThread::getFunction(FUNCTION f)
 {
-	if (f == FUNCTION::VERTEX_TEXTURE_FETCH1D)
+	switch (f)
 	{
+	case FUNCTION::VERTEX_TEXTURE_FETCH1D:
 		// Metal: 1D textures are 2D textures of height 1 (declared as sampler2D in insertConstants)
 		return "textureLod($t, vec2($0.x, 0.5), 0)";
+	case FUNCTION::DP4:
+	case FUNCTION::DPH:
+		// Games transform the same vertices with DP4 (w = 1 from the vertex fetch) in one program and DPH in another,
+		// e.g. a depth pre-pass and the colour passes that test depth for equality against it, and the RSX gives both
+		// the same bits. dot(v, m) and dot(vec4(v.xyz, 1.0), m) are different computations for the Metal compiler: it
+		// folds the constant lane and may sum the products in another order (relaxed math reassociates), so the
+		// positions differ in the last bit and whole triangles fail the depth test ([[invariant]] only covers identical
+		// computations). One explicit fused chain that starts with the w product makes the two bit-identical whenever
+		// v.w == 1: w * m.w == m.w exactly, and every later step is the same fma on the same values.
+		return f == FUNCTION::DP4
+			? "$Ty(fma($0.x, $1.x, fma($0.y, $1.y, fma($0.z, $1.z, $0.w * $1.w))))"
+			: "$Ty(fma($0.x, $1.x, fma($0.y, $1.y, fma($0.z, $1.z, $1.w))))";
+	default:
+		return glsl::getFunctionImpl(f);
 	}
-
-	return glsl::getFunctionImpl(f);
 }
 
 std::string MTLVertexDecompilerThread::compareFunction(COMPARE f, std::string_view Op0, std::string_view Op1, bool scalar)
@@ -111,6 +124,8 @@ void MTLVertexDecompilerThread::insertHeader(std::stringstream& OS)
 	};
 	inputs.push_back(std::move(context_input));
 
+	// Stays a storage buffer (MSL device): the renderer binds it at offset 0 or 4, and a constant address space buffer
+	// offset must be 256-byte aligned on macOS.
 	if (m_device_props.emulate_conditional_rendering)
 	{
 		OS <<
@@ -130,8 +145,10 @@ void MTLVertexDecompilerThread::insertHeader(std::stringstream& OS)
 		inputs.push_back(std::move(predicate_input));
 	}
 
+	// The draw parameters are the same for every vertex of a draw (indexed by a push constant): a uniform block (MSL
+	// constant address space, which Apple GPUs optimize for data every thread of a draw reads), bound at offset 0.
 	OS <<
-		"layout(std430, set=0, binding=" << mtl_prog->binding_table.vertex_buffers_location + 2 << ") readonly restrict buffer DrawParametersBuffer\n"
+		"layout(std430, set=0, binding=" << mtl_prog->binding_table.vertex_buffers_location + 2 << ") uniform DrawParametersBuffer\n"
 		"{\n"
 		"	draw_parameters_t draw_parameters[];\n"
 		"};\n\n";
@@ -139,7 +156,7 @@ void MTLVertexDecompilerThread::insertHeader(std::stringstream& OS)
 	mtl::glsl::program_input layouts_input
 	{
 		.domain = glsl::glsl_vertex_program,
-		.type = mtl::glsl::input_type_storage_buffer,
+		.type = mtl::glsl::input_type_uniform_buffer,
 		.set = mtl::glsl::binding_set_index_vertex,
 		.location = mtl_prog->binding_table.vertex_buffers_location + 2,
 		.name = "DrawParametersBuffer"
@@ -328,27 +345,13 @@ void MTLVertexDecompilerThread::insertOutputs(std::stringstream& OS, const std::
 		}
 	}
 
-	if (!(m_prog.ctrl & RSX_SHADER_CONTROL_INTERPRETER_MODEL))
-	{
-		OS << "layout(location=" << mtl::get_varying_register_location("usr") << ") out flat uvec4 draw_params_payload;\n";
-	}
+	// No draw-parameter payload varying: the fragment stage gets its per-draw offsets as push constants (see
+	// MTLFragmentProgram::draw_offsets_push_offset), which keeps them uniform for the Metal compiler.
 
 	// Games draw the same geometry in several passes with different programs (depth pre-pass, G-buffer, lighting) and
 	// test depth for equality between them. Fast math lets the Metal compiler round the position differently in each
 	// program; an invariant position ([[position, invariant]] + preserveInvariance) is computed the same way everywhere.
 	OS << "invariant gl_Position;\n";
-}
-
-void MTLVertexDecompilerThread::insertFSExport(std::stringstream& OS)
-{
-	OS <<
-		"void write_fs_payload()\n"
-		"{\n"
-		"	draw_params_payload.x = get_draw_params().fs_constants_offset;\n"
-		"	draw_params_payload.y = get_draw_params().fs_context_offset;\n"
-		"	draw_params_payload.z = get_draw_params().fs_texture_base_index;\n"
-		"	draw_params_payload.w = get_draw_params().fs_stipple_pattern_offset;\n"
-		"}\n\n";
 }
 
 void MTLVertexDecompilerThread::insertMainStart(std::stringstream& OS)
@@ -365,8 +368,6 @@ void MTLVertexDecompilerThread::insertMainStart(std::stringstream& OS)
 
 	glsl::insert_glsl_legacy_function(OS, properties2);
 	glsl::insert_vertex_input_fetch(OS, glsl::glsl_rules_vulkan);
-
-	insertFSExport(OS);
 
 	// Declare global registers with optional initialization
 	std::string registers;
@@ -452,9 +453,6 @@ void MTLVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
 	}
 
 	OS << "	vs_main();\n\n";
-
-	// FS payload
-	OS << "write_fs_payload();\n\n";
 
 	for (auto &i : reg_table)
 	{

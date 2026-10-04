@@ -5,12 +5,16 @@ R"(
 // Fragment-shader variant of ColorResolvePass.glsl (used where storage-image writes are unavailable or undesirable).
 // Renders the sample-expanded (resolved) image: every output pixel reads one sample of the multisampled source.
 
+// average_samples.x > 0 (forced host MSAA): the output has the source's own size and every output pixel is the average
+// of all average_samples.x samples of that pixel (box resolve, like a hardware MSAA resolve).
+
 #ifdef VULKAN
 layout(set=0, binding=0) uniform sampler2DMS fs0;
-layout(push_constant) uniform static_data { ivec2 sample_count; };
+layout(push_constant) uniform static_data { ivec2 sample_count; ivec2 average_samples; };
 #else
 layout(binding=31) uniform sampler2DMS fs0;
 uniform ivec2 sample_count;
+uniform ivec2 average_samples;
 #endif
 
 layout(location=0) out vec4 out_color;
@@ -18,6 +22,19 @@ layout(location=0) out vec4 out_color;
 void main()
 {
 	ivec2 out_coord = ivec2(gl_FragCoord.xy);
+
+	if (average_samples.x > 0)
+	{
+		vec4 sum = vec4(0.);
+		for (int i = 0; i < average_samples.x; ++i)
+		{
+			sum += texelFetch(fs0, out_coord, i);
+		}
+
+		out_color = sum / float(average_samples.x);
+		return;
+	}
+
 	ivec2 in_coord = (out_coord / sample_count.xy);
 	ivec2 sample_loc = out_coord % sample_count.xy;
 	int sample_index = sample_loc.x + (sample_loc.y * sample_count.y);

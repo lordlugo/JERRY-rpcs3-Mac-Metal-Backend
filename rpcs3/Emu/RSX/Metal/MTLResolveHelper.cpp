@@ -1,5 +1,6 @@
 #include "stdafx.h"
 
+#include "MTLGraphicsLog.h"
 #include "MTLResolveHelper.h"
 #include "mtlutils/device.h"
 
@@ -47,7 +48,7 @@ namespace mtl
 		ensure(msaa_image->samples() > 1);
 		ensure(resolve_image->samples() == 1);
 
-		update_sample_configuration(msaa_image);
+		update_sample_configuration(msaa_image, resolve_image);
 
 		// Raw data (VK_REMAP_VIEW_MULTISAMPLED / VK_REMAP_IDENTITY): ignore the native component layout on both sides
 		auto src_view = msaa_image->get_identity_view(aspect_color);
@@ -82,7 +83,7 @@ namespace mtl
 		ensure(resolve_image->samples() == 1);
 
 		// Per-sample shading is implied by gl_SampleID ([[sample_id]]) in the fragment shader
-		update_sample_configuration(msaa_image);
+		update_sample_configuration(msaa_image, resolve_image);
 
 		auto src_view = resolve_image->get_identity_view(aspect_color);
 
@@ -102,6 +103,7 @@ namespace mtl
 		if (aspect == aspect_color)
 		{
 			initialize_pass(g_color_resolver, dev);
+			note_resolve("color", false, dst->width(), dst->height());
 			g_color_resolver->run(cmd, src, dst);
 			return;
 		}
@@ -109,11 +111,13 @@ namespace mtl
 		if ((aspect & aspect_depth) && (aspect & aspect_stencil) && (dst->aspect() & aspect_stencil))
 		{
 			initialize_pass(g_depthstencil_resolver, dev);
+			note_resolve("depthstencil", false, dst->width(), dst->height());
 			g_depthstencil_resolver->run(cmd, src, dst);
 		}
 		else if (aspect & aspect_depth)
 		{
 			initialize_pass(g_depth_resolver, dev);
+			note_resolve("depth", false, dst->width(), dst->height());
 			g_depth_resolver->run(cmd, src, dst);
 		}
 		else
@@ -131,6 +135,7 @@ namespace mtl
 		if (aspect == aspect_color)
 		{
 			initialize_pass(g_color_unresolver, dev);
+			note_resolve("color", true, dst->width(), dst->height());
 			g_color_unresolver->run(cmd, dst, src);
 			return;
 		}
@@ -138,11 +143,13 @@ namespace mtl
 		if ((aspect & aspect_depth) && (aspect & aspect_stencil) && (dst->aspect() & aspect_stencil))
 		{
 			initialize_pass(g_depthstencil_unresolver, dev);
+			note_resolve("depthstencil", true, dst->width(), dst->height());
 			g_depthstencil_unresolver->run(cmd, dst, src);
 		}
 		else if (aspect & aspect_depth)
 		{
 			initialize_pass(g_depth_unresolver, dev);
+			note_resolve("depth", true, dst->width(), dst->height());
 			g_depth_unresolver->run(cmd, dst, src);
 		}
 		else

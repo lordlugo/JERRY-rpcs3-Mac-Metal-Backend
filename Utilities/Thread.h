@@ -315,6 +315,14 @@ public:
 	// Exit.
 	[[noreturn]] static void emergency_exit(std::string_view reason);
 
+	// Providers of extra one-shot context lines for fatal reports (e.g. RSX FIFO
+	// state, Metal sampler writes), registered by the emulation layer and the
+	// backends. Called on the crashing thread inside emergency_exit(): keep them
+	// cheap, lock-free and non-throwing. Repeat registrations of the same
+	// function are ignored, so renderer re-init stays idempotent.
+	using fatal_context_provider = std::string(*)();
+	static void add_fatal_context_provider(fatal_context_provider provider);
+
 	// Exit the current named thread as errored without reporting a fatal error.
 	[[noreturn]] static void silent_exit() noexcept;
 

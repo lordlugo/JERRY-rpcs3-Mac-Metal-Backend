@@ -13,6 +13,7 @@
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/timers.hpp"
 #include "Emu/Memory/vm_reservation.h"
+#include "spu_boot_settle.h"
 #include "sys_interrupt.h"
 #include "sys_process.h"
 #include "sys_memory.h"
@@ -1225,7 +1226,7 @@ error_code sys_spu_thread_group_start(ppu_thread& ppu, u32 id)
 		}
 	} notify_threads;
 
-	std::lock_guard lock(group->mutex);
+	std::unique_lock lock(group->mutex);
 
 	// SPU_THREAD_GROUP_STATUS_READY state is not used
 	switch (group->run_state.compare_and_swap(SPU_THREAD_GROUP_STATUS_INITIALIZED, SPU_THREAD_GROUP_STATUS_RUNNING))
@@ -1267,6 +1268,15 @@ error_code sys_spu_thread_group_start(ppu_thread& ppu, u32 id)
 
 	u32 ran_threads = max_threads;
 
+	struct booted_thread
+	{
+		shared_ptr<named_thread<spu_thread>> thread;
+		u64 first_block = 0;
+	};
+
+	booted_thread booted[8]{};
+	u32 booted_count = 0;
+
 	for (auto& thread : group->threads)
 	{
 		if (!ran_threads)
@@ -1276,8 +1286,152 @@ error_code sys_spu_thread_group_start(ppu_thread& ppu, u32 id)
 
 		if (thread && ran_threads--)
 		{
+			// Snapshot while stopped: the counter cannot advance before stop clears.
+			booted[booted_count++] = {thread, atomic_storage<u64>::load(thread->block_counter)};
 			thread->state -= cpu_flag::stop;
 			notify_threads.threads[++notify_threads.index] = thread.get();
+		}
+	}
+
+	// The group mutex must not be held while waiting for SPU boot (boot paths take it).
+	lock.unlock();
+
+	for (u32 i = 0; i != booted_count; i++)
+	{
+		// Kick before waiting: the exit-scope notify below only fires at return.
+		booted[i].thread->state.notify_one();
+	}
+
+	// Boot barrier: do not return until every started SPU thread has executed its
+	// first block. Kernels that are still compiling (LLVM) boot seconds after start
+	// returns; the PPU outruns them to submit-and-join while their first poll lands
+	// on already-written state (stale reservation baseline), wedging the group
+	// forever with all kernels idle in LR-wait (GoW Ascension loading freeze: PPU in
+	// group_join, every kernel parked at one PC). Waiting here makes PPU submissions
+	// postdate SPU first-poll, matching hardware boot timing. Bounded by a timeout
+	// (falls back to immediate return) and aborted on stop; skipped for SPU-proxied
+	// starts, where the caller may be one of the threads.
+	if (!cpu_thread::get_current<spu_thread>() && booted_count)
+	{
+		// Visible in the log: proves the barrier engaged and how long SPU boot
+		// took (LLVM compile latency is the wedge's fuel). One line per group start.
+		const u64 wait_start = get_system_time();
+		bool timed_out = false;
+
+		// Phase 1: every thread has executed its first block (covers LLVM entry
+		// compile, which is seconds on a cold cache). Generous timeout.
+		const u64 exec_deadline = wait_start + 30'000'000;
+
+		for (bool all_booted = false; !all_booted;)
+		{
+			all_booted = true;
+
+			for (u32 i = 0; i != booted_count; i++)
+			{
+				if (atomic_storage<u64>::load(booted[i].thread->block_counter) == booted[i].first_block)
+				{
+					all_booted = false;
+					break;
+				}
+			}
+
+			if (all_booted || ppu.is_stopped())
+			{
+				break;
+			}
+
+			if (get_system_time() >= exec_deadline)
+			{
+				timed_out = true;
+				break;
+			}
+
+			thread_ctrl::wait_for(1000);
+		}
+
+		// Phase 2: every thread has reached its first wait state or stopped.
+		// First execution is not first poll: the kernel init path between them can
+		// still lose to a fast PPU submitter. SPURS kernels poll immediately (this
+		// resolves in milliseconds). Compute-bound kernels that never wait
+		// (video decode and friends) no longer burn the whole timeout on every
+		// group start: sustained execution proves them past init (see
+		// boot_settle_tracker), so the barrier proceeds early instead of
+		// freezing the game's job dispatcher for seconds per batch.
+		bool wait_timed_out = false;
+		bool settled_by_execution = false;
+
+		if (!timed_out && !ppu.is_stopped())
+		{
+			lv2_spu::boot_settle_tracker settle;
+			u64 settle_counters[lv2_spu::boot_settle_tracker::max_threads]{};
+
+			for (u32 i = 0; i != booted_count; i++)
+			{
+				settle_counters[i] = atomic_storage<u64>::load(booted[i].thread->block_counter);
+			}
+
+			settle.begin(booted_count, get_system_time(), settle_counters);
+
+			for (;;)
+			{
+				lv2_spu::boot_settle_tracker::thread_snapshot snapshots[lv2_spu::boot_settle_tracker::max_threads]{};
+
+				for (u32 i = 0; i != booted_count; i++)
+				{
+					auto& thread = booted[i].thread;
+					snapshots[i].stopped = thread->is_stopped();
+					snapshots[i].waiting = !!(+thread->state & cpu_flag::wait);
+					snapshots[i].counter = atomic_storage<u64>::load(thread->block_counter);
+				}
+
+				const auto outcome = settle.update(get_system_time(), snapshots);
+
+				if (outcome == lv2_spu::boot_settle_tracker::verdict::settled)
+				{
+					break;
+				}
+
+				if (outcome == lv2_spu::boot_settle_tracker::verdict::proceed_executing)
+				{
+					settled_by_execution = true;
+					break;
+				}
+
+				if (outcome == lv2_spu::boot_settle_tracker::verdict::timed_out)
+				{
+					wait_timed_out = true;
+					break;
+				}
+
+				if (ppu.is_stopped())
+				{
+					break;
+				}
+
+				// Fine-grained cadence: the settle windows are sub-millisecond,
+				// and sleep overshoot only lengthens the grace (the safe
+				// direction).
+				thread_ctrl::wait_for(200);
+			}
+		}
+
+		const u64 barrier_elapsed_ms = (get_system_time() - wait_start) / 1000;
+		const char* barrier_outcome = timed_out ? "timeout, proceeding unguarded" : ppu.is_stopped() ? "emulation stopping" :
+			wait_timed_out ? "threads executing but not yet waiting" :
+			settled_by_execution ? "threads executing (sustained), proceeding early" : "all threads polling or stopped";
+
+		if (barrier_elapsed_ms >= 2 || timed_out || wait_timed_out || settled_by_execution || ppu.is_stopped())
+		{
+			sys_spu.notice("sys_spu_thread_group_start(id=0x%x): SPU boot barrier released %u thread(s) after %llu ms (%s)", id, booted_count,
+				barrier_elapsed_ms, barrier_outcome);
+		}
+		else
+		{
+			// Fast-path success (sub-2 ms, all polling): trace only. The
+			// per-start notice fired ~13k times in one SVR 2011 session,
+			// burying real signals; every slow or unusual start still logs.
+			sys_spu.trace("sys_spu_thread_group_start(id=0x%x): SPU boot barrier released %u thread(s) after %llu ms (%s)", id, booted_count,
+				barrier_elapsed_ms, barrier_outcome);
 		}
 	}
 

@@ -266,7 +266,12 @@ namespace mtl
 			return MTL::PixelFormatRG8Snorm;
 		case MTL::PixelFormatRGBA8Unorm:
 			return MTL::PixelFormatRGBA8Snorm;
-		// NOTE: Metal has no BGRA8Snorm. The shader-side renormalization path handles BGRA8 sources instead.
+		case MTL::PixelFormatBGRA8Unorm:
+			// Metal has no BGRA8Snorm (VK uses B8G8R8A8_SNORM). An RGBA8Snorm view of the BGRA8 data reads the bytes in
+			// the other channel order; image_view::as() swaps the red and blue swizzle selectors to compensate. Without
+			// this twin, signed A8R8G8B8/D8R8G8B8 textures (e.g. signed normal maps) keep the shader-side sign extension,
+			// which cannot be filtered: they were point sampled without mip interpolation or anisotropy.
+			return MTL::PixelFormatRGBA8Snorm;
 		// 16-bit
 		case MTL::PixelFormatR16Unorm:
 			return MTL::PixelFormatR16Snorm;
@@ -284,6 +289,7 @@ namespace mtl
 		case MTL::PixelFormatR8Unorm:
 		case MTL::PixelFormatR8Unorm_sRGB:
 		case MTL::PixelFormatR8Snorm:
+		case MTL::PixelFormatR8Uint: // shader interpreter's placeholder for unused stencil mirror slots (zero-filled)
 			return 1;
 		case MTL::PixelFormatR16Uint:
 		case MTL::PixelFormatR16Float:

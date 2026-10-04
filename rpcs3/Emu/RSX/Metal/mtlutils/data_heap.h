@@ -70,5 +70,8 @@ namespace mtl
 		void restore_snapshot(const managed_heap_snapshot_t& snapshot);
 		void reset_heap_allocations();
 		void reset();
+
+		// Sum of the sizes of the registered ring buffers (telemetry: the rings grow, they never shrink)
+		u64 get_total_heap_size();
 	}
 }

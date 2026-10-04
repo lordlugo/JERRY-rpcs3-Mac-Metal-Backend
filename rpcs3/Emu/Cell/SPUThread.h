@@ -748,6 +748,12 @@ public:
 	atomic_t<ch_events_t> ch_events;
 	bool interrupts_enabled = false;
 
+	// Reservation address the SPU is (or was last) parked on in an RdEventStat
+	// wait. Forensics only: written by the SPU thread on wait entry, read by the
+	// RSX stall dumper. Tells which lock a wedged kernel polls (SPURS area,
+	// taskset queue, peer LS) when mask/pending/MFC alone cannot.
+	atomic_t<u32> wait_raddr = 0;
+
 	u64 ch_dec_start_timestamp = 0; // timestamp of writing decrementer value
 	u32 ch_dec_value = 0; // written decrementer value
 	bool is_dec_frozen = false;

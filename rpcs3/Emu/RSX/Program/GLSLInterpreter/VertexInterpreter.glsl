@@ -510,10 +510,10 @@ void main()
 			case RSX_SCA_OPCODE_MOV: break;
 			case RSX_SCA_OPCODE_RCP: value = 1.0 / value; break;
 			case RSX_SCA_OPCODE_RCC: value = clamp(1.0 / value, 5.42101e-20, 1.884467e19);  break;
-			case RSX_SCA_OPCODE_RSQ: value = 1.0 / sqrt(value); break;
+			case RSX_SCA_OPCODE_RSQ: value = 1.0 / sqrt(max(value, 0.0000000001)); break; // Same clamp as the recompiler (NotZeroPositive)
 			case RSX_SCA_OPCODE_EXP: value = exp(value); break;
 			case RSX_SCA_OPCODE_LOG: value = log(value); break;
-			case RSX_SCA_OPCODE_LG2: value = log2(value); break;
+			case RSX_SCA_OPCODE_LG2: value = log2(max(value, 0.0000000001)); break;
 			case RSX_SCA_OPCODE_EX2: value = exp2(value); break;
 			case RSX_SCA_OPCODE_SIN: value = sin(value); break;
 			case RSX_SCA_OPCODE_COS: value = cos(value); break;

@@ -228,31 +228,66 @@ namespace rsx
 
 		if (_thr.m_enqueued_count.load() <= _thr.m_processed_count.load()) [[likely]]
 		{
-			// Nothing to do
+			// Fully drained (also clears a wedge observed by an earlier call)
+			m_sync_wedge_target.release(0);
 			return true;
 		}
 
-		if (auto rsxthr = get_current_renderer(); rsxthr->is_current_thread())
+		// A previous sync() already waited out the whole timeout while the offloader made no progress past
+		// this mark: do not hitch the caller again, report the fallback path right away. The mark clears as
+		// soon as the offloader moves past it (or drains fully, above).
+		if (const u64 wedge = m_sync_wedge_target.load(); wedge != 0 && _thr.m_processed_count.load() < wedge)
 		{
-			if (m_mem_fault_flag)
+			return false;
+		}
+		m_sync_wedge_target.release(0);
+
+		auto rsxthr = get_current_renderer();
+		const bool on_rsx_thread = rsxthr->is_current_thread();
+
+		if (on_rsx_thread && m_mem_fault_flag)
+		{
+			// Abort if offloader is in recovery mode
+			return false;
+		}
+
+		// Bounded wait: an offloader that stops making progress (wedged worker, blocked job) must not freeze
+		// its waiters forever. The old unbounded spin hung the RSX thread at full CPU with no log and ignored
+		// exit requests. Callers already fall back when this returns false (e.g. inline submit).
+		static constexpr u64 sync_timeout_us = 2'000'000;
+		const u64 start = get_system_time();
+
+		for (;;)
+		{
+			const u64 enqueued = _thr.m_enqueued_count.load();
+			const u64 processed = _thr.m_processed_count.load();
+
+			switch (poll_offload_drain(enqueued, processed, start, get_system_time(), sync_timeout_us))
 			{
-				// Abort if offloader is in recovery mode
+			case offload_drain_poll::drained:
+				return true;
+			case offload_drain_poll::timed_out:
+				rsx_log.error("RSX offloader sync timed out after 2 s (%llu job(s) queued, %llu processed); continuing without the drain",
+					enqueued, processed);
+				m_sync_wedge_target.release(enqueued);
 				return false;
+			default:
+				break;
 			}
 
-			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+			if (on_rsx_thread)
 			{
-				rsxthr->on_semaphore_acquire_wait();
-				utils::pause();
-			}
-		}
-		else
-		{
-			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
-				utils::pause();
-		}
+				// Exit requests must break the wait
+				if (rsxthr->test_stopped())
+				{
+					return false;
+				}
 
-		return true;
+				rsxthr->on_semaphore_acquire_wait();
+			}
+
+			utils::pause();
+		}
 	}
 
 	void dma_manager::join()

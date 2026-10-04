@@ -311,16 +311,22 @@ namespace mtl
 		dispose_image(m_input_copy);
 	}
 
-	void metalfx_upscale_pass::signal_fence(mtl::command_list& cmd)
+	void metalfx_upscale_pass::signal_fence(mtl::command_list& cmd, std::span<const gpu_access> scaler_accesses)
 	{
-		// MetalFX encodes its own passes. Update the fence it waits on from a command that is itself ordered after all
-		// previously recorded work (the compute encoder opens with a full queue barrier, compute() orders it against
-		// earlier commands of the same encoder), then close the encoder so the scaler can encode into the buffer.
+		// MetalFX encodes its own passes, which wait on m_fence. Update it after a command declared with the scaler's
+		// accesses: the command list orders that command after the earlier work they conflict with. The fill gives the
+		// fence update a command to follow (16-byte aligned offset, 4-byte length). Then close the encoder so the
+		// scaler can encode into the buffer.
 		auto& heap = get_scratch_heap();
 		const auto offset = heap.alloc<16>(16);
 
-		auto encoder = cmd.compute();
-		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0); // 16-byte aligned offset, 4-byte length
+		std::array<gpu_access, 4> accesses{};
+		ensure(scaler_accesses.size() < accesses.size());
+		std::copy(scaler_accesses.begin(), scaler_accesses.end(), accesses.begin());
+		accesses[scaler_accesses.size()] = write_buffer(heap.heap.get(), offset, 4);
+
+		auto encoder = cmd.blit(std::span<const gpu_access>(accesses.data(), scaler_accesses.size() + 1));
+		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0);
 		encoder->updateFence(m_fence, MTL::StageBlit | MTL::StageDispatch);
 
 		cmd.end_encoder();
@@ -328,16 +334,18 @@ namespace mtl
 
 	void metalfx_upscale_pass::wait_fence(mtl::command_list& cmd)
 	{
-		// The scaler updates m_fence once its output is written. Open a fresh encoder and make its commands wait on the
-		// fence. The opening queue barrier most likely covers the scaler's passes already; the fence makes the order
-		// explicit. The (blocked) anchor command keeps the wait meaningful when nothing else is recorded here: every
-		// later encoder starts with a queue barrier on all prior work, i.e. after it. RCAS dispatches in this encoder
-		// (after the intra-encoder barrier compute() inserts).
+		// The scaler updates m_fence once its output is written. A fresh compute encoder waits on it before its first
+		// command, so RCAS (dispatched into this encoder next) cannot read the scaler target early; later encoders (the
+		// present passes) begin with barriers on all earlier work, this encoder and the scaler's passes included. The
+		// hazard tracker orders the same readers after the scaler's external work (queue barriers); the fence is the
+		// synchronization MetalFX documents. The anchor command keeps the wait in the command stream when nothing else is
+		// recorded into the encoder.
+		ensure(cmd.active_encoder() == mtl::command_list::encoder_type::none);
+
 		auto& heap = get_scratch_heap();
 		const auto offset = heap.alloc<16>(16);
 
-		ensure(cmd.active_encoder() == mtl::command_list::encoder_type::none);
-		auto encoder = cmd.compute();
+		auto encoder = cmd.blit({ write_buffer(heap.heap.get(), offset, 4) });
 		encoder->waitForFence(m_fence, MTL::StageBlit | MTL::StageDispatch);
 		encoder->fillBuffer(heap.value(), NS::Range::Make(offset, 4), 0);
 	}
@@ -478,8 +486,17 @@ namespace mtl
 			input = m_input_copy.get();
 		}
 
-		// 1. Everything recorded so far (the producer of the input, readers of the previous output) -> fence
-		signal_fence(cmd);
+		// What the scaler's passes access: the input, the target and its own internal resources (shared by its runs)
+		const std::array<gpu_access, 3> scaler_accesses =
+		{
+			read_image(input),
+			write_image(scaler_target),
+			write_object(entry->scaler)
+		};
+
+		// 1. Earlier work these accesses conflict with (the producer of the input, readers of the previous output, the
+		// previous run of this scaler) -> fence
+		signal_fence(cmd, scaler_accesses);
 
 		// 2. Scaler passes. Self-contained: MetalFX may create autoreleased objects while encoding
 		{
@@ -498,10 +515,12 @@ namespace mtl
 			scaler->setOutputTexture(nullptr);
 		}
 
-		// 3. Scaler output -> everything recorded afterwards
+		// 3. Scaler output -> the work recorded afterwards that reads it (RCAS, the present passes), in every stage:
+		// declared to the hazard tracker, and made explicit by waiting on the fence the scaler updates
+		cmd.external_work(scaler_accesses);
 		wait_fence(cmd);
 
-		// 4. Sharpening into the view output (same compute encoder, ordered after the fence wait)
+		// 4. Sharpening into the view output (same compute encoder, after the fence wait)
 		if (rcas)
 		{
 			rcas->run(cmd, m_intermediate.get(), output.get(), sharpening_intensity);

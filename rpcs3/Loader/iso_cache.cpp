@@ -35,14 +35,34 @@ namespace
 	{
 		return get_cache_stem(iso_path + "//index");
 	}
+
+	// The file the ISO is read from, whose modification time validates its entries: the ISO file itself, or the image file of
+	// a mounted disc image (see fs::get_optical_disc_source()). Nothing is cached for a raw device (an optical drive, or an
+	// image which is not a plain ISO): its device node tells nothing about the disc
+	bool get_source(const std::string& iso_path, std::string& source, fs::stat_t& source_stat)
+	{
+		source = iso_path;
+		bool is_raw_device = false;
+		fs::get_optical_disc_source(iso_path, &source, &is_raw_device);
+
+		return !is_raw_device && fs::get_stat(source, source_stat) && !source_stat.is_directory;
+	}
+
+	// Entries also record their source: a mounted disc image may be replaced by another image at the same mount point.
+	// An entry without it (older version) was made for an ISO file, which is its own source
+	bool is_same_source(const YAML::Node& node, const std::string& iso_path, const std::string& source, const fs::stat_t& source_stat)
+	{
+		return node["source"].as<std::string>(iso_path) == source && node["mtime"].as<s64>(0) == source_stat.mtime;
+	}
 }
 
 namespace iso_cache
 {
 	bool load(const std::string& iso_path, std::string_view cache_key, iso_metadata_cache_entry& out_entry)
 	{
+		std::string source;
 		fs::stat_t iso_stat{};
-		if (!fs::get_stat(iso_path, iso_stat) || iso_stat.is_directory)
+		if (!get_source(iso_path, source, iso_stat))
 		{
 			return false;
 		}
@@ -67,8 +87,7 @@ namespace iso_cache
 		}
 
 		// Reject stale entries.
-		const s64 cached_mtime = node["mtime"].as<s64>(0);
-		if (cached_mtime != iso_stat.mtime)
+		if (!is_same_source(node, iso_path, source, iso_stat))
 		{
 			return false;
 		}
@@ -79,7 +98,7 @@ namespace iso_cache
 			return false;
 		}
 
-		out_entry.mtime      = cached_mtime;
+		out_entry.mtime      = iso_stat.mtime;
 		out_entry.psf_data   = sfo_file.to_vector<u8>();
 		out_entry.icon_path  = node["icon_path"].as<std::string>("");
 		out_entry.movie_path = node["movie_path"].as<std::string>("");
@@ -96,6 +115,13 @@ namespace iso_cache
 
 	void save(std::string_view iso_path, std::string_view cache_key, const iso_metadata_cache_entry& entry)
 	{
+		std::string source;
+		fs::stat_t iso_stat{};
+		if (!get_source(std::string(iso_path), source, iso_stat))
+		{
+			return;
+		}
+
 		const std::string stem     = get_cache_stem(cache_key);
 		const std::string dir      = get_cache_dir();
 		const std::string yml_path = dir + stem + ".yml";
@@ -104,7 +130,8 @@ namespace iso_cache
 
 		YAML::Emitter out;
 		out << YAML::BeginMap;
-		out << YAML::Key << "mtime"      << YAML::Value << static_cast<long long>(entry.mtime);
+		out << YAML::Key << "source"     << YAML::Value << source;
+		out << YAML::Key << "mtime"      << YAML::Value << static_cast<long long>(iso_stat.mtime);
 		out << YAML::Key << "icon_path"  << YAML::Value << entry.icon_path;
 		out << YAML::Key << "movie_path" << YAML::Value << entry.movie_path;
 		out << YAML::Key << "audio_path" << YAML::Value << entry.audio_path;
@@ -141,8 +168,9 @@ namespace iso_cache
 
 	bool load_index(const std::string& iso_path, std::vector<std::string>& out_subdirs)
 	{
+		std::string source;
 		fs::stat_t iso_stat{};
-		if (!fs::get_stat(iso_path, iso_stat) || iso_stat.is_directory)
+		if (!get_source(iso_path, source, iso_stat))
 		{
 			return false;
 		}
@@ -163,8 +191,7 @@ namespace iso_cache
 			return false;
 		}
 
-		const s64 cached_mtime = node["mtime"].as<s64>(0);
-		if (cached_mtime != iso_stat.mtime)
+		if (!is_same_source(node, iso_path, source, iso_stat))
 		{
 			return false;
 		}
@@ -189,8 +216,9 @@ namespace iso_cache
 
 	void save_index(const std::string& iso_path, const std::vector<std::string>& subdirs)
 	{
+		std::string source;
 		fs::stat_t iso_stat{};
-		if (!fs::get_stat(iso_path, iso_stat))
+		if (!get_source(iso_path, source, iso_stat))
 		{
 			return;
 		}
@@ -199,6 +227,7 @@ namespace iso_cache
 
 		YAML::Emitter out;
 		out << YAML::BeginMap;
+		out << YAML::Key << "source"  << YAML::Value << source;
 		out << YAML::Key << "mtime"   << YAML::Value << static_cast<long long>(iso_stat.mtime);
 		out << YAML::Key << "subdirs" << YAML::Value << YAML::BeginSeq;
 		for (const std::string& s : subdirs)

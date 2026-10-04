@@ -53,7 +53,10 @@ struct cfg_root : cfg::node
 			}
 		};
 
-		fifo_setting rsx_fifo_accuracy{this, "RSX FIFO Fetch Accuracy", rsx_fifo_mode::atomic };
+		// RPCS3 Metal fork: Ordered & Atomic. Atomic fills its command cache out of order when a cache line is being written,
+		// so one fetched block can mix command memory from two moments; games patching command lists while the RSX runs them
+		// (Bink/SPURS heavy titles: SvR 2011, Pirates of the Caribbean) then desync ("Dead FIFO", RET without CALL).
+		fifo_setting rsx_fifo_accuracy{this, "RSX FIFO Fetch Accuracy", rsx_fifo_mode::atomic_ordered };
 		cfg::_bool spu_verification{ this, "SPU Verification", true }; // Should be enabled
 		cfg::_bool spu_cache{ this, "SPU Cache", true };
 		cfg::_bool spu_prof{ this, "SPU Profiler", false };
@@ -126,6 +129,9 @@ struct cfg_root : cfg::node
 		cfg::_enum<frame_limit_type> frame_limit{ this, "Frame limit", frame_limit_type::_auto, true };
 		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true }; // 0 disables its effect
 		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::_auto };
+		// Forced host MSAA for every game (RSX/Common/forced_msaa.hpp): sample count given to render targets the game
+		// creates as single-sample, with MSAA "Auto". 2 (default), 4, or 0/1 = off. PS3-MSAA surfaces keep their own count
+		cfg::_int<0, 4> forced_msaa_samples{ this, "Forced MSAA Samples", 2 };
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_with_interpreter };
 		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::ultra };
 #ifdef __APPLE__
@@ -136,9 +142,19 @@ struct cfg_root : cfg::node
 #endif
 
 		cfg::_bool write_color_buffers{ this, "Write Color Buffers", true };
+#ifdef __APPLE__
+		// The Metal backend initializes surfaces from guest memory and writes depth
+		// back entirely on the GPU (GPU upload/tiling, compute depth packing), so
+		// fresh installs get the image-quality benefit without migration markers
+		// (see metal-fork-defaults-v8 in Emu/System.cpp).
+		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer", true };
+		cfg::_bool read_color_buffers{ this, "Read Color Buffers", true };
+		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer", true };
+#else
 		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer" };
 		cfg::_bool read_color_buffers{ this, "Read Color Buffers" };
 		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer" };
+#endif
 		cfg::_bool handle_tiled_memory{ this, "Handle RSX Memory Tiling", false, true };
 		cfg::_bool log_programs{ this, "Log shader programs" };
 		cfg::_bool debug_output{ this, "Debug output" };
@@ -167,7 +183,14 @@ struct cfg_root : cfg::node
 		cfg::_bool multithreaded_rsx{ this, "Multithreaded RSX", false };
 #endif
 		cfg::_bool relaxed_zcull_sync{ this, "Relaxed ZCULL Sync", false };
+#ifdef __APPLE__
+		// MSAA resolve/unresolve run as GPU fragment passes on Metal
+		// (MTLResolveHelper), so forcing the hardware resolve path yields
+		// crisper visuals without a CPU fallback (see metal-fork-defaults-v8).
+		cfg::_bool force_hw_MSAA_resolve{ this, "Force Hardware MSAA Resolve", true, true };
+#else
 		cfg::_bool force_hw_MSAA_resolve{ this, "Force Hardware MSAA Resolve", false, true };
+#endif
 		cfg::_bool stereo_enabled{ this, "3D Display Enabled", false };
 		cfg::_enum<stereo_render_mode_options> stereo_render_mode{ this, "3D Display Mode", stereo_render_mode_options::disabled, true };
 		cfg::_int<10, 99> screen_size{ this, "Screen size in inches", 24, false };
@@ -277,7 +300,9 @@ struct cfg_root : cfg::node
 		cfg::_enum<audio_avport> rsxaudio_port{ this, "RSXAudio Avport", audio_avport::hdmi_0, true };
 		cfg::_bool dump_to_file{ this, "Dump to file", false, true };
 		cfg::_bool convert_to_s16{ this, "Convert to 16 bit", false, true };
-		cfg::_enum<audio_format> format{ this, "Audio Format", audio_format::stereo, false };
+		// RPCS3 Metal fork: 5.1 by default, so games mix in surround and Core Audio renders it as Apple spatial audio
+		// (AUSpatialMixer: binaural on headphones with head tracking, virtualized on built-in speakers, mapped to real speakers)
+		cfg::_enum<audio_format> format{ this, "Audio Format", audio_format::surround_5_1, false };
 		cfg::uint<0, 0xFF> formats{ this, "Audio Formats", static_cast<u32>(audio_format_flag::lpcm_2_48khz), false };
 		cfg::_enum<audio_channel_layout> channel_layout{ this, "Audio Channel Layout", audio_channel_layout::automatic, false };
 		cfg::string audio_device{ this, "Audio Device", "@@@default@@@", true };

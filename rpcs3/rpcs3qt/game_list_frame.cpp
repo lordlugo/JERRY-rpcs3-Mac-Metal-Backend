@@ -13,6 +13,7 @@
 #include "config_database.h"
 
 #include "Emu/System.h"
+#include "Emu/iso_media_cache.h"
 #include "Emu/system_utils.hpp"
 #include "util/types.hpp"
 #include "Utilities/File.h"
@@ -386,6 +387,9 @@ void game_list_frame::Refresh(const bool from_drive, const std::vector<std::stri
 
 	if (from_drive)
 	{
+		// Discs may have been swapped: the enumeration parses them again and refills the cache
+		iso_media_cache::clear();
+
 		m_game_enumeration.clear(false);
 		m_serials.clear();
 		m_game_data.clear();

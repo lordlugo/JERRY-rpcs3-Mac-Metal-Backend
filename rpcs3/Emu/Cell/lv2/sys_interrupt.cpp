@@ -251,6 +251,15 @@ void ppu_interrupt_thread_entry(ppu_thread& ppu, ppu_opcode_t, be_t<u32>*, struc
 {
 	while (true)
 	{
+		// A stopping thread must not dispatch: its handler can't run any more (the entry_call returns at once), so the
+		// SPU interrupt would never be acknowledged and would be dispatched again, endlessly (each turn logs this
+		// thread's perf stats: a 39 GB log and an emulator that never finished stopping). Savestates re-queue this
+		// entry when the thread is loaded.
+		if (::is_stopped(+ppu.state))
+		{
+			return;
+		}
+
 		shared_ptr<lv2_int_serv> serv = null_ptr;
 
 		// Loop endlessly trying to invoke an interrupt if required

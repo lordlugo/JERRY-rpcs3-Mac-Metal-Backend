@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Cell/timing_probe.h"
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/timers.hpp"
 
@@ -19,6 +20,7 @@ extern vm::gvar<u32> g_ppu_exit_mutex;
 u64 sys_time_get_system_time()
 {
 	sysPrxForUser.trace("sys_time_get_system_time()");
+	timing_probe::hit(timing_probe::sys_time_get_system_time);
 
 	return get_guest_system_time();
 }
