@@ -88,6 +88,8 @@ namespace mtl
 		clear_pass,                // clear-only pass recorded for deferred clears that no pass folded
 		readback_not_speculated,   // Write Color/Depth Buffers: no speculative readback of a surface that stays bound
 		clear_kept_pass_open,      // full-frame clear of some planes only, drawn as a quad instead of ending the draw pass
+		attachments_retained,      // RSX layout dropped attachments of the open draw pass; the pass kept them (no split)
+		retained_attachment_sampled, // a draw sampled a retained attachment: the pass ended and dropped it
 		count
 	};
 

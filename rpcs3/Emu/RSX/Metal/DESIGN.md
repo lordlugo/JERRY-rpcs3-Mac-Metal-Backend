@@ -239,10 +239,20 @@ below ends it. Its order against earlier work is fixed when it begins (the pass 
   replacement or a submit. `command_list::end_render_pass(reason)` records which (telemetry).
 * Surface changes: every change of the RSX surface set (`prepare_rtts`: other colour or depth-stencil surfaces, their
   count, the area or the sample count) ends the draw pass (`pass_end_reason::framebuffer_change`); the next draw opens
-  a pass that attaches exactly the new surfaces. A pass never attaches a surface the RSX does not bind, and never
-  outlives the surface set it was begun for. The RSX layout of a draw drops the depth buffer when the draw does not
-  test depth or stencil, and the colour buffers when it writes no colour, and clears bind only what they clear: each
-  such toggle is a surface change.
+  a pass that attaches exactly the new surfaces. The RSX layout of a draw drops the depth buffer when the draw does not
+  test depth or stencil, and the colour buffers when it writes no colour, and clears bind only what they clear.
+  Attachment retention: when the new RSX set is a subset of the open pass's attachments (same area and sample count,
+  the colour surfaces a prefix of the pass's, the pass's depth buffer or none) the pass keeps rendering with its
+  attachments (`retain_pass_attachments`, `m_attachments_retained`; `m_rsx_fbo` holds what the RSX binds). A retained
+  attachment is never touched: its colour write mask is 0 in every pipeline (`decode_rsx_state` describes the pass's
+  attachments, the RSX-bound ones first), the depth/stencil state is "always, no write" when the RSX binds no depth
+  buffer (`update_draw_state`), and `mark_attachment_writes` / the surface store only know the RSX-bound surfaces. A
+  draw that samples a retained attachment ends the pass and drops it first (`drop_retained_attachments_if_sampled`,
+  before `load_program`): the surface store does not consider it bound, so nothing else would route the read through
+  a copy. Retained surfaces are re-validated at every layout change (still the live surface of their address) and
+  marked `is_bound` so the spiller leaves them alone. Without retention each depth-test toggle between draws stored and
+  reloaded every attachment (X-Men Origins: Wolverine: 46 "framebuffer changes" and 4.3 GiB of attachment traffic per
+  frame). A pass never outlives the surface set it was begun for otherwise.
 * Colour attachment N is RSX surface N in every pass: render passes do not enable colour attachment mapping, and
   every render pipeline uses the identity mapping (`colorAttachmentMappingState = Identity`, set in one place for every
   pipeline descriptor, §7). Framebuffer fetch (`[[color(n)]]`, programmable blending) reads surface n.

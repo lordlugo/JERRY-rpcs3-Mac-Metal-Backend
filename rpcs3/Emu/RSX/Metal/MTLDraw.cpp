@@ -813,8 +813,10 @@ void MTLGSRender::update_draw_state()
 
 	m_encoder_state.rasterizer_valid = true;
 
-	// Depth/stencil tests without the corresponding attachment are meaningless (and rejected by Metal validation)
-	if (!m_draw_fbo.depth_stencil)
+	// Depth/stencil tests without the corresponding attachment are meaningless (and rejected by Metal validation). A
+	// depth attachment the pass retained while the RSX layout dropped it (prepare_rtts) is left untouched: the RSX
+	// dropped it because the draw neither tests nor writes depth/stencil.
+	if (!m_draw_fbo.depth_stencil || !m_rtts.m_bound_depth_stencil.second)
 	{
 		m_rasterizer_state.depth_stencil_key = mtl::make_depth_stencil_key(MTL::CompareFunctionAlways, false, nullptr, nullptr);
 	}
@@ -1586,6 +1588,37 @@ bool MTLGSRender::draw_reads_deferred_clear() const
 		check(vs_sampler_state, current_vp_metadata.referenced_textures_mask);
 }
 
+void MTLGSRender::drop_retained_attachments_if_sampled()
+{
+	auto samples_retained = [&](const auto& states, u32 mask)
+	{
+		for (u32 i = 0; mask; mask >>= 1, ++i)
+		{
+			if (!(mask & 1) || !states[i])
+			{
+				continue;
+			}
+
+			const auto desc = static_cast<const mtl::texture_cache::sampled_image_descriptor*>(states[i].get());
+			if (desc->image_handle && is_retained_attachment(desc->image_handle->image()))
+			{
+				return true;
+			}
+
+			// Copies and gathers of a retained surface are recorded outside the pass: the compute command ends the pass,
+			// which stores the surface first (the pass never wrote it), so they read current data
+		}
+
+		return false;
+	};
+
+	if (samples_retained(fs_sampler_state, current_fp_metadata.referenced_textures_mask) ||
+		samples_retained(vs_sampler_state, current_vp_metadata.referenced_textures_mask))
+	{
+		drop_retained_attachments();
+	}
+}
+
 mtl::render_target* MTLGSRender::find_bound_attachment(const mtl::image* image) const
 {
 	if (!image)
@@ -2352,6 +2385,15 @@ void MTLGSRender::end()
 		load_texture_env();
 	}
 	m_frame_stats.textures_upload_time += m_profiler.duration();
+
+	// Before the pipeline is chosen (its attachment set is the pass's): a texture unit sampling an attachment the pass
+	// kept although the RSX unbound it (depth sampled after the depth-tested draws: fog, SSAO, soft particles) makes
+	// the pass end and drop it. The surface store does not know the surface as bound, so nothing else would route the
+	// read through a copy, and sampling a live attachment is undefined on Apple GPUs.
+	if (m_attachments_retained) [[unlikely]]
+	{
+		drop_retained_attachments_if_sampled();
+	}
 
 	if (!load_program())
 	{

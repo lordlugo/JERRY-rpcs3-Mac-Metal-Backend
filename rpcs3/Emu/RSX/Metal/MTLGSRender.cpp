@@ -295,7 +295,7 @@ namespace mtl
 	mtl::pipeline_props decode_rsx_state(
 		const rsx::context* ctx,
 		u8 topology_class,
-		const std::vector<mtl::image*>& color_attachments,
+		const mtl::framebuffer_info& pass,
 		mtl::render_target* ds,
 		const rsx::backend_configuration& backend_config,
 		u8 num_draw_buffers,
@@ -309,15 +309,23 @@ namespace mtl
 		state.topology_class = get_pipeline_topology_class(topology_class);
 		state.rasterization_enabled = 1;
 
-		// Attachments
-		state.color_count = num_draw_buffers;
-		state.depth_stencil_format = ds ? static_cast<u32>(ds->format()) : 0u;
+		// Attachments: those of the render pass. The RSX binds the first num_draw_buffers colour attachments; any the
+		// pass keeps beyond them (retained across an RSX layout that dropped them, see prepare_rtts) are not written.
+		ensure(num_draw_buffers <= pass.color_count);
+		state.color_count = pass.color_count;
+		state.depth_stencil_format = pass.depth_stencil ? static_cast<u32>(pass.depth_stencil->format()) : 0u;
 		state.sample_count = std::max<u8>(1, num_rasterization_samples);
+
+		for (u32 index = num_draw_buffers; index < pass.color_count; ++index)
+		{
+			state.color[index].pixel_format = static_cast<u32>(ensure(pass.color[index])->format());
+			state.color[index].write_mask = 0;
+		}
 
 		const auto host_write_mask = rsx::get_write_output_mask(REGS(ctx)->surface_color());
 		for (uint index = 0; index < num_draw_buffers; ++index)
 		{
-			state.color[index].pixel_format = static_cast<u32>(ensure(color_attachments[index])->format());
+			state.color[index].pixel_format = static_cast<u32>(ensure(pass.color[index])->format());
 
 			bool color_mask_b = REGS(ctx)->color_mask_b(index);
 			bool color_mask_g = REGS(ctx)->color_mask_g(index);
@@ -1804,7 +1812,7 @@ bool MTLGSRender::load_program()
 		mtl::pipeline_props properties = mtl::decode_rsx_state(
 			m_ctx,
 			topology_class,
-			m_fbo_images,
+			m_draw_fbo,
 			m_rtts.m_bound_depth_stencil.second,
 			backend_config,
 			static_cast<u8>(m_draw_buffers.size()),
@@ -2766,8 +2774,6 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		}
 	}
 
-	m_current_renderpass_key = mtl::get_renderpass_key(m_fbo_images);
-
 	// Build the framebuffer (attachment set) and its render pass descriptor
 	const auto [fbo_width, fbo_height] = rsx::apply_resolution_scale<true>(resolution_scaling_config, m_framebuffer_layout.width, m_framebuffer_layout.height);
 
@@ -2788,8 +2794,9 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 
 	fbo.width = fbo_width;
 	fbo.height = fbo_height;
+	m_rsx_fbo = fbo;
 
-	const bool fbo_changed = !m_draw_pass_desc ||
+	bool fbo_changed = !m_draw_pass_desc ||
 		fbo.color_count != m_draw_fbo.color_count ||
 		fbo.color != m_draw_fbo.color ||
 		fbo.depth_stencil != m_draw_fbo.depth_stencil ||
@@ -2797,10 +2804,27 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 		fbo.height != m_draw_fbo.height ||
 		fbo.samples != m_draw_fbo.samples;
 
+	if (fbo_changed && retain_pass_attachments(fbo))
+	{
+		// The RSX binds a subset of the open pass's attachments (its layout drops the depth buffer for draws that do
+		// not test depth and the colour buffers for depth-only clears): the pass keeps rendering with the superset.
+		// The RSX-unbound attachments are left alone (colour write mask 0, depth/stencil test off, see
+		// decode_rsx_state and update_draw_state); the next draw that samples one of them drops them first
+		// (drop_retained_attachments). Ending the pass instead stores every attachment and the next pass loads them
+		// again: at 1440p that is ~33 MiB per toggle, and games toggle dozens of times per frame (X-Men Origins:
+		// Wolverine: 46 "framebuffer changes" per frame, 4.3 GiB of attachment traffic).
+		fbo_changed = false;
+		mtl::count_pass_event(mtl::pass_event::attachments_retained);
+	}
+
+	m_attachments_retained = !fbo_changed && (fbo.color_count != m_draw_fbo.color_count || fbo.depth_stencil != m_draw_fbo.depth_stencil);
+	m_current_renderpass_key = mtl::get_renderpass_key(m_attachments_retained ? pass_images() : m_fbo_images);
+
 	if (fbo_changed)
 	{
 		// The active pass renders into the previous surface set
 		close_render_pass(mtl::pass_end_reason::framebuffer_change);
+		release_retained_attachments(fbo);
 
 		// RPCS3 Metal fork: the pass ends here anyway, so submitting costs no extra attachment store/load. Hand the GPU
 		// what was recorded once it is worth it (>= 1.5 ms since the last submit, >= 64 draws): otherwise it idles until
@@ -2823,6 +2847,155 @@ void MTLGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
 	on_framebuffer_layout_updated();
 
 	check_zcull_status(true);
+}
+
+bool MTLGSRender::retain_pass_attachments(const mtl::framebuffer_info& fbo)
+{
+	// Same area and sample count, and the RSX set is a prefix of the pass's colour attachments (colour attachment N
+	// is RSX surface N, so the fragment outputs keep their targets) with the pass's depth buffer or none
+	if (!m_draw_pass_desc || m_draw_fbo.empty() ||
+		fbo.width != m_draw_fbo.width || fbo.height != m_draw_fbo.height || fbo.samples != m_draw_fbo.samples ||
+		fbo.color_count > m_draw_fbo.color_count ||
+		(fbo.depth_stencil && fbo.depth_stencil != m_draw_fbo.depth_stencil))
+	{
+		return false;
+	}
+
+	for (u32 i = 0; i < fbo.color_count; ++i)
+	{
+		if (fbo.color[i] != m_draw_fbo.color[i])
+		{
+			return false;
+		}
+	}
+
+	// Every attachment the pass keeps and the RSX dropped must still be the live surface of its address (not replaced,
+	// aliased by a surface of the other type, or invalidated by this layout change)
+	const auto still_live = [&](mtl::image* image)
+	{
+		const auto surface = mtl::try_as_rtt(image);
+		return surface && surface->value && m_rtts.get_surface_at(surface->base_addr) == surface;
+	};
+
+	for (u32 i = fbo.color_count; i < m_draw_fbo.color_count; ++i)
+	{
+		if (!still_live(m_draw_fbo.color[i]))
+		{
+			return false;
+		}
+	}
+
+	if (!fbo.depth_stencil && m_draw_fbo.depth_stencil && !still_live(m_draw_fbo.depth_stencil))
+	{
+		return false;
+	}
+
+	// Retained surfaces stay unspillable while attached (the surface store marks them unbound)
+	for (u32 i = fbo.color_count; i < m_draw_fbo.color_count; ++i)
+	{
+		mtl::try_as_rtt(m_draw_fbo.color[i])->is_bound = true;
+	}
+
+	if (!fbo.depth_stencil && m_draw_fbo.depth_stencil)
+	{
+		mtl::try_as_rtt(m_draw_fbo.depth_stencil)->is_bound = true;
+	}
+
+	return true;
+}
+
+void MTLGSRender::release_retained_attachments(const mtl::framebuffer_info& bound)
+{
+	// Attachments of the previous pass that the RSX no longer binds leave the surface store's view of them
+	const auto release = [&](mtl::image* image)
+	{
+		if (!image)
+		{
+			return;
+		}
+
+		if (image == bound.depth_stencil)
+		{
+			return;
+		}
+
+		for (u32 i = 0; i < bound.color_count; ++i)
+		{
+			if (bound.color[i] == image)
+			{
+				return;
+			}
+		}
+
+		if (const auto surface = mtl::try_as_rtt(image))
+		{
+			surface->is_bound = false;
+		}
+	};
+
+	for (u32 i = 0; i < m_draw_fbo.color_count; ++i)
+	{
+		release(m_draw_fbo.color[i]);
+	}
+
+	release(m_draw_fbo.depth_stencil);
+}
+
+std::vector<mtl::image*> MTLGSRender::pass_images() const
+{
+	std::vector<mtl::image*> images;
+	images.reserve(m_draw_fbo.color_count + 1);
+	for (u32 i = 0; i < m_draw_fbo.color_count; ++i)
+	{
+		images.push_back(m_draw_fbo.color[i]);
+	}
+
+	if (m_draw_fbo.depth_stencil)
+	{
+		images.push_back(m_draw_fbo.depth_stencil);
+	}
+
+	return images;
+}
+
+bool MTLGSRender::is_retained_attachment(const mtl::image* image) const
+{
+	if (!m_attachments_retained || !image)
+	{
+		return false;
+	}
+
+	if (image == m_draw_fbo.depth_stencil)
+	{
+		return image != m_rsx_fbo.depth_stencil;
+	}
+
+	for (u32 i = m_rsx_fbo.color_count; i < m_draw_fbo.color_count; ++i)
+	{
+		if (m_draw_fbo.color[i] == image)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void MTLGSRender::drop_retained_attachments()
+{
+	if (!m_attachments_retained)
+	{
+		return;
+	}
+
+	// The pass renders into the superset: end it, and attach exactly what the RSX binds from now on
+	close_render_pass(mtl::pass_end_reason::framebuffer_change);
+	release_retained_attachments(m_rsx_fbo);
+	m_draw_fbo = m_rsx_fbo;
+	m_attachments_retained = false;
+	m_current_renderpass_key = mtl::get_renderpass_key(m_fbo_images);
+	update_render_pass_descriptor();
+	mtl::count_pass_event(mtl::pass_event::retained_attachment_sampled);
 }
 
 void MTLGSRender::renderctl(u32 request_code, void* args)

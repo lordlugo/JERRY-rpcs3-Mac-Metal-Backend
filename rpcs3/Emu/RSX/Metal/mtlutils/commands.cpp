@@ -918,6 +918,7 @@ namespace mtl
 			"no readback speculation for %.1f surfaces that stayed bound; "
 			"clears: %.1f drawn as quads in the draw pass (scissored or masked; %.1f of them full-frame clears of some planes that kept the pass open), %.1f folded into a load action, "
 			"%.1f clear-only passes; "
+			"attachments retained across %.1f RSX layout changes (%.1f dropped again for a draw sampling them); "
 			"attachment memory traffic %.0f MiB loaded and %.0f MiB stored per frame",
 			(stats.draw_render_passes + other_total) * scale, stats.draw_render_passes * scale, other_total * scale, by_context(stats.other_passes),
 			ends.empty() ? std::string("nothing") : ends,
@@ -927,6 +928,7 @@ namespace mtl
 			stats.feedback_reads_in_pass * scale,
 			event(pass_event::readback_not_speculated),
 			event(pass_event::clear_in_pass), event(pass_event::clear_kept_pass_open), event(pass_event::clear_folded), event(pass_event::clear_pass),
+			event(pass_event::attachments_retained), event(pass_event::retained_attachment_sampled),
 			stats.attachment_load_bytes * scale / mib, stats.attachment_store_bytes * scale / mib);
 	}
 

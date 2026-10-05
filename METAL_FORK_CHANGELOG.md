@@ -18,6 +18,20 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-05 — Attachment retention: RSX depth/colour toggles no longer end the draw pass (X-Men Origins: Wolverine stutter)
+
+- Wolverine log (steady state, 60 fps, 200% scale): 68 draw passes per frame, 46 ended by "framebuffer change", 2070 MiB
+  of attachments loaded and 2243 MiB stored per frame; GPU 11 ms per frame, and the RSX thread waited for it 4.6 times
+  per frame (6.3 ms, up to 10.7 ms) at "zcull report read: RSX copy/blit reads report memory", i.e. every frame that
+  waited longer than the budget was a visible hitch. The RSX layout drops the depth buffer for draws that do not test
+  depth (and the colour buffers for depth-only clears), so each toggle was a pass end: every attachment stored and
+  loaded again (~33 MiB at 1440p).
+- The draw pass now keeps its attachments when the new RSX set is a subset of them (same area/samples, colour surfaces
+  a prefix, the pass's depth or none). Retained attachments are never written (write mask 0 in the pipeline,
+  depth/stencil state "always, no write"), re-validated at every layout change, protected from spilling, and dropped
+  (pass ended) before a draw that samples one of them. Telemetry: "attachments retained across N RSX layout changes
+  (M dropped again for a draw sampling them)" in the render passes line. DESIGN.md §4.
+
 ## 2026-10-05 — Performance audit: upstream video defaults, RSX thread hot path, Metal command ordering, glitch fixes
 
 Configuration (the largest part of the low frame rates):

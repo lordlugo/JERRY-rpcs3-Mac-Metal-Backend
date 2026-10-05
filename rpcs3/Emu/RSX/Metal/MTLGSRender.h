@@ -200,7 +200,15 @@ private:
 	mtl::command_buffer_chunk* m_current_command_buffer = nullptr;
 
 	// Main render pass (VK: renderpass + framebuffer)
-	mtl::framebuffer_info m_draw_fbo{};
+	mtl::framebuffer_info m_draw_fbo{};       // Attachments of the draw pass (may be a superset of what the RSX binds)
+	mtl::framebuffer_info m_rsx_fbo{};        // Exactly the surfaces the RSX layout binds (prepare_rtts)
+	bool m_attachments_retained = false;      // m_draw_fbo keeps attachments the RSX layout dropped (see prepare_rtts)
+	bool retain_pass_attachments(const mtl::framebuffer_info& fbo);
+	void release_retained_attachments(const mtl::framebuffer_info& bound);
+	std::vector<mtl::image*> pass_images() const;
+	bool is_retained_attachment(const mtl::image* image) const;
+	void drop_retained_attachments();
+	void drop_retained_attachments_if_sampled();
 	std::array<const MTL::Texture*, 5> m_draw_fbo_textures{};  // Textures m_draw_pass_desc was built with
 	mtl::ref<MTL4::RenderPassDescriptor> m_draw_pass_desc;
 	const MTL::Buffer* m_draw_pass_visibility_buffer = nullptr;
