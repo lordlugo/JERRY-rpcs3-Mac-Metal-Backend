@@ -1904,12 +1904,15 @@ namespace mtl
 			needs.queue = 0;
 		}
 
-		// Within the encoder, every command is a blit or a dispatch of this backend and declares its accesses in full
-		// (cmd.blit({...}), program::bind() for every table slot of a compute program), so the hazard check above is
-		// exact: a command only waits for the earlier commands of the encoder it conflicts with (needs.encoder), and
-		// N independent texture uploads or readback copies run back to back instead of each waiting for the previous
-		// one. A command that declared nothing at all is ordered after every earlier command of the encoder.
-		if (new_command && hs.command > 1 && accesses.empty())
+		// Within the encoder, every command after the first waits for the earlier commands of the encoder, whatever the
+		// hazard check found (only the parts of one command, blit_concurrent(), stay concurrent). Ordering compute
+		// commands by their declarations alone was tried (2026-10-05) and brought GoldenEye 007: Reloaded's stale
+		// 32x32-pixel tiles back in colour and depth (the scene target in tiles of an earlier frame, the first-person
+		// weapon depth-tested against garbage): some declaration of the depth-stencil scatter/gather or readback
+		// chains does not cover every byte those commands touch. Until every compute command is proven to declare
+		// exactly what it accesses, the encoder-order barrier stays. The declarations are still recorded for what is
+		// checked against them (render passes' vertex-stage reads, submissions).
+		if (new_command && hs.command > 1)
 		{
 			needs.encoder = compute_classes;
 		}

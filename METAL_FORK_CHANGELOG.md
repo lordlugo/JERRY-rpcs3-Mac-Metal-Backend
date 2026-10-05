@@ -18,6 +18,19 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-05 — GoldenEye 007: Reloaded stale tiles (colour and depth): compute commands wait for each other again
+
+- Screenshots (build 17424cd0): the scene in tile-shaped blocks of an earlier frame, and the first-person weapon
+  shattered along tile edges (depth-tested against stale depth tiles). The same artifact the fork documented for this
+  game before compute commands were made to wait for the earlier commands of their encoder. The 2026-10-05 change that
+  ordered compute commands by their declarations alone (independent uploads/readbacks running back to back) is
+  reverted: some compute chain's declarations do not cover every byte it touches, and the GPU-side gain is not worth
+  a correctness hole. DESIGN.md §3 restored and annotated.
+- One such hole fixed: the depth-stencil image<->buffer conversions place the depth and stencil plane blocks at
+  256-byte aligned offsets but sized the scratch buffer and checked it against the unaligned sum, so the stencil copy
+  could run up to 510 bytes past the end of its allocation into whatever the scratch pool holds next.
+  calculate_working_buffer_size reserves the alignment slack; the checks use the aligned block ends.
+
 ## 2026-10-05 — God of War: Ascension: depth bounds culling before shading, non-blocking zcull polling, no double sharpening
 
 - GoW:A log (gameplay, 24 fps, 200% scale): GPU 29.8 ms per frame at 72% busy, the RSX thread waited for it 13.2 ms per

@@ -544,7 +544,9 @@ namespace mtl
 	{
 		if (aspect & (aspect_stencil | aspect_depth))
 		{
-			return (base_size * 3);
+			// Packed data, then the depth and stencil planes, each plane block 256-byte aligned (the two alignments
+			// can add up to 510 bytes: the scratch buffer must cover them or the stencil copy runs past its end)
+			return (base_size * 3) + 512;
 		}
 		else
 		{
@@ -633,12 +635,13 @@ namespace mtl
 			const u32 in_depth_size = packed_length;
 			const u32 in_stencil_size = out_w * out_h;
 
-			const auto allocation_end = region.buffer_offset + packed_length + in_depth_size + in_stencil_size;
-			ensure(dst->size() >= allocation_end);
-
 			const auto data_offset = u32(region.buffer_offset);
 			const auto z_offset = utils::align<u32>(data_offset + packed_length, 256);
 			const auto s_offset = utils::align<u32>(z_offset + in_depth_size, 256);
+
+			// The aligned plane blocks, not the unaligned sum: an overrun writes whatever the scratch pool holds next
+			const u64 allocation_end = u64{ s_offset } + in_stencil_size;
+			ensure(dst->size() >= allocation_end);
 
 			// 1. Copy the depth and stencil blocks to separate banks (one Metal copy per plane)
 			buffer_image_copy sub_regions[2];
@@ -741,12 +744,13 @@ namespace mtl
 			const u32 in_depth_size = packed_length;
 			const u32 in_stencil_size = out_w * out_h;
 
-			const auto allocation_end = region.buffer_offset + packed_length + in_depth_size + in_stencil_size;
-			ensure(src->size() >= allocation_end); // "Out of memory (compute heap). Lower your resolution scale setting."
-
 			const auto data_offset = u32(region.buffer_offset);
 			const auto z_offset = utils::align<u32>(data_offset + packed_length, 256);
 			const auto s_offset = utils::align<u32>(z_offset + in_depth_size, 256);
+
+			// The aligned plane blocks (see copy_image_to_buffer)
+			const u64 allocation_end = u64{ s_offset } + utils::align<u32>(in_stencil_size, 4);
+			ensure(src->size() >= allocation_end); // "Out of memory (compute heap). Lower your resolution scale setting."
 
 			// Zero out the stencil block
 			const auto stencil_block = NS::Range::Make(s_offset, utils::align(in_stencil_size, 4));
