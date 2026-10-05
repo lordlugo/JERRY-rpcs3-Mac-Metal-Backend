@@ -1346,10 +1346,17 @@ namespace rsx
 				}
 			}
 
-			// Stall tripwire at a coarse cadence (diagnostic only, never blocks)
-			if ((m_cycles_counter & 1023) == 0)
+			// Stall tripwire at a coarse cadence (diagnostic only, never blocks). Checked in the 64-cycle sub-unit slice
+			// and at most every 250 ms: with an empty FIFO the loop turns at yield() speed, so a per-1024-cycles check
+			// was thousands of clock reads per second on the RSX thread.
+			if ((m_cycles_counter & 63) == 1)
 			{
-				check_stall_tripwire();
+				const u64 now = get_system_time();
+				if (now - stall_tripwire_last_check_us >= 250'000)
+				{
+					stall_tripwire_last_check_us = now;
+					check_stall_tripwire();
+				}
 			}
 
 			// Execute FIFO queue
@@ -4136,7 +4143,9 @@ namespace rsx
 
 		// Reset current stats
 		m_frame_stats = {};
-		m_profiler.enabled = true; // The debug overlay and the renderers' periodic telemetry report m_frame_stats
+		// The per-stage timings (setup/vertex/texture/draw/flip) cost ~10 clock reads per draw and only the debug
+		// overlay shows them; the periodic telemetry uses the counters, which are always kept.
+		m_profiler.enabled = !!g_cfg.video.debug_overlay;
 	}
 
 	f64 thread::get_cached_display_refresh_rate()

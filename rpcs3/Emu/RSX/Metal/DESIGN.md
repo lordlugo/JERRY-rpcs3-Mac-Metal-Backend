@@ -72,15 +72,18 @@ Every component is a port of its `rpcs3/Emu/RSX/VK/` counterpart. Keep the same 
 ## 3. Synchronization model (Metal 4: all resources untracked): hazard-tracked barriers
 
 Every GPU command recorded through `mtl::command_list` (mtlutils/commands.h) declares what it reads and writes
-(`mtl::gpu_access`). Compute encoder work is ordered conservatively: every compute encoder begins with a consumer
-barrier on every stage of all earlier work of the queue, and every command after the first (`blit()`, `dispatch()`)
-waits for the earlier commands of its encoder; only the parts of one command (`blit_concurrent()`) run concurrently.
-Letting compute commands overlap earlier work (barriers only for declared conflicts) is only correct if every one of
-the backend's GPU operations declares exactly the memory it touches, which nothing verifies; a copy racing a render
-pass shows as tile-shaped stale content (GoldenEye 007: Reloaded showed stale 32x32-pixel tiles of its scene target).
-The declarations of compute commands are still recorded for what is checked against them (later render passes'
-vertex-stage reads, submissions of draws and external work). Render passes are ordered when they begin, because of the
-rule below.
+(`mtl::gpu_access`). Compute encoder work is ordered conservatively against earlier encoders: every compute encoder
+begins with a consumer barrier on every stage of all earlier work of the queue. Letting compute commands overlap a
+render pass (barriers only for declared conflicts) would only be correct if the passes declared exactly the memory
+they touch, which they do not (attachment loads/stores, tile memory); a copy racing a render pass shows as tile-shaped
+stale content (GoldenEye 007: Reloaded showed stale 32x32-pixel tiles of its scene target). Inside one compute
+encoder every command is a blit or dispatch of this backend and declares its accesses in full (`blit({...})`,
+`program::bind()` for every table slot of a compute program), so the commands of an encoder are ordered by the hazard
+check alone: a command waits (`barrierAfterEncoderStages`) only for the earlier commands of its encoder it conflicts
+with, and independent texture uploads or readback copies run back to back. A command that declares nothing is ordered
+after every earlier command of the encoder. The declarations are also recorded for what is checked against them later
+(render passes' vertex-stage reads, submissions of draws and external work). Render passes are ordered when they
+begin, because of the rule below.
 
 **The TBDR rule: no ordering can be added to a render pass after its first draw.** An Apple GPU bins every draw of a
 pass (vertex work) before it shades any of them tile by tile (fragment/tile work, attachment loads and stores). A

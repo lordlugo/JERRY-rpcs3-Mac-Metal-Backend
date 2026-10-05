@@ -814,6 +814,7 @@ MTLGSRender::~MTLGSRender()
 	// Render pass state
 	m_draw_pass_desc.reset();
 	m_depth_stencil_states.clear();
+	m_last_depth_stencil_state = nullptr;
 	m_fbo_images.clear();
 	m_draw_fbo.clear();
 

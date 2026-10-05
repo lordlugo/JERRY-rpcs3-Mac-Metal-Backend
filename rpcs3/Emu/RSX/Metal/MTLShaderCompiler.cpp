@@ -574,7 +574,13 @@ namespace mtl::glsl
 		// both (RCP/RSQ/DIV by zero, 1/w, the z-clip transform relies on w = 0 giving Inf) and the results must follow
 		// IEEE rules as on the PS3 and the Vulkan backend. "Disable MSL fast math" selects MathModeSafe.
 		options->setMathMode(fast_math ? MTL::MathModeRelaxed : MTL::MathModeSafe);
-		options->setMathFloatingPointFunctions(fast_math ? MTL::MathFloatingPointFunctionsFast : MTL::MathFloatingPointFunctionsPrecise);
+		// Always the precise single-precision functions: the fast:: variants (exp2/log2/pow/sqrt/rsqrt/sin/cos) have
+		// implementation-defined precision and undefined results outside their domain (pow(0, x), log2(0), rsqrt(0)),
+		// while the shared GLSL relies on IEEE edge cases for fog (exp of large negative values), sRGB encode/decode
+		// (pow(0, 1/2.4)) and LIT/POW/LG2/RSQ emulation. The Vulkan backend evaluates all of these at full precision;
+		// fast functions showed as banding in exponential fog and black/garbage pixels from NaN in sRGB targets.
+		// The math mode above still allows reassociation and contraction, which is where the speed is.
+		options->setMathFloatingPointFunctions(MTL::MathFloatingPointFunctionsPrecise);
 		options->setPreserveInvariance(true); // Honors [[invariant]] vertex positions (RSX vertex programs)
 		options->setLibraryType(MTL::LibraryTypeExecutable);
 

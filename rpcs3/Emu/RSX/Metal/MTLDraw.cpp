@@ -652,9 +652,17 @@ mtl::image_view* MTLGSRender::redirect_depth_attachment_read(mtl::image_view* vi
 
 MTL::DepthStencilState* MTLGSRender::get_depth_stencil_state(u64 key)
 {
+	// Consecutive draws almost always share the depth/stencil configuration: one compare, no hash lookup
+	if (key == m_last_depth_stencil_key && m_last_depth_stencil_state)
+	{
+		return m_last_depth_stencil_state;
+	}
+
 	if (auto found = m_depth_stencil_states.find(key); found != m_depth_stencil_states.end())
 	{
-		return found->second.get();
+		m_last_depth_stencil_key = key;
+		m_last_depth_stencil_state = found->second.get();
+		return m_last_depth_stencil_state;
 	}
 
 	mtl::autorelease_scope pool;
@@ -687,9 +695,10 @@ MTL::DepthStencilState* MTLGSRender::get_depth_stencil_state(u64 key)
 	auto state = m_device->handle()->newDepthStencilState(desc.get());
 	ensure(state, "Metal: failed to create depth-stencil state");
 
-	auto result = state;
 	m_depth_stencil_states.emplace(key, mtl::ref<MTL::DepthStencilState>(state));
-	return result;
+	m_last_depth_stencil_key = key;
+	m_last_depth_stencil_state = state;
+	return state;
 }
 
 mtl::image_view* MTLGSRender::get_null_texture_view(rsx::texture_dimension_extended type, bool is_depth)
@@ -2196,7 +2205,9 @@ void MTLGSRender::emit_geometry(u32 sub_index)
 		else
 		{
 			// Metal requires 4-byte aligned index buffer addresses. 16-bit sub-ranges following an odd index count start on
-			// a 2-byte boundary: those are copied to a fresh (aligned) ring allocation.
+			// a 2-byte boundary: those are copied to a fresh (aligned) ring allocation. Guest index arrays are uploaded
+			// as 32-bit when that would happen (MTLVertexBuffers.cpp), so this only remains for the 16-bit indices the
+			// DMA offloader generates for emulated primitives of array/inlined draws (hence the sync below).
 			// NOTE: Read the source through the mapping taken before any allocation; a ring grow swaps the backing store
 			// (the old buffer stays alive through the GC until this submission completes, so index_base remains valid).
 			const u8* index_data = m_index_buffer_ring_info.map<u8>(offset, 0);
@@ -2799,8 +2810,46 @@ void MTLGSRender::clear_surface(u32 mask)
 	}
 
 	// Planes of the draw pass attachments the full-frame parts clear
-	const u32 full_ds_planes = m_draw_fbo.depth_stencil ? (full.depth_stencil_planes & m_draw_fbo.depth_stencil->aspect()) : 0;
-	const bool full_color = full.color && m_draw_fbo.color_count;
+	u32 full_ds_planes = m_draw_fbo.depth_stencil ? (full.depth_stencil_planes & m_draw_fbo.depth_stencil->aspect()) : 0;
+	bool full_color = full.color && m_draw_fbo.color_count;
+
+	if ((full_color || full_ds_planes) && is_render_pass_open())
+	{
+		// Ending the open draw pass stores every attachment and the next pass loads the ones the clear leaves alone.
+		// Worth it only when the clear covers every attached plane (all of them become free loadAction=Clear). A
+		// full-frame clear of some planes only (depth between two passes over the same colour targets, colour with the
+		// depth kept) is drawn as the quad below inside the open pass instead: no pass split, no store/load round trip
+		// of the untouched attachments (tens of MiB per occurrence at scaled resolutions).
+		const bool clears_all_color = full_color || !m_draw_fbo.color_count;
+		const bool clears_all_ds = !m_draw_fbo.depth_stencil || full_ds_planes == m_draw_fbo.depth_stencil->aspect();
+
+		if (!clears_all_color || !clears_all_ds)
+		{
+			if (full_color)
+			{
+				inpass.color_write_mask = static_cast<u8>(MTL::ColorWriteMaskAll);
+				inpass.color = { static_cast<f32>(full.color_value.red), static_cast<f32>(full.color_value.green),
+					static_cast<f32>(full.color_value.blue), static_cast<f32>(full.color_value.alpha) };
+			}
+
+			if (full_ds_planes & mtl::aspect_depth)
+			{
+				inpass.depth = true;
+				inpass.depth_value = static_cast<f32>(full.depth);
+			}
+
+			if (full_ds_planes & mtl::aspect_stencil)
+			{
+				inpass.stencil = true;
+				inpass.stencil_value = static_cast<u8>(full.stencil);
+				inpass.stencil_write_mask = 0xFF;
+			}
+
+			full_color = false;
+			full_ds_planes = 0;
+			mtl::count_pass_event(mtl::pass_event::clear_kept_pass_open);
+		}
+	}
 
 	if (full_color || full_ds_planes)
 	{

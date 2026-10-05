@@ -305,8 +305,11 @@ namespace mtl
 			{
 				dma_sync(false);
 
-				// Guest destination: any alignment (blit when 4-byte aligned, compute byte copy otherwise)
-				mtl::copy_buffer_to_buffer_aligned(cmd, working_buffer, result_offset, dma_mapping.second, dma_mapping.first, dma_sync_region.length());
+				// Guest destination: any alignment (blit when 4-byte aligned, compute byte copy otherwise). Without tiling
+				// the working buffer holds task_length converted bytes; never copy scratch bytes past them into guest
+				// memory (the scratch pool is shared with texture uploads, so they are arbitrary texel data).
+				const u64 copy_length = require_tiling ? u64{dma_sync_region.length()} : std::min<u64>(dma_sync_region.length(), task_length);
+				mtl::copy_buffer_to_buffer_aligned(cmd, working_buffer, result_offset, dma_mapping.second, dma_mapping.first, copy_length);
 			}
 			else
 			{
@@ -1083,7 +1086,19 @@ namespace mtl
 				// (convert_x + convert_w) x (src_y + src_h) bounding extent only served
 				// cross-section cache reuse and can exceed the 16384 Metal 2D limit on the
 				// offset alone while the content fits.
-				src_image = mtl::get_typeless_helper(dst->format(), dst->format_class(), convert_w, src_h, "xfer-surfaces");
+				// A scaled copy into a 3D destination below needs a 2D helper of the same (format, class) key as this
+				// one, placed under the converted source (see _dst). Request the union now: a second, larger request
+				// would dispose of this helper, and with it the converted source bytes, before copy_scaled_image reads
+				// them (garbage/black slices in 3D textures assembled from converted render targets).
+				u32 helper_w = convert_w;
+				u32 helper_h = src_h;
+				if ((convert_w != section.dst_w || src_h != section.dst_h) && dst->type() == MTL::TextureType3D)
+				{
+					helper_w = std::max<u32>(helper_w, dst->width());
+					helper_h += section.dst_h;
+				}
+
+				src_image = mtl::get_typeless_helper(dst->format(), dst->format_class(), helper_w, helper_h, "xfer-surfaces");
 
 				if (!src_image || convert_w > 0xFFFFu)
 				{

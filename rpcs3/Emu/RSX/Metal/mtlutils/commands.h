@@ -87,6 +87,7 @@ namespace mtl
 		clear_folded,              // deferred clear folded into the load action of a pass attaching the texture
 		clear_pass,                // clear-only pass recorded for deferred clears that no pass folded
 		readback_not_speculated,   // Write Color/Depth Buffers: no speculative readback of a surface that stays bound
+		clear_kept_pass_open,      // full-frame clear of some planes only, drawn as a quad instead of ending the draw pass
 		count
 	};
 
@@ -256,7 +257,7 @@ namespace mtl
 
 		// Slots written / skipped since the owning list last submitted (telemetry)
 		u64 writes = 0;
-		u64 writes_skipped = 0;
+		mutable u64 writes_skipped = 0;
 
 		// Each returns true, and records the value, if the table does not hold it yet (the caller writes it then)
 		bool update_buffer(u32 index, MTL::GPUAddress address)
@@ -292,6 +293,24 @@ namespace mtl
 			}
 
 			address = buffers[index];
+			return true;
+		}
+
+		// The table is known to hold this sampler ID in this slot (no write needed)
+		bool holds_sampler(u32 index, MTL::ResourceID id) const
+		{
+			const u32 bit = u32{1} << index;
+			if (!(samplers_known & bit))
+			{
+				return false;
+			}
+
+			if (samplers[index] != id._impl)
+			{
+				return false;
+			}
+
+			writes_skipped++;
 			return true;
 		}
 

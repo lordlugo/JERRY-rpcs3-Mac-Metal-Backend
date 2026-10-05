@@ -394,6 +394,9 @@ namespace mtl
 			// (set, binding) -> bitmask of stages (m_inputs/m_layouts index) that declare it
 			static constexpr u32 max_binding_locations = 128;
 			std::array<std::array<u8, max_binding_locations>, binding_set_index_max_enum> m_binding_stage_mask{};
+			// Per stage: index + 1 into m_table_slots of the slot at a GLSL binding location (0: none). bind_uniform*()
+			// resolves ~12-20 locations per draw; this replaces the hash map lookups of m_layouts[].slots.
+			std::array<std::array<u16, max_binding_locations>, binding_set_index_max_enum> m_slot_by_location{};
 			bool m_missing_binding_reported = false;
 			// Sampler slots already reported by report_dead_sampler (one bit per slot, per stage)
 			std::array<u32, binding_set_index_max_enum> m_dead_sampler_reported{};

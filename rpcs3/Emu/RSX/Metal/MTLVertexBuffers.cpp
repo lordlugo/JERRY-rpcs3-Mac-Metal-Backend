@@ -133,6 +133,43 @@ namespace
 			// Storage for 16-bit indices widened to 32-bit (big endian, like the guest data)
 			std::vector<be_t<u32>> widened_indices;
 
+			const auto widen_source_to_u32 = [&]()
+			{
+				if (widened_indices.empty())
+				{
+					const auto src16 = std::span<const be_t<u16>>(reinterpret_cast<const be_t<u16>*>(index_source.data()), index_source.size() / sizeof(u16));
+					widened_indices.resize(src16.size());
+
+					for (usz i = 0; i < src16.size(); ++i)
+					{
+						widened_indices[i] = static_cast<u32>(src16[i]);
+					}
+				}
+
+				index_source = std::as_bytes(std::span<const be_t<u32>>(widened_indices));
+				index_type = rsx::index_array_type::u32;
+			};
+
+			if (index_type == rsx::index_array_type::u16 && !rsx::method_registers.current_draw_clause.is_single_draw())
+			{
+				// Metal needs 4-byte aligned index buffer addresses, and the sub-ranges of a multi-range draw are drawn
+				// from their offset in this upload (no firstIndex). A 16-bit range that starts after an odd number of
+				// indices is misaligned; emit_geometry() would then copy it to an aligned allocation on the CPU for every
+				// draw (and sync the DMA offloader first). Uploading such draws as 32-bit indices costs 2x the index
+				// bytes once and makes every range address aligned.
+				u32 cumulative_count = 0;
+				for (const auto& range : rsx::method_registers.current_draw_clause.get_subranges())
+				{
+					if (cumulative_count & 1)
+					{
+						widen_source_to_u32();
+						break;
+					}
+
+					cumulative_count += get_index_count(primitive, range.count);
+				}
+			}
+
 			while (true)
 			{
 				const u32 type_size = get_index_type_size(index_type);
@@ -183,21 +220,8 @@ namespace
 					// Metal always restarts strips on 0xFFFF (and cannot disable it). Restart markers are never counted
 					// in min/max, so this is a literal vertex index: widen the source to 32-bit and upload again.
 					// The restart index keeps its value; a 16-bit restart index > 0xFFFF still never matches.
-					if (widened_indices.empty())
-					{
-						const auto src16 = std::span<const be_t<u16>>(reinterpret_cast<const be_t<u16>*>(index_source.data()), index_source.size() / sizeof(u16));
-						widened_indices.resize(src16.size());
-
-						for (usz i = 0; i < src16.size(); ++i)
-						{
-							widened_indices[i] = static_cast<u32>(src16[i]);
-						}
-					}
-
 					m_index_buffer_ring_info.unmap();
-
-					index_source = std::as_bytes(std::span<const be_t<u32>>(widened_indices));
-					index_type = rsx::index_array_type::u32;
+					widen_source_to_u32();
 					continue;
 				}
 

@@ -1470,16 +1470,20 @@ void MTLGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(!m_current_frame->drawable);
 	ensure(m_current_frame->swap_command_buffer == nullptr);
 
-	// Graphics self-check (MTLFrameInspector): read back the checks the GPU has finished, then record this frame's
-	// (a few small compute dispatches every 15th/30th frame, nothing waits for them)
-	if (!m_frame_inspector)
+	// Graphics self-check (MTLFrameInspector, opt-in: "Graphics Self-Check"): read back the checks the GPU has finished,
+	// then record this frame's (a few small compute dispatches every 15th/30th frame, nothing waits for them, but they
+	// end the frame's encoders and add a compute pass plus a surface-store walk to the present path)
+	if (g_cfg.video.graphics_self_check && !m_frame_inspector)
 	{
 		m_frame_inspector = std::make_unique<mtl::frame_inspector>();
 	}
 
-	m_frame_inspector->poll();
+	if (m_frame_inspector)
+	{
+		m_frame_inspector->poll();
+	}
 
-	if (info.emu_flip && image_to_flip)
+	if (m_frame_inspector && info.emu_flip && image_to_flip)
 	{
 		std::vector<mtl::frame_inspector::target_candidate> targets;
 

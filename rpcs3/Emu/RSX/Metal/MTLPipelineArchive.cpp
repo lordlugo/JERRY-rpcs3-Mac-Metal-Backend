@@ -117,8 +117,9 @@ namespace mtl
 		// sidecars), keys hash each shader's MSL once and include the function constant values of specialized shaders,
 		// render pipelines inherit the encoder's colour attachment map. 6: render pipelines use the identity colour
 		// attachment mapping again (no colour attachment maps). 7: vertex programs compute DP4/DPH as explicit fma chains and
-		// fetch w = 1 exactly (every vertex shader binary changes).
-		constexpr u32 archive_format_version = 7;
+		// fetch w = 1 exactly (every vertex shader binary changes). 8: libraries compile with precise math functions, and
+		// fragment programs declare stencil mirrors after all texture units (sampler slot order), so every binary changes.
+		constexpr u32 archive_format_version = 8;
 
 		constexpr std::string_view archive_extension = ".mtl4archive";
 		constexpr std::string_view keys_extension = ".keys"; // Sidecar: <archive file name>.keys

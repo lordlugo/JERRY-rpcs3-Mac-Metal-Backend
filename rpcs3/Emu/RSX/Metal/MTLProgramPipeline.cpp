@@ -350,9 +350,12 @@ namespace mtl
 				auto& table_slots = m_table_slots[stage];
 				table_slots.clear();
 				table_slots.reserve(m_layouts[stage].slots.size());
+				m_slot_by_location[stage].fill(0);
 				for (const auto& [location, slot] : m_layouts[stage].slots)
 				{
 					table_slots.push_back(slot);
+					ensure(location < max_binding_locations, "Binding location out of range");
+					m_slot_by_location[stage][location] = static_cast<u16>(table_slots.size()); // index + 1
 				}
 
 				// Every slot bind() writes must fit the argument table it targets and the
@@ -437,10 +440,9 @@ namespace mtl
 					continue;
 				}
 
-				const auto& slots = m_layouts[stage].slots;
-				if (const auto found = slots.find(binding_point); found != slots.end())
+				if (const u32 slot_index = m_slot_by_location[stage][binding_point])
 				{
-					func(stage, found->second);
+					func(stage, m_table_slots[stage][slot_index - 1]);
 				}
 			}
 
@@ -841,6 +843,15 @@ namespace mtl
 						for (u32 i = 0; i < slot.array_size; ++i)
 						{
 							MTL::ResourceID sampler_id = bindings.samplers[slot.sampler_index + i];
+
+							if (contents.holds_sampler(slot.sampler_index + i, sampler_id))
+							{
+								// The table already holds this ID: no driver call, so nothing to guard. Every bound
+								// sampler is ref-held by the renderer for the draw (fs_sampler_handles), so a dead ID can
+								// only sit in a slot the program does not use. This skips the process-wide liveness
+								// mutex + hash lookup that otherwise ran for every sampler slot of every draw.
+								continue;
+							}
 
 							// Resolve under the liveness lock and HOLD it across the driver call:
 							// the sampler object behind a live ID can be destroyed on another

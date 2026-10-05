@@ -18,6 +18,68 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-05 — Performance audit: upstream video defaults, RSX thread hot path, Metal command ordering, glitch fixes
+
+Configuration (the largest part of the low frame rates):
+- The fork's global defaults turned the most expensive RSX options on for every game: forced 2x host MSAA on every
+  render target (G-buffers, bloom chains and shadow maps included, each resolved whenever it is sampled) at 200%
+  resolution scale, i.e. 8x the fill rate of native, plus Write Color Buffers, Write Depth Buffer, Read Color Buffers
+  and Read Depth Buffer (per-title workarounds upstream: readbacks the RSX thread waits for, and surfaces initialised
+  from guest memory that show stale frames through). Defaults are the upstream ones again (forced MSAA off, the four
+  memory options off, 100% scale). metal-fork-defaults-v11 moves installs still on exactly those values; anything else
+  is kept. Titles that need any of them keep getting them from their per-title config (GTA IV, God of War: Ascension,
+  Far Cry 3, ...).
+
+RSX thread (CPU):
+- NV406E semaphore acquire: the flip semaphore waited in a `sched_yield()` loop, i.e. a full core of syscalls for most
+  of every vblank period on a vsync-limited game; it waits on the cache line again (WFE on arm64, the upstream path).
+  Timed 50 us sleeps only start after 1 ms of waiting (macOS timed waits oversleep by far more than 50 us) and no
+  longer wake on unrelated thread notifications. An already-satisfied acquire no longer drops the FIFO prefetch cache
+  (`flush_fifo()` on every acquire, hundreds per frame in SPURS games; upstream never did).
+- seq-cst fences restored in `write_gcm_label` and `semaphore_acquire` (upstream): PPU/SPU threads that observe GET
+  also see every label the RSX wrote before publishing it (arm64 is weakly ordered).
+- The per-stage draw profiler (`m_profiler`) was forced on: ~10 clock reads per draw for timings nothing displays
+  unless the debug overlay is on. Upstream gating restored.
+- The stall tripwire ran every 1024 loop turns (thousands of clock reads per second with an empty FIFO); now in the
+  64-cycle sub-unit slice, at most every 250 ms.
+
+Metal backend:
+- Compute encoders: every blit/dispatch after the first waited for every earlier command of its encoder, whatever it
+  touched (`needs.encoder = compute_classes` unconditionally), so N texture uploads or readback copies in one encoder
+  ran strictly one after another. Commands within an encoder are fully declared, so they are ordered by the hazard
+  check alone now; the all-stages barrier each encoder begins with (render passes do not declare everything) stays.
+- Render pass begin walked the descriptor twice (hazard declarations + attachment traffic telemetry: ~100 objc_msgSends
+  per pass, tens to hundreds of passes per frame); one walk, stopping at the first unused colour slot.
+- A full-frame RSX clear of some planes only (depth between passes over the same colour targets, colour with depth
+  kept) ended the draw pass, storing every attachment and reloading the untouched ones in the next pass. It is drawn
+  as the in-pass quad instead; a clear of every attached plane still ends the pass (free loadAction=Clear). New
+  counter in the passes telemetry line.
+- 16-bit multi-range indexed draws (strips joined by primitive restart): a range starting after an odd index count is
+  misaligned for Metal and was re-copied on the CPU per range, after a blocking `dma_manager::sync()` on the RSX
+  thread per draw. Such uploads are widened to 32-bit once at upload time; the realignment path remains only for the
+  offloader-generated indices of emulated primitives.
+- `program::bind()`: the process-wide sampler liveness mutex + hash lookup ran for every sampler slot of every draw
+  before checking whether the table already held the ID; it is skipped when it does. Binding location -> slot lookups
+  (12-20 per draw) use a flat per-stage index instead of the `unordered_map`. Depth-stencil state lookups cache the
+  last key.
+- Draws the interpreter cannot run wait at most 16 ms (was 40) for their pipeline, 24 ms per frame (was 60).
+- Graphics self-check (MTLFrameInspector: compute dispatches and a surface-store walk on the present path every 15th /
+  30th frame) is opt-in: "Graphics Self-Check" (off by default).
+
+Glitch fixes:
+- MSL libraries compile with precise math functions (`MathFloatingPointFunctionsPrecise`): the fast:: variants have
+  undefined results outside their domain (pow(0, x), log2(0), rsqrt(0)) and implementation-defined precision, which the
+  shared GLSL relies on for exponential fog, sRGB encode/decode and LIT/POW/LG2/RSQ (NaN pixels, fog banding). The
+  math mode (reassociation, contraction) is unchanged. Archive format version 8.
+- Fragment programs declared each stencil mirror right after its texture unit; sampler slots are handed out in input
+  order, so programs with many texture units plus a depth-redirected one sampled their last real textures with the
+  constant fallback sampler (nearest, clamp-to-border, LOD 0). Mirrors are declared after every texture unit.
+- Texture cache: a scaled copy of a typeless-converted source into a 3D texture requested a second helper with the same
+  (format, class) key and a larger size, which disposed of the helper holding the converted source before it was read
+  (garbage/black slices). The first request now covers both.
+- `dma_transfer`: the non-tiled readback copy to guest memory is bounded by the converted byte count, never copying
+  scratch bytes (shared with texture uploads) past it.
+
 ## 2026-10-04 — cellAudio: one-block lag reverted; write-ahead probe; 10 s audio reports
 
 - The one-block lag gave 98% delivery in GTA IV's menus but sounded much worse in play (no gameplay report: the session ended 25 s into gameplay). Reverted to upstream's mix position.

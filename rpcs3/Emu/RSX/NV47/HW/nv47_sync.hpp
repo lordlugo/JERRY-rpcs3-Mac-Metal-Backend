@@ -13,6 +13,10 @@ namespace rsx
 		template <bool FlushDMA, bool FlushPipe>
 		static void write_gcm_label(context* ctx, u32 type, u32 address, u32 data)
 		{
+			// Ensure atomic seq-cst memory ordering for FIFO GET updates: PPU/SPU threads that observe GET must also see
+			// every label the RSX wrote before publishing it (upstream ordering; arm64 is weakly ordered).
+			atomic_fence_seq_cst();
+
 			// The RSX uses the unprotected mapping for labels. The label page can hold zcull reports too (16 KiB host
 			// pages: labels and report slots 0-703 share one page), whose pages are access-protected to detect CPU reads
 			// of pending reports. The RSX's own label traffic must not count as such a read.
@@ -25,7 +29,7 @@ namespace rsx
 				const bool handled = RSX(ctx)->get_backend_config().supports_host_gpu_labels && RSX(ctx)->release_GCM_label(type, address, data);
 
 				// (A deferred write to the same address would change the value later, see flush_deferred_labels)
-				if (label.load() == data && !RSX(ctx)->has_deferred_label_at(address))
+				if (label.load() == data && (!RSX(ctx)->has_deferred_labels() || !RSX(ctx)->has_deferred_label_at(address)))
 				{
 					// It's a no-op to write the same value (although there is a delay in real-hw so it's more accurate to allow GPU label in this case)
 					// There is no possible way for the guest to know that the label has been processed so we can skip MM sync here.

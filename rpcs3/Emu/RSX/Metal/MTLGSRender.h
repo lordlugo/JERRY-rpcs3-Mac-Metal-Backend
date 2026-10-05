@@ -211,6 +211,8 @@ private:
 
 	// Depth-stencil state objects (Metal has no dynamic stencil masks)
 	std::unordered_map<u64, mtl::ref<MTL::DepthStencilState>> m_depth_stencil_states;
+	u64 m_last_depth_stencil_key = 0;                                 // Last get_depth_stencil_state() lookup (owned by the map)
+	MTL::DepthStencilState* m_last_depth_stencil_state = nullptr;
 
 	sizeu m_swapchain_dims{};
 	bool swapchain_unavailable = false;
@@ -292,8 +294,11 @@ private:
 	static constexpr u64 async_compile_wait_budget_us = 8'000;
 	u64 m_async_compile_wait_spent_us = 0;
 	// Draws the shader interpreter cannot run wait for their recompiled pipeline (load_program), within these budgets
-	static constexpr u64 unsupported_wait_draw_budget_us = 40'000;  // Was 250 ms: up to 600 ms per frame showed as hitches (GTA IV)
-	static constexpr u64 unsupported_wait_frame_budget_us = 60'000;
+	// One 60 Hz frame per draw, 1.5 per frame: a longer wait is a visible hitch (was 250 ms / 600 ms, then 40 / 60 ms:
+	// shader bursts at the start of a game still stalled for several frames in a row). The draw is skipped for this
+	// frame when the budget runs out, as the Vulkan backend does for every compiling pipeline.
+	static constexpr u64 unsupported_wait_draw_budget_us = 16'000;
+	static constexpr u64 unsupported_wait_frame_budget_us = 24'000;
 	u64 m_unsupported_wait_spent_us = 0;
 
 	// Pipeline telemetry, reported and reset with the presentation statistics (MTLPresent.cpp)

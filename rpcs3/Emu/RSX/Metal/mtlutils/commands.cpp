@@ -91,50 +91,6 @@ namespace mtl
 			}
 		}
 
-		// Memory traffic of the attachments of a pass that is about to begin: loads at its start, stores at its end
-		void count_attachment_traffic(const MTL4::RenderPassDescriptor* desc)
-		{
-			u64 load_bytes = 0, store_bytes = 0;
-			const u64 area = u64{ desc->renderTargetWidth() } * desc->renderTargetHeight();
-
-			const auto count = [&](const MTL::RenderPassAttachmentDescriptor* attachment, bool stencil_plane)
-			{
-				const MTL::Texture* texture = attachment->texture();
-				if (!texture)
-				{
-					return false;
-				}
-
-				const u64 pixels = area ? area : u64{ std::max<NS::UInteger>(texture->width() >> attachment->level(), 1) } *
-					std::max<NS::UInteger>(texture->height() >> attachment->level(), 1);
-				const u64 bytes = pixels * texture->sampleCount() * get_attachment_texel_size(texture->pixelFormat(), stencil_plane);
-
-				if (attachment->loadAction() == MTL::LoadActionLoad)
-				{
-					load_bytes += bytes;
-				}
-
-				if (const auto store = attachment->storeAction(); store == MTL::StoreActionStore || store == MTL::StoreActionStoreAndMultisampleResolve)
-				{
-					store_bytes += bytes;
-				}
-
-				return true;
-			};
-
-			// Colour attachments are dense in every descriptor the backend builds
-			for (u32 index = 0; index < 8 && count(desc->colorAttachments()->object(index), false); ++index)
-			{
-			}
-
-			count(desc->depthAttachment(), false);
-			count(desc->stencilAttachment(), true);
-
-			auto& state = gpu_stats();
-			state.attachment_load_bytes += load_bytes;
-			state.attachment_store_bytes += store_bytes;
-		}
-
 		// Called by Metal when committed work finishes (any thread)
 		void on_commit_feedback(MTL4::CommitFeedback* feedback)
 		{
@@ -960,7 +916,7 @@ namespace mtl
 			"vertex read of earlier fragment output %.1f, copy of the depth buffer for shader reads %.1f), "
 			"%.1f feedback reads kept in the pass; "
 			"no readback speculation for %.1f surfaces that stayed bound; "
-			"clears: %.1f drawn as quads in the draw pass (scissored or masked), %.1f folded into a load action, "
+			"clears: %.1f drawn as quads in the draw pass (scissored or masked; %.1f of them full-frame clears of some planes that kept the pass open), %.1f folded into a load action, "
 			"%.1f clear-only passes; "
 			"attachment memory traffic %.0f MiB loaded and %.0f MiB stored per frame",
 			(stats.draw_render_passes + other_total) * scale, stats.draw_render_passes * scale, other_total * scale, by_context(stats.other_passes),
@@ -970,7 +926,7 @@ namespace mtl
 			split(pass_split_reason::depth_copy),
 			stats.feedback_reads_in_pass * scale,
 			event(pass_event::readback_not_speculated),
-			event(pass_event::clear_in_pass), event(pass_event::clear_folded), event(pass_event::clear_pass),
+			event(pass_event::clear_in_pass), event(pass_event::clear_kept_pass_open), event(pass_event::clear_folded), event(pass_event::clear_pass),
 			stats.attachment_load_bytes * scale / mib, stats.attachment_store_bytes * scale / mib);
 	}
 
@@ -1633,7 +1589,6 @@ namespace mtl
 
 		auto& stats = gpu_stats();
 		(draw_pass ? stats.draw_render_passes : stats.other_passes[static_cast<u32>(g_pass_context)])++;
-		count_attachment_traffic(desc);
 
 		auto& hs = *m_hazards;
 		hs.render = true;
@@ -1651,38 +1606,74 @@ namespace mtl
 		// descriptor as begun: attachments whose load action is a folded deferred clear are written like any other, and
 		// the clear-only passes of flush_deferred_clears() come through here too. In-pass clear quads only write
 		// attachments of the open pass. Unused colour attachment descriptors are created (autoreleased) on access.
+		// One walk over the descriptor serves both the hazard declarations and the attachment traffic telemetry (each
+		// property is an objc_msgSend; passes begin tens to hundreds of times per frame).
 		std::array<gpu_access, 20> attachments{};
 		u32 count = 0;
+		u64 load_bytes = 0, store_bytes = 0;
 		{
 			autorelease_scope pool;
+			const u64 area = u64{ desc->renderTargetWidth() } * desc->renderTargetHeight();
 
-			auto add_attachment = [&](const MTL::RenderPassAttachmentDescriptor* attachment)
+			// Returns false for an unused attachment slot
+			auto add_attachment = [&](const MTL::RenderPassAttachmentDescriptor* attachment, bool stencil_plane)
 			{
 				if (!attachment)
 				{
-					return;
+					return false;
 				}
 
-				if (const auto access = attachment_access(attachment->texture(), attachment->level(), attachment->slice()); access.kind != gpu_access::none)
+				const MTL::Texture* texture = attachment->texture();
+				if (!texture)
+				{
+					return false;
+				}
+
+				const NS::UInteger level = attachment->level();
+				if (const auto access = attachment_access(texture, level, attachment->slice()); access.kind != gpu_access::none)
 				{
 					attachments[count++] = access;
 				}
 
-				if (const auto access = attachment_access(attachment->resolveTexture(), attachment->resolveLevel(), attachment->resolveSlice()); access.kind != gpu_access::none)
+				if (const MTL::Texture* resolve = attachment->resolveTexture())
 				{
-					attachments[count++] = access;
+					if (const auto access = attachment_access(resolve, attachment->resolveLevel(), attachment->resolveSlice()); access.kind != gpu_access::none)
+					{
+						attachments[count++] = access;
+					}
 				}
+
+				// Memory traffic of the pass: loads at its start, stores at its end
+				const u64 pixels = area ? area : u64{ std::max<NS::UInteger>(texture->width() >> level, 1) } *
+					std::max<NS::UInteger>(texture->height() >> level, 1);
+				const u64 bytes = pixels * texture->sampleCount() * get_attachment_texel_size(texture->pixelFormat(), stencil_plane);
+
+				if (attachment->loadAction() == MTL::LoadActionLoad)
+				{
+					load_bytes += bytes;
+				}
+
+				if (const auto store = attachment->storeAction(); store == MTL::StoreActionStore || store == MTL::StoreActionStoreAndMultisampleResolve)
+				{
+					store_bytes += bytes;
+				}
+
+				return true;
 			};
 
+			// Colour attachments are dense in every descriptor the backend builds; stop at the first unused slot (an
+			// unused attachment descriptor is created, autoreleased, on access)
 			const auto colors = desc->colorAttachments();
-			for (u32 i = 0; i < 8; ++i)
+			for (u32 i = 0; i < 8 && add_attachment(colors->object(i), false); ++i)
 			{
-				add_attachment(colors->object(i));
 			}
 
-			add_attachment(desc->depthAttachment());
-			add_attachment(desc->stencilAttachment());
+			add_attachment(desc->depthAttachment(), false);
+			add_attachment(desc->stencilAttachment(), true);
 		}
+
+		stats.attachment_load_bytes += load_bytes;
+		stats.attachment_store_bytes += store_bytes;
 
 		// Earlier accesses of the attachments are ordered by the pass barriers (fragment/tile work after everything).
 		// Written by every render stage of the pass, as far as later work is concerned.
@@ -1897,13 +1888,12 @@ namespace mtl
 			hs.full_barriers++;
 		}
 
-		// Conservative ordering of compute encoder work (DESIGN.md §3): a compute encoder begins with a consumer barrier on
-		// every stage of all earlier work of the queue (earlier command buffers included), and each command after the first
-		// waits for the earlier commands of its encoder (the parts of one command, blit_concurrent(), stay concurrent).
-		// A compute command overlapping earlier work is only correct if every GPU operation declared exactly what it
-		// touches, which nothing verifies; a render pass racing a copy shows as tile-shaped stale content (GoldenEye's
-		// 32x32-pixel stale tiles). This is the ordering the renderer had before hazard tracking. The declarations are still
-		// recorded: later render passes (vertex-stage reads) and submissions (draws, external work) are checked against them.
+		// Conservative ordering against earlier encoders (DESIGN.md §3): a compute encoder begins with a consumer barrier
+		// on every stage of all earlier work of the queue (earlier command buffers included). Render passes do not declare
+		// everything they touch (attachment loads/stores, tile memory), so a compute command overlapping a render pass is
+		// only safe behind this barrier; a copy racing a pass shows as tile-shaped stale content (GoldenEye's 32x32-pixel
+		// stale tiles). The declarations are still recorded: later render passes (vertex-stage reads) and submissions
+		// (draws, external work) are checked against them.
 		if (opened)
 		{
 			// Before every stage of the encoder (a later command may dispatch after a first blit, or vice versa). It covers
@@ -1912,7 +1902,12 @@ namespace mtl
 			needs.queue = 0;
 		}
 
-		if (new_command && hs.command > 1)
+		// Within the encoder, every command is a blit or a dispatch of this backend and declares its accesses in full
+		// (cmd.blit({...}), program::bind() for every table slot of a compute program), so the hazard check above is
+		// exact: a command only waits for the earlier commands of the encoder it conflicts with (needs.encoder), and
+		// N independent texture uploads or readback copies run back to back instead of each waiting for the previous
+		// one. A command that declared nothing at all is ordered after every earlier command of the encoder.
+		if (new_command && hs.command > 1 && accesses.empty())
 		{
 			needs.encoder = compute_classes;
 		}

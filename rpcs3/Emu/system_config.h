@@ -129,9 +129,12 @@ struct cfg_root : cfg::node
 		cfg::_enum<frame_limit_type> frame_limit{ this, "Frame limit", frame_limit_type::_auto, true };
 		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true }; // 0 disables its effect
 		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::_auto };
-		// Forced host MSAA for every game (RSX/Common/forced_msaa.hpp): sample count given to render targets the game
-		// creates as single-sample, with MSAA "Auto". 2 (default), 4, or 0/1 = off. PS3-MSAA surfaces keep their own count
-		cfg::_int<0, 4> forced_msaa_samples{ this, "Forced MSAA Samples", 2 };
+		// Forced host MSAA (RSX/Common/forced_msaa.hpp): sample count given to render targets the game creates as
+		// single-sample, with MSAA "Auto". 0/1 = off (default), 2 or 4. PS3-MSAA surfaces keep their own count.
+		// Off by default: it multisamples every intermediate target too (G-buffers, bloom chains, shadow maps), so each
+		// of them is resolved whenever it is sampled and written at N times the bandwidth. On Apple GPUs at 200%
+		// scale that was most of the frame time, and the extra resolve passes are a source of stale-tile glitches.
+		cfg::_int<0, 4> forced_msaa_samples{ this, "Forced MSAA Samples", 0 };
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_with_interpreter };
 		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::ultra };
 #ifdef __APPLE__
@@ -141,24 +144,23 @@ struct cfg_root : cfg::node
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
 #endif
 
-		cfg::_bool write_color_buffers{ this, "Write Color Buffers", true };
-#ifdef __APPLE__
-		// The Metal backend initializes surfaces from guest memory and writes depth
-		// back entirely on the GPU (GPU upload/tiling, compute depth packing), so
-		// fresh installs get the image-quality benefit without migration markers
-		// (see metal-fork-defaults-v8 in Emu/System.cpp).
-		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer", true };
-		cfg::_bool read_color_buffers{ this, "Read Color Buffers", true };
-		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer", true };
-#else
+		// Upstream defaults. These four are per-title workarounds, not quality settings: Write Color/Depth Buffers
+		// copies every render target the game touches back to guest memory each frame (GPU readbacks the RSX thread
+		// waits for), and Read Color/Depth Buffers initialises every new surface from guest memory, which shows stale
+		// frames through whenever the memory was not written by the game ("earlier frames showing through"). Games
+		// that need them get them from their per-title config (see get_builtin_title_config in Emu/System.cpp).
+		cfg::_bool write_color_buffers{ this, "Write Color Buffers", false };
 		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer" };
 		cfg::_bool read_color_buffers{ this, "Read Color Buffers" };
 		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer" };
-#endif
 		cfg::_bool handle_tiled_memory{ this, "Handle RSX Memory Tiling", false, true };
 		cfg::_bool log_programs{ this, "Log shader programs" };
 		cfg::_bool debug_output{ this, "Debug output" };
 		cfg::_bool debug_overlay{ this, "Debug overlay", false, true };
+		// RPCS3 Metal fork: graphics self-check (MTLFrameInspector): samples the presented image and scans float render
+		// targets for NaN/Inf on the GPU every 15th/30th frame and reports in the log. Diagnostic: it adds compute
+		// dispatches and a readback to the frame's critical path, so it is off unless asked for.
+		cfg::_bool graphics_self_check{ this, "Graphics Self-Check", false, true };
 		cfg::_bool renderdoc_compatiblity{ this, "Renderdoc Compatibility Mode" };
 		cfg::_bool use_gpu_texture_scaling{ this, "Use GPU texture scaling", false };
 		cfg::_bool stretch_to_display_area{ this, "Stretch To Display Area", false, true };
@@ -198,7 +200,7 @@ struct cfg_root : cfg::node
 		cfg::_bool precise_zpass_count{ this, "Accurate ZCULL stats", true };
 		cfg::_int<1, 8> consecutive_frames_to_draw{ this, "Consecutive Frames To Draw", 1, true};
 		cfg::_int<1, 8> consecutive_frames_to_skip{ this, "Consecutive Frames To Skip", 1, true};
-		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 200, true };
+		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 100, true };
 		cfg::uint<0, 16> anisotropic_level_override{ this, "Anisotropic Filter Override", 0, true };
 		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
 		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 16, true };

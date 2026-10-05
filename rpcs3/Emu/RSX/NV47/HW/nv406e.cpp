@@ -47,22 +47,27 @@ namespace rsx
 			// Syncronization point, may be associated with memory changes without actually changing addresses
 			RSX(ctx)->m_graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
 
+			// Ensure atomic seq-cst memory ordering for FIFO GET update (upstream; arm64 is weakly ordered)
+			atomic_fence_seq_cst();
+
 			// Unprotected mapping: see rsx::util::write_gcm_label
 			const auto& sema = *vm::get_super_ptr<RsxSemaphore>(addr);
 			const auto& atomic_sema = *vm::get_super_ptr<atomic_t<RsxSemaphore>>(addr);
 
 			if (sema == arg)
 			{
+				// Already satisfied: nothing waits, so the FIFO prefetch cache stays valid (upstream behaviour). Only
+				// expose GET, which PPU-side callbacks poll at sync points.
 				// Flip semaphore doesnt need wake-up delay
 				if (addr != RSX(ctx)->label_addr + 0x10)
 				{
-					RSX(ctx)->flush_fifo();
+					RSX(ctx)->fifo_ctrl->sync_get();
 					RSX(ctx)->fifo_wake_delay(2);
 				}
 
 				return;
 			}
-			else if (RSX(ctx)->deferred_label_will_write(addr, arg))
+			else if (RSX(ctx)->has_deferred_labels() && RSX(ctx)->deferred_label_will_write(addr, arg))
 			{
 				// RPCS3 Metal fork: the awaited value is the RSX's own earlier release, held back only so that the CPU
 				// does not see it before the zcull reports queued before it. The RSX itself is past that release: every
@@ -70,23 +75,35 @@ namespace rsx
 				// satisfied now instead of forcing the held-back labels out, which waited for all queued GPU work
 				// (GTA IV: 6-10 ms per frame, "semaphore acquire flushes held-back labels"). The memory gets the value
 				// when the reports land, as for the CPU.
-				RSX(ctx)->flush_fifo();
+				RSX(ctx)->fifo_ctrl->sync_get();
 				return;
 			}
 			else
 			{
+				// A real wait follows: expose GET and drop the prefetch cache, the PPU may rewrite the command buffer
+				// while the RSX waits.
 				RSX(ctx)->flush_fifo();
 
 				// The awaited value may depend on a texture read label that is still waiting for zcull reports (directly,
 				// or through a CPU thread that waits for it). Never wait with labels held back.
-				reports::read_reason_scope reason("zcull report read: semaphore acquire flushes held-back labels");
-				RSX(ctx)->flush_deferred_labels();
+				if (RSX(ctx)->has_deferred_labels())
+				{
+					reports::read_reason_scope reason("zcull report read: semaphore acquire flushes held-back labels");
+					RSX(ctx)->flush_deferred_labels();
+				}
 			}
 
 			u64 start = get_system_time();
 			u64 last_check_val = start;
 			const u64 async_flip_start_us = g_sync_wait_stats.rsx_async_flip_us;
 			const bool is_flip_sema = (addr == RSX(ctx)->label_addr + 0x10);
+
+			// How long the RSX thread waits on the cache line (WFE on arm64: the core idles until the line changes or
+			// the event stream ticks, so this costs almost nothing) before it starts timed sleeps. Timed waits on
+			// macOS oversleep by far more than the requested 50 us, so they are only used once the wait has clearly
+			// become a long one (the producer is an SPU job that takes a while), never for the common sub-millisecond
+			// handshake and never for the flip semaphore, whose release ends the frame.
+			constexpr u64 spin_before_sleep_us = 1000;
 
 			while (sema != arg)
 			{
@@ -127,24 +144,20 @@ namespace rsx
 
 				RSX(ctx)->on_semaphore_acquire_wait();
 
-				if (is_flip_sema)
+				if (is_flip_sema || get_system_time() - start < spin_before_sleep_us)
 				{
-					// The flip-label producer is frequently another thread (PPU flip/vblank
-					// handling) or deferred present work: yield the RSX thread instead of
-					// hot-spinning the cacheline so the producer is scheduled sooner.
-					std::this_thread::yield();
-				}
-				else if (get_system_time() - start < 200)
-				{
-					// Wait until the value changes or until 100us pass.
+					// Wait until the value changes or until 100us pass (upstream path). The flip semaphore's producer
+					// is the PPU flip handler; the cache-line wait wakes the moment it writes, where a sched_yield()
+					// loop (previous fork code) burned a full core in syscalls for most of every vblank period.
 					utils::spin_on_cacheline_once(atomic_sema, sema, 100);
 				}
 				else
 				{
 					// RPCS3 Metal fork: a wait that lasts (the game's SPUs/PPU still producing: God of War: Ascension
 					// ~4.6 ms per frame) sleeps in short steps instead of keeping a P-core spinning, which the SPU
-					// threads it waits for need. 50 us steps keep the wake-up latency far below a frame.
-					thread_ctrl::wait_for(50);
+					// threads it waits for need. alert=false: unrelated thread_ctrl notifications must not cut the
+					// sleep short and turn this into a storm of kernel waits.
+					thread_ctrl::wait_for(100, false);
 				}
 			}
 

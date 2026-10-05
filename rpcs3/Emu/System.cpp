@@ -723,6 +723,34 @@ void Emulator::Init()
 				g_cfg.core.rsx_fifo_accuracy.set(rsx_fifo_mode::atomic_ordered);
 			}
 		}},
+		{ "metal-fork-defaults-v11", "Forced MSAA: Off, Read/Write Color/Depth Buffers: Off, Resolution Scale: 100%", []()
+		{
+			// v4/v5/v8 and the forced MSAA default turned the most expensive RSX options on for every game: forced 2x
+			// MSAA on every render target at 200% scale (8x the fill rate of native), and all four memory read-back /
+			// surface-initialisation options, which are per-title workarounds upstream (readbacks the RSX thread waits
+			// for; Read Color Buffers shows stale guest memory through new surfaces). Installs still on exactly those
+			// values move to the upstream defaults; other values are the user's own and are kept. Titles that need any
+			// of them keep getting them from their per-title config.
+			if (g_cfg.video.forced_msaa_samples.get() == 2)
+			{
+				g_cfg.video.forced_msaa_samples.set(0);
+			}
+
+			if (g_cfg.video.write_color_buffers.get() && g_cfg.video.read_color_buffers.get() &&
+				g_cfg.video.read_depth_buffer.get() && g_cfg.video.write_depth_buffer.get())
+			{
+				// All four on is the forced default (a user picks one or two for a game, not every one of them)
+				g_cfg.video.write_color_buffers.set(false);
+				g_cfg.video.read_color_buffers.set(false);
+				g_cfg.video.read_depth_buffer.set(false);
+				g_cfg.video.write_depth_buffer.set(false);
+			}
+
+			if (g_cfg.video.resolution_scale_percent.get() == 200)
+			{
+				g_cfg.video.resolution_scale_percent.set(100);
+			}
+		}},
 	};
 
 	for (const fork_defaults_t& defaults : fork_defaults)

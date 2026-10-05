@@ -218,6 +218,7 @@ namespace rsx
 		bool stall_tripwire_armed = false;
 		bool stall_tripwire_fired = false;
 		u32 stall_tripwire_last_put = 0;
+		u64 stall_tripwire_last_check_us = 0;
 
 		enum class flip_request : u32
 		{

@@ -222,6 +222,12 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 			continue;
 		}
 
+		// Stencil mirrors are declared after every texture unit: the binding layout hands out the 16 sampler slots in
+		// input order, and the mirrors (texelFetch only) do not need one. Interleaving them pushed real textures of
+		// programs with many units past the last sampler slot, which sampled them with the constant fallback sampler
+		// (nearest, clamp-to-border, LOD 0: wrong filtering/wrapping/mips).
+		std::vector<mtl::glsl::program_input> stencil_mirrors;
+
 		for (const ParamItem& PI : PT.items)
 		{
 			std::string samplerType = PT.type;
@@ -276,11 +282,13 @@ void MTLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 				// Insert stencil mirror declaration
 				in.name += "_stencil";
 				in.location = mtl_prog->binding_table.ftex_stencil_location[id];
-				inputs.push_back(in);
+				stencil_mirrors.push_back(in);
 
 				OS << "layout(set=1, binding=" << in.location << ") uniform u" << samplerType << " " << in.name << ";\n";
 			}
 		}
+
+		inputs.insert(inputs.end(), stencil_mirrors.begin(), stencil_mirrors.end());
 	}
 
 	if (m_prog.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE)
