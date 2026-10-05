@@ -46,9 +46,9 @@ focused unit tests where runnable, and log evidence from on-device runs.
   once per frame. It checks the newest slot (slots complete in list order) so the periodic path stays non-blocking;
   reads the game actually needs still wait, under their named reason. The remaining unnamed read sites are named
   ("periodic update of a report whose query was reported complete", "occlusion query pool exhausted", "forced retire").
-- "FidelityFX CAS Sharpening Intensity" defaults to 0 on macOS (metal-fork-defaults-v12 moves installs on 50): RCAS
-  ran on top of MetalFX spatial upscaling, whose output is already edge-enhanced, double-sharpening fine detail into
-  shimmering edges.
+- "FidelityFX CAS Sharpening Intensity" was defaulted to 0 on macOS (metal-fork-defaults-v12) on the theory that RCAS
+  over MetalFX's edge-enhanced output double-sharpens; reverted the same day at the user's request: default 50 again,
+  metal-fork-defaults-v13 moves installs v12 had set to 0 back to 50.
 - DESIGN.md §4 depth bounds text corrected (the code tested the stored depth from the copy all along; the doc said
   the fragment's own depth).
 

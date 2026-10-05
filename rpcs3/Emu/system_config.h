@@ -223,14 +223,7 @@ struct cfg_root : cfg::node
 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
 		cfg::_bool disable_hardware_blending{ this, "Disable Hardware Blending", false, true };
 		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };
-#ifdef __APPLE__
-		// RPCS3 Metal fork: "FSR" is MetalFX spatial upscaling, whose output is already edge-enhanced; RCAS on top of it
-		// (upstream's 50, tuned for FSR 1.0's softer EASU output) double-sharpens fine detail into crawling/shimmering
-		// edges. Off by default; the slider still works for those who want it.
-		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 0, true };
-#else
 		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 50, true };
-#endif
 		cfg::_bool disable_blit_engine_upscaling{ this, "Disable Blit Engine Upscaling", false, true };
 
 		struct node_vk : cfg::node
