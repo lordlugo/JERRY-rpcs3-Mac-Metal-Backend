@@ -284,16 +284,16 @@ below ends it. Its order against earlier work is fixed when it begins (the pass 
     multisampled ROP output; the test itself is pixel-rate). No other program changes. With no depth buffer bound the
     test does nothing. The RSX layout keeps the depth buffer for an active test but is not re-evaluated when the test
     becomes active: `begin()` re-evaluates it then (once while the buffer stays out).
-  - Shader (MTLFragmentProgram): `main()` begins with the test, `gl_FragCoord.z` outside the pushed bounds ->
-    `discard` (MSL `discard_fragment()`, demote semantics: derivatives of the neighbours stay defined). Programs that
-    export depth test the exported `r1.z` (saturated, the value written to the attachment) after `fs_main()` instead,
-    which is what the hardware tests. Multisampled draws test the same fragment depth once per pixel: every sample
-    shares it, and MSL exposes no per-sample fragment depth. Bounds: push constants 112..120, only in these programs'
-    push block. Binding: nothing (`depth_bounds_location`, after every other texture, is only the test marker). The
-    test reads no depth buffer, so these draws make no depth copy and open no extra pass.
-  - History: the test used to fetch the depth stored in the depth buffer before the draw (a copy made outside the
-    pass) and test that. Stored depth belongs to earlier draws, so it discarded or kept the wrong pixels (X-Men
-    Origins: Wolverine's lights drawn through the test came out as grids of squares, one per tile).
+  - Semantics (EXT_depth_bounds_test, Vulkan depthBoundsTestEnable, RSX): the test compares the depth STORED in the
+    depth buffer at the fragment's (x, y) with [min, max]; it has no dependency on the fragment's own depth. Deferred
+    renderers draw light volumes through it so that only the pixels whose scene depth is in range are shaded.
+  - Shader (MTLFragmentProgram, MTLDepthBounds.h): `main()` begins with the test on `depth_bounds_texture`, the copy
+    of the draw's depth buffer (`update_depth_copy`, below: reading the attachment itself inside its pass is undefined
+    on Apple GPUs and gave grids of wrong tiles), `texelFetch` at the pixel (sample 0 for multisampled buffers), and
+    the whole program runs in the else branch of the test: MSL `discard_fragment()` does not end the invocation, so a
+    test followed by the program would still shade every culled pixel (God of War: Ascension: ~450 such draws per
+    frame). Bounds: push constants 112..120, only in these programs' push block. Binding: `depth_bounds_location`,
+    after every other texture.
   - The shader interpreter does not run these programs (their draws wait for the recompiled pipeline).
   - Telemetry: the "render passes" line has "depth bounds test: N draws per frame emulated in the fragment shader"; the
     first draw logs a notice.

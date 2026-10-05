@@ -30,6 +30,18 @@ TEST(MetalDepthBounds, TestsStoredDepthFromTheCopy)
 	EXPECT_NE(src.find("discard"), std::string::npos);
 }
 
+TEST(MetalDepthBounds, ProgramRunsInTheElseBranch)
+{
+	// The program is emitted after this snippet and closed by append_depth_bounds_test_end(): culled pixels skip it
+	const std::string src = emit();
+	EXPECT_NE(src.find("else"), std::string::npos);
+	EXPECT_GT(src.find("else"), src.find("discard"));
+
+	std::stringstream OS;
+	mtl::append_depth_bounds_test_end(OS);
+	EXPECT_EQ(OS.str(), "\t}\n");
+}
+
 TEST(MetalDepthBounds, IgnoresFragmentAndExportedDepth)
 {
 	const std::string src = emit();

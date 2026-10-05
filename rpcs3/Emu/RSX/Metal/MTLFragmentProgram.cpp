@@ -711,12 +711,15 @@ void MTLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 	OS << "void main()\n";
 	OS << "{\n";
 
-	if (m_prog.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST)
+	const bool depth_bounds = !!(m_prog.ctrl & RSX_SHADER_CONTROL_DEPTH_BOUNDS_TEST);
+	if (depth_bounds)
 	{
 		// Depth bounds test (no hardware support before Apple10): the depth STORED in the depth buffer at this pixel
 		// must lie in [min, max], else the fragment is not rendered (no colour, depth or stencil write). See
-		// MTLDepthBounds.h. Runs before the program: it does not depend on anything the program computes. MSL
-		// discard_fragment() demotes (MSL 2.3+): the implicit derivatives of neighbouring fragments stay defined.
+		// MTLDepthBounds.h. Runs before the program: it does not depend on anything the program computes, and the
+		// program runs in its else branch so culled pixels skip it (discard_fragment() alone does not end the
+		// invocation). MSL discard_fragment() demotes (MSL 2.3+): the implicit derivatives of neighbouring fragments
+		// stay defined.
 		mtl::append_depth_bounds_test(OS);
 	}
 
@@ -770,6 +773,11 @@ void MTLFragmentDecompilerThread::insertMainEnd(std::stringstream & OS)
 			//Input not declared. Leave commented to assist in debugging the shader
 			OS << "	//gl_FragDepth = r1.z;\n";
 		}
+	}
+
+	if (depth_bounds)
+	{
+		mtl::append_depth_bounds_test_end(OS);
 	}
 
 	OS << "}\n";

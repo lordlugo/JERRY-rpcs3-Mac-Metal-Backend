@@ -3083,8 +3083,14 @@ bool MTLGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_inf
 	if (data.is_current(m_current_command_buffer))
 		return false;
 
-	const u32 oldest = data.indices.front();
-	return m_occlusion_query_manager->check_query_status(oldest);
+	// A query that stays active across command list submits is split into one slot per list (cb_load_occluson_task):
+	// with a submit every ~1.5 ms a frame-long query spans a dozen. The slots complete in list order, so the query is
+	// ready when its newest slot is. Checking the oldest slot (as the VK backend does, where a query rarely spans
+	// more than one command buffer) reported the query ready as soon as the first list finished, and
+	// get_occlusion_query_result() then blocked on the newest list, i.e. on the whole GPU backlog, from the periodic
+	// update() that is meant to be non-blocking (God of War: Ascension: one ~15 ms wait per frame, GPU 72% busy).
+	const u32 newest = data.indices.back();
+	return m_occlusion_query_manager->check_query_status(newest);
 }
 
 void MTLGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* query)

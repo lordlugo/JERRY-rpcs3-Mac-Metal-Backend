@@ -245,6 +245,7 @@ namespace rsx
 				}
 
 				m_next_tsc = 0;
+				read_reason_scope reason("zcull report read: occlusion query pool exhausted, retiring the oldest report");
 				update(ptimer, m_pending_writes.front().sink);
 
 				retries++;
@@ -739,6 +740,11 @@ namespace rsx
 				retire_deferred_labels();
 				return;
 			}
+
+			// Telemetry: a read that waits here without a named cause is either forced by an unnamed caller or the
+			// periodic update reading a report whose query the backend reported complete (then it must not wait)
+			read_reason_scope reason(g_read_reason ? g_read_reason :
+				(sync_address ? "zcull report read: forced retire of the oldest report (unnamed caller)" : "zcull report read: periodic update of a report whose query was reported complete"));
 
 			const auto& front = m_pending_writes.front();
 			if (!front.sink)

@@ -18,6 +18,27 @@ focused unit tests where runnable, and log evidence from on-device runs.
 
 
 
+## 2026-10-05 — God of War: Ascension: depth bounds culling before shading, non-blocking zcull polling, no double sharpening
+
+- GoW:A log (gameplay, 24 fps, 200% scale): GPU 29.8 ms per frame at 72% busy, the RSX thread waited for it 13.2 ms per
+  frame (one ~15 ms wait at "zcull report read: other"), other threads 6.8 ms (SPU lighting reading colour buffers back);
+  "depth bounds test: 434-467 draws per frame emulated in the fragment shader".
+- Depth bounds test: the program now runs in the else branch of the test. MSL discard_fragment() does not end the
+  invocation, so the previous `test; discard; program` shaded every culled pixel of every light volume anyway; the
+  hardware test culls before shading, which is why deferred renderers draw hundreds of light volumes a frame through
+  it. All games using the test (GoW:A, Wolverine, GTA IV).
+- Occlusion queries: a query that stays active across command list submits (every ~1.5 ms here) is split into one slot
+  per list. check_occlusion_query_status() looked at the oldest slot and reported the query complete once the first
+  list finished; the periodic update() then read it and blocked on the newest list, i.e. on the whole GPU backlog,
+  once per frame. It checks the newest slot (slots complete in list order) so the periodic path stays non-blocking;
+  reads the game actually needs still wait, under their named reason. The remaining unnamed read sites are named
+  ("periodic update of a report whose query was reported complete", "occlusion query pool exhausted", "forced retire").
+- "FidelityFX CAS Sharpening Intensity" defaults to 0 on macOS (metal-fork-defaults-v12 moves installs on 50): RCAS
+  ran on top of MetalFX spatial upscaling, whose output is already edge-enhanced, double-sharpening fine detail into
+  shimmering edges.
+- DESIGN.md §4 depth bounds text corrected (the code tested the stored depth from the copy all along; the doc said
+  the fragment's own depth).
+
 ## 2026-10-05 — Attachment retention: RSX depth/colour toggles no longer end the draw pass (X-Men Origins: Wolverine stutter)
 
 - Wolverine log (steady state, 60 fps, 200% scale): 68 draw passes per frame, 46 ended by "framebuffer change", 2070 MiB

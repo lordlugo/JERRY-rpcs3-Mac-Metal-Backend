@@ -19,14 +19,28 @@
 // The test runs first thing in main(), before the program runs: like the hardware, it does not depend on anything
 // the program computes (exported depth included).
 
+// Emission: `if (out of bounds) discard; else { <program> }`. MSL discard_fragment() does not end the invocation (the
+// rest of the shader keeps executing with its outputs dead), so a test followed by the program would still pay the
+// program for every culled pixel. The real hardware test culls before shading, which is the point of the feature:
+// deferred renderers draw hundreds of light volumes a frame (God of War: Ascension: ~450 draws per frame) and only the
+// pixels in range are shaded. With the program in the else branch the GPU takes the branch and skips it.
 namespace mtl
 {
 	inline void append_depth_bounds_test(std::stringstream& OS)
 	{
 		OS <<
+			"	const float _db_z = texelFetch(depth_bounds_texture, ivec2(gl_FragCoord.xy), 0).x;\n"
+			"	if (_db_z < depth_bounds.x || _db_z > depth_bounds.y)\n"
 			"	{\n"
-			"		const float _db_z = texelFetch(depth_bounds_texture, ivec2(gl_FragCoord.xy), 0).x;\n"
-			"		if (_db_z < depth_bounds.x || _db_z > depth_bounds.y) discard;\n"
-			"	}\n\n";
+			"		discard;\n"
+			"	}\n"
+			"	else\n"
+			"	{\n";
+	}
+
+	// Closes the else branch opened by append_depth_bounds_test()
+	inline void append_depth_bounds_test_end(std::stringstream& OS)
+	{
+		OS << "	}\n";
 	}
 }

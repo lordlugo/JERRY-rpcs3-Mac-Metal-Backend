@@ -751,6 +751,15 @@ void Emulator::Init()
 				g_cfg.video.resolution_scale_percent.set(100);
 			}
 		}},
+		{ "metal-fork-defaults-v12", "FidelityFX CAS Sharpening Intensity: 0 (MetalFX output is not sharpened again)", []()
+		{
+			// RCAS over MetalFX spatial upscaling double-sharpens (shimmering edges); installs on the old default move
+			// to off, a value the user picked is kept
+			if (g_cfg.video.rcas_sharpening_intensity.get() == 50)
+			{
+				g_cfg.video.rcas_sharpening_intensity.set(0);
+			}
+		}},
 	};
 
 	for (const fork_defaults_t& defaults : fork_defaults)
